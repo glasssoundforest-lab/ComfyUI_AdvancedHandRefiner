@@ -97,12 +97,15 @@
 
 ---
 
-## Phase 3: ドキュメント整備（優先度: 中）
+## Phase 3: ドキュメント整備（優先度: 中）✅ 完了（2026-07-07）
 
-- [ ] `requirements.txt` 作成（`mediapipe`, `opencv-python`, `numpy`, `onnxruntime`。
-      `ultralytics` はYOLO初回変換時のみ必要である旨を明記）
-- [ ] `README.md` の充実化（インストール手順、各ノードのパラメータ説明、
-      `use_sam2_mask` / `sam2_blend_strength` を含む）※本タスクで一部着手
+- [x] `requirements.txt` 作成（`mediapipe`, `onnxruntime`。`torch`/`numpy`/`opencv-python`は
+      ComfyUI本体が提供する前提で除外。`ultralytics`/`onnxruntime-gpu`はオプションとして
+      コメントアウトで記載）
+- [x] `README.md` の充実化（インストール手順、各ノードのパラメータ表（型・デフォルト値・
+      説明を全パラメータ網羅）、`use_sam2_mask` / `sam2_blend_strength` を含む）
+- [x] `nodes.py` 内の古いコメント（YOLO/SAM2が未実装のスタブだった頃の記述）を
+      実装完了後の実態に合わせて修正
 
 ---
 

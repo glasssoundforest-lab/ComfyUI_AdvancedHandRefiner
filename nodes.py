@@ -24,11 +24,10 @@ logger = logging.getLogger("HandRefiner")
 
 BASE_MODEL_PATH = os.path.join(os.path.dirname(__file__), "models")
 
-# ★検出パイプライン: 現状はMediaPipeのみが有効（YOLO/SAM2はis_available()が
-# Falseを返すスタブのため、DetectorPipeline側で自動的にスキップされる）。
-# 将来YOLO/SAM2を実装する際は、各スタブファイルのis_available()を
-# 実際のモデル有無チェックに置き換えるだけで、このパイプラインに
-# 自動的に組み込まれる（nodes.py側の変更は不要）。
+# 検出パイプライン: YOLO(bbox) → MediaPipe(landmarks) → SAM2(segmentation mask) の
+# 3段階。各検出器の is_available() が False を返す場合（対応する ONNX/task
+# モデルファイルが models/ 配下に存在しない場合）は DetectorPipeline 側で
+# 自動的にスキップされ、残りの検出器のみで処理が継続する。
 _detector_pipeline = DetectorPipeline(
     [
         YoloHandDetector(),

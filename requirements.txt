@@ -1,0 +1,29 @@
+# ComfyUI_AdvancedHandRefiner — 実行時依存関係
+#
+# 注意: torch / numpy / opencv-python は通常 ComfyUI 本体が既に提供しているため、
+# ここには含めていません（ComfyUI環境と競合するバージョンを別途インストール
+# してしまうことを避けるため）。既に入っていない場合のみ、ご自身のComfyUI
+# 環境の torch バージョンに合ったものを別途インストールしてください。
+#
+# インストール方法（ComfyUI portable版の例）:
+#   python_embeded\python.exe -m pip install -r requirements.txt
+
+# 手のランドマーク検出（HandLandmarker Task API, 0.10.x以降が必須）
+mediapipe>=0.10.9
+
+# YOLO(hand_yolov8s) / SAM2(sam2_hiera_tiny) の ONNX 推論に使用。
+# 本リポジトリには変換済みの .onnx を同梱済みのため、通常はこれだけで
+# YOLO/SAM2検出器が動作する（ultralyticsのインストールは不要）。
+onnxruntime>=1.16
+
+# --- 以下はオプション ---
+#
+# models/yolo/hand_yolov8s.onnx が何らかの理由で無い/壊れている場合のみ、
+# .pt から .onnx への変換に ultralytics（と動作する torch）が必要になる。
+# 通常は同梱済みの .onnx を使うため不要。
+# ultralytics>=8.0
+
+# NVIDIA GPUでYOLO/SAM2のONNX推論を高速化したい場合、上記の onnxruntime の
+# 代わりに以下をインストールする（システム側にonnxruntime-gpuが要求する
+# バージョンのCUDA/cuDNNランタイムが別途必要）。
+# onnxruntime-gpu>=1.16
