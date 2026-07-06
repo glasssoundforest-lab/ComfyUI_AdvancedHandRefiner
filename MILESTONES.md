@@ -34,7 +34,7 @@
 
 ---
 
-## Phase 2: 実機検証（優先度: 高）🔶 一部完了（2026-07-06、サンドボックス内で可能な範囲）
+## Phase 2: 実機検証（優先度: 高）🔶 ほぼ完了（2026-07-06、ユーザー環境での実施結果を反映）
 
 このサンドボックス環境は `huggingface.co` 等へのネットワークアクセスが制限されており、
 かつ `torch` のLinux向けpip配布がNVIDIA CUDAライブラリ群に依存するビルドのため、
@@ -71,18 +71,25 @@
 
 ### ⏳ ユーザーの実ComfyUI環境でのみ検証可能（サンドボックスでは不可能と判明）
 
-- [ ] `hand_yolov8s.pt` → `.onnx` 変換（`ultralytics` + 動作する`torch`が必要）。
+- [x] `hand_yolov8s.pt` → `.onnx` 変換（`ultralytics` + 動作する`torch`が必要）✅
+      **ユーザー環境（Windows portable, torch 2.12.1+cu130）で実施・成功を確認（2026-07-06）**。
+      `models/yolo/hand_yolov8s.onnx`（42.7MB, opset20, onnxslim最適化）が生成された。
       このサンドボックスでは `pip install torch` してもNVIDIA CUDA関連の
-      共有ライブラリが無く `import torch` 自体が失敗した
-      （`libcublasLt.so.*` 等、正しくインストールすると数GB規模になり
-      このサンドボックスのディスク容量的にも安全でないと判断）。
-      ComfyUIは通常torchが正しくセットアップ済みのため、実環境側では
-      問題なく動作する可能性が高い
-- [ ] 変換後のYOLO ONNXでの実推論・検出精度確認
+      共有ライブラリが無く `import torch` 自体が失敗したが、torchが
+      正しくセットアップされたComfyUI環境では問題なく変換できることを確認
+- [x] 変換後のYOLO ONNXでの実推論（`YoloHandDetector.detect()`）が実環境で
+      クラッシュせず動作することを確認（2026-07-06）。
+      同環境ではonnxruntimeのCUDA実行プロバイダがシステムのCUDA/cuDNN
+      ランタイムと不一致（cublasLt64_13.dll不足）で初期化に失敗したが、
+      `utils/onnx_providers.py`の設計通りCPU実行に自動フォールバックし、
+      検出処理自体は最後まで正常に完了した（実装のバグではなく、
+      GPU推論を使うにはシステム側にCUDA 13 + cuDNN 9系ランタイムの
+      別途導入が必要という運用上の注意点）
 - [ ] 実写真での検出・セグメンテーション精度そのものの妥当性
       （このサンドボックスでの検証は「クラッシュしないこと」の確認であり、
       精度評価ではない）
 - [ ] CUDA環境（`onnxruntime-gpu`）での実際のGPU推論動作
+      （上記の通り、CUDA/cuDNNランタイムのバージョン整合が別途必要）
 - [ ] 実写真での `finger_sharpness` / `wrist_blur` / `sam2_blend_strength` の
       見た目上の妥当性
 
