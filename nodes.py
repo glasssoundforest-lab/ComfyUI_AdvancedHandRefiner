@@ -88,10 +88,17 @@ def _detect_hands(
     image_rgb: np.ndarray,
     min_detection_confidence: float,
     detection_mode: str = "full",
+    sam2_tile_size: int = 512,
+    sam2_tile_overlap: int = 64,
 ) -> DetectionResult:
     """統一検出パイプラインを実行するヘルパー"""
     pipeline = _get_detector_pipeline(detection_mode)
-    return pipeline.run(image_rgb, min_hand_detection_confidence=min_detection_confidence)
+    return pipeline.run(
+        image_rgb,
+        min_hand_detection_confidence=min_detection_confidence,
+        sam2_tile_size=sam2_tile_size,
+        sam2_tile_overlap=sam2_tile_overlap,
+    )
 
 
 def _select_hand(result: DetectionResult, hand_index: int):
@@ -309,6 +316,10 @@ class AdvancedHandMaskRefiner:
                     {"default": 0, "min": 0, "max": 19, "step": 1},
                 ),
                 "detection_mode": (DETECTION_MODES, {"default": "full"}),
+                "sam2_tile_size": (
+                    "INT",
+                    {"default": 512, "min": 128, "max": 2048, "step": 64},
+                ),
             },
         }
 
@@ -327,6 +338,7 @@ class AdvancedHandMaskRefiner:
         sam2_blend_strength: float = 0.5,
         hand_index: int = 0,
         detection_mode: str = "full",
+        sam2_tile_size: int = 512,
     ):
         batch_size = image.shape[0]
         if mask.shape[0] not in (1, batch_size):
@@ -353,6 +365,7 @@ class AdvancedHandMaskRefiner:
                     sam2_blend_strength,
                     hand_index,
                     detection_mode,
+                    sam2_tile_size,
                 )
             )
 
@@ -374,6 +387,7 @@ class AdvancedHandMaskRefiner:
         sam2_blend_strength: float,
         hand_index: int,
         detection_mode: str = "full",
+        sam2_tile_size: int = 512,
     ) -> np.ndarray:
         """バッチ中の1枚分のマスク精緻化処理（refine_hand_maskから呼ばれる内部ヘルパー）"""
         img_rgb = _tensor_to_numpy_rgb(image, image_index)
@@ -389,7 +403,9 @@ class AdvancedHandMaskRefiner:
             )
             coarse_mask = cv2.resize(coarse_mask, (w, h), interpolation=cv2.INTER_NEAREST)
 
-        result = _detect_hands(img_rgb, min_detection_confidence, detection_mode)
+        result = _detect_hands(
+            img_rgb, min_detection_confidence, detection_mode, sam2_tile_size=sam2_tile_size
+        )
         selected = _select_hand(result, hand_index)
 
         if selected is None or selected.landmarks is None:

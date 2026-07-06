@@ -55,7 +55,9 @@ Union）に基づいて行われるため、検出器ごとに手の順序が異
 
 - **YOLO** (`hand_yolov8s.pt`/`.onnx`, `Bingsu/adetailer`配布): 手の見逃しを減らすバウンディングボックス検出
 - **MediaPipe** (`hand_landmarker.task`, Google公式): 手の向き・関節構造の把握
-- **SAM2** (`sam2_hiera_tiny`, `vietanhdev/segment-anything-2-onnx-models`配布): 画素単位の精密セグメンテーション
+- **SAM2** (`sam2_hiera_tiny`, `vietanhdev/segment-anything-2-onnx-models`配布): 画素単位の精密セグメンテーション。
+  デコーダの生出力は256×256固定解像度のため、大きな画像では自動的にタイル分割して
+  推論することで実効解像度を向上させている（`sam2_tile_size`で調整可能）
 
 ## ノードパラメータ詳細
 
@@ -95,6 +97,7 @@ inpaintノードに渡す前段として使うことを想定しています。
 | `sam2_blend_strength` | FLOAT | 0.5（0.0〜1.0） | `use_sam2_mask=True`時のブレンド強度。0で粗いマスクのみ、1でSAM2マスク優先。両方が前景と判定した領域は強度に関わらず前景として維持されます |
 | `hand_index` | INT | 0（0〜19） | 複数の手が検出された場合に処理対象とする手のインデックス（0=最も信頼度が高い手）。範囲外の値は警告の上、最後の手にクランプされる |
 | `detection_mode` | 選択式 | `full` | 検出パイプラインの実行モード。`full`=YOLO+MediaPipe+SAM2、`yolo_mediapipe`=SAM2を省略、`mediapipe_only`=MediaPipeのみ（最速）|
+| `sam2_tile_size` | INT | 512（128〜2048, step 64） | `use_sam2_mask=True`時、この値を超える画像はタイル分割して推論する（実効解像度が向上するが処理時間は増加。小さくするほど高精度・低速）|
 
 **出力**: `refined_mask`（補正後マスク）
 

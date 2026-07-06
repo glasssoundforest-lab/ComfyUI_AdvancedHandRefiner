@@ -245,3 +245,33 @@ class TestSeamlessStitcherSingleRemapInfoWithBatchInput:
             image_tensor, image_tensor, mask_tensor, remap_info, color_match_strength=0.8
         )
         assert final.numpy().shape[0] == 1
+
+
+class TestSam2TileSizeWiring:
+    def test_sam2_tile_size_flows_through_detect_hands_without_crashing(self):
+        """
+        sam2_tile_size/sam2_tile_overlapパラメータが、_detect_hands経由で
+        DetectorPipeline.run() -> Sam2HandDetector.detect() まで正しく
+        伝播し、クラッシュしないことを確認する。
+        """
+        image = np.zeros((100, 100, 3), dtype=np.uint8)
+        result = nodes._detect_hands(
+            image, 0.5, "full", sam2_tile_size=256, sam2_tile_overlap=32
+        )
+        assert result.is_empty  # 手が無い画像なので空の結果でよい
+
+    def test_mask_refiner_accepts_sam2_tile_size_parameter(self):
+        h, w = 64, 64
+        image_tensor = nodes.torch.from_numpy(np.zeros((1, h, w, 3), dtype=np.float32))
+        mask_tensor = nodes.torch.from_numpy(np.zeros((1, h, w), dtype=np.float32))
+
+        refiner = nodes.AdvancedHandMaskRefiner()
+        (refined,) = refiner.refine_hand_mask(
+            image_tensor,
+            mask_tensor,
+            wrist_blur=15,
+            finger_sharpness=1.0,
+            use_sam2_mask=True,
+            sam2_tile_size=256,
+        )
+        assert refined.numpy().shape == (1, h, w)

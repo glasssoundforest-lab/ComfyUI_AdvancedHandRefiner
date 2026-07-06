@@ -28,6 +28,33 @@ logger = logging.getLogger("HandRefiner")
 
 _ENCODER_INPUT_SIZE = 1024  # SAM2の標準入力解像度
 
+#: predict_from_box_tiled/predict_from_points_tiled のデフォルトタイルサイズ。
+#: SAM2デコーダの生出力が256x256固定であるため、1タイルの物理サイズを
+#: この程度に抑えることで、タイル内の実効解像度をある程度確保する。
+_TILE_SIZE_DEFAULT = 512
+#: 隣接タイル間の重なり幅（ピクセル）。タイル境界での縫い目を軽減するため
+#: 重なりを持たせ、重なり領域は論理和(前景優先)で統合する。
+_TILE_OVERLAP_DEFAULT = 64
+
+
+def _tile_starts(length: int, tile_size: int, overlap: int) -> list[tuple[int, int]]:
+    """
+    1次元(縦または横)を、重なりを持たせつつ`tile_size`以下のタイルで
+    余さず覆うための (開始位置, タイル幅) のリストを返す。
+
+    例: length=1000, tile_size=512, overlap=64
+        -> [(0, 512), (448, 512), (488, 512)] のような、
+           最後まで確実にカバーする開始位置列を返す。
+    """
+    if length <= tile_size:
+        return [(0, length)]
+
+    step = max(1, tile_size - overlap)
+    starts = list(range(0, length - tile_size + 1, step))
+    if not starts or starts[-1] + tile_size < length:
+        starts.append(length - tile_size)
+    return [(s, tile_size) for s in starts]
+
 
 class Sam2OnnxInference:
     """onnxruntime を使ったSAM2セグメンテーションの推論ラッパー"""
@@ -100,6 +127,75 @@ class Sam2OnnxInference:
             logger.warning("Sam2HandDetector: bboxプロンプトでの推論に失敗しました (%s)", e)
             return None
 
+    def predict_from_box_tiled(
+        self,
+        image_rgb: np.ndarray,
+        box: tuple[float, float, float, float],
+        tile_size: int = _TILE_SIZE_DEFAULT,
+        overlap: int = _TILE_OVERLAP_DEFAULT,
+    ) -> np.ndarray | None:
+        """
+        画像をタイル分割して、複数回のSAM2推論結果を合成することで、
+        固定解像度（256x256）というデコーダ出力の制約による実効解像度の
+        低下を軽減する。
+
+        SAM2エンコーダは入力を内部的に1024x1024へリサイズしてから処理する
+        ため、1回の推論でカバーする物理領域が広いほど（＝画像が大きいほど）、
+        256x256という固定出力解像度に対して1画素あたりが表す実面積が
+        大きくなり、輪郭が粗くなる。画像をタイルに分割し、タイルごとに
+        個別にエンコード・デコードすることで、タイル1枚あたりの物理領域が
+        小さくなり、結果として合成後のマスク全体の実効解像度が向上する
+        （タイル1枚が tile_size 以下であれば `predict_from_box` 1回分と
+        同等の解像度になる）。
+
+        Args:
+            image_rgb: RGB uint8 ndarray（H, W, 3）
+            box: (x1, y1, x2, y2) 元画像のピクセル座標系
+            tile_size: タイル1枚の一辺のサイズ（ピクセル）。画像の縦横どちらも
+                これ以下であればタイル分割せず`predict_from_box`と同じ1回の
+                推論で済ませる
+            overlap: 隣接タイル間の重なり幅（ピクセル）。タイル境界での
+                縫い目を目立たなくするために、重なり領域は前景判定の
+                論理和（どちらかのタイルが前景と判定すれば前景）で統合する
+
+        Returns:
+            (H, W) の0-255 uint8マスク（元画像と同じサイズ）。
+            全タイルが失敗した場合は None。
+        """
+        h, w = image_rgb.shape[:2]
+
+        if h <= tile_size and w <= tile_size:
+            return self.predict_from_box(image_rgb, box)
+
+        x1, y1, x2, y2 = box
+        canvas = np.zeros((h, w), dtype=np.uint8)
+        any_tile_succeeded = False
+
+        for ty, tile_h in _tile_starts(h, tile_size, overlap):
+            for tx, tile_w in _tile_starts(w, tile_size, overlap):
+                # boxをこのタイルのローカル座標系へクリップする。
+                # 重ならない場合はスキップ（無駄なエンコード呼び出しを避ける）。
+                local_x1 = max(0.0, x1 - tx)
+                local_y1 = max(0.0, y1 - ty)
+                local_x2 = min(float(tile_w), x2 - tx)
+                local_y2 = min(float(tile_h), y2 - ty)
+
+                if local_x2 <= local_x1 or local_y2 <= local_y1:
+                    continue
+
+                tile_img = image_rgb[ty : ty + tile_h, tx : tx + tile_w]
+                tile_mask = self.predict_from_box(
+                    tile_img, (local_x1, local_y1, local_x2, local_y2)
+                )
+                if tile_mask is None:
+                    continue
+
+                any_tile_succeeded = True
+                region = canvas[ty : ty + tile_h, tx : tx + tile_w]
+                canvas[ty : ty + tile_h, tx : tx + tile_w] = np.maximum(region, tile_mask)
+
+        return canvas if any_tile_succeeded else None
+
     def predict_from_points(
         self,
         image_rgb: np.ndarray,
@@ -130,6 +226,50 @@ class Sam2OnnxInference:
         except Exception as e:
             logger.warning("Sam2HandDetector: pointプロンプトでの推論に失敗しました (%s)", e)
             return None
+
+    def predict_from_points_tiled(
+        self,
+        image_rgb: np.ndarray,
+        points: list[tuple[float, float]],
+        tile_size: int = _TILE_SIZE_DEFAULT,
+        overlap: int = _TILE_OVERLAP_DEFAULT,
+    ) -> np.ndarray | None:
+        """
+        `predict_from_box_tiled` のpointプロンプト版。
+        各タイルには、そのタイル内に含まれる点だけを渡す（タイル内に
+        1点も含まれない場合はスキップする）。
+        """
+        if not points:
+            return None
+
+        h, w = image_rgb.shape[:2]
+
+        if h <= tile_size and w <= tile_size:
+            return self.predict_from_points(image_rgb, points)
+
+        canvas = np.zeros((h, w), dtype=np.uint8)
+        any_tile_succeeded = False
+
+        for ty, tile_h in _tile_starts(h, tile_size, overlap):
+            for tx, tile_w in _tile_starts(w, tile_size, overlap):
+                local_points = [
+                    (px - tx, py - ty)
+                    for px, py in points
+                    if tx <= px < tx + tile_w and ty <= py < ty + tile_h
+                ]
+                if not local_points:
+                    continue
+
+                tile_img = image_rgb[ty : ty + tile_h, tx : tx + tile_w]
+                tile_mask = self.predict_from_points(tile_img, local_points)
+                if tile_mask is None:
+                    continue
+
+                any_tile_succeeded = True
+                region = canvas[ty : ty + tile_h, tx : tx + tile_w]
+                canvas[ty : ty + tile_h, tx : tx + tile_w] = np.maximum(region, tile_mask)
+
+        return canvas if any_tile_succeeded else None
 
     def _run_decoder(
         self,

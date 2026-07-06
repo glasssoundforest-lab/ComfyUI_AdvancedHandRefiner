@@ -44,9 +44,16 @@ class Sam2HandDetector(HandDetector):
 
     name = "sam2"
 
-    def __init__(self, model_name: str = DEFAULT_MODEL_NAME):
+    def __init__(
+        self,
+        model_name: str = DEFAULT_MODEL_NAME,
+        tile_size: int = 512,
+        tile_overlap: int = 64,
+    ):
         self._model_name = model_name
         self._download_attempted = False
+        self._tile_size = tile_size
+        self._tile_overlap = tile_overlap
 
     def is_available(self) -> bool:
         """
@@ -104,9 +111,12 @@ class Sam2HandDetector(HandDetector):
             logger.warning("Sam2HandDetector: モデルの準備に失敗しました (%s)", e)
             return DetectionResult()
 
+        tile_size = kwargs.get("sam2_tile_size", self._tile_size)
+        tile_overlap = kwargs.get("sam2_tile_overlap", self._tile_overlap)
+
         hands: list[HandDetection] = []
         for prior_hand in prior.hands:
-            mask = self._segment_one_hand(inference, image_rgb, prior_hand)
+            mask = self._segment_one_hand(inference, image_rgb, prior_hand, tile_size, tile_overlap)
             if mask is None:
                 # セグメンテーションに失敗した手は、maskを持たない
                 # HandDetection としてそのまま引き継ぐ（後段のmergeで
@@ -139,6 +149,8 @@ class Sam2HandDetector(HandDetector):
         inference: Sam2OnnxInference,
         image_rgb: np.ndarray,
         prior_hand: HandDetection,
+        tile_size: int = 512,
+        tile_overlap: int = 64,
     ) -> np.ndarray | None:
         """
         1つの手について、優先順位に従ってプロンプトを構築し
@@ -146,7 +158,9 @@ class Sam2HandDetector(HandDetector):
         """
         if prior_hand.bbox is not None:
             box = prior_hand.bbox.to_int_tuple()
-            mask = inference.predict_from_box(image_rgb, box)
+            mask = inference.predict_from_box_tiled(
+                image_rgb, box, tile_size=tile_size, overlap=tile_overlap
+            )
             if mask is not None:
                 return mask
             logger.warning(
@@ -155,7 +169,9 @@ class Sam2HandDetector(HandDetector):
             )
 
         if prior_hand.landmarks:
-            return inference.predict_from_points(image_rgb, prior_hand.landmarks)
+            return inference.predict_from_points_tiled(
+                image_rgb, prior_hand.landmarks, tile_size=tile_size, overlap=tile_overlap
+            )
 
         logger.warning(
             "Sam2HandDetector: この手にはbbox・landmarksのいずれも無いため "

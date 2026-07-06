@@ -19,7 +19,7 @@ import cv2
 import numpy as np
 import pytest
 
-from utils.sam2_inference import Sam2OnnxInference
+from utils.sam2_inference import Sam2OnnxInference, _tile_starts
 
 
 class _FakeDecoderSession:
@@ -39,8 +39,10 @@ class _FakeEncoderSession:
         self._output_names = list(outputs.keys())
         self._output_values = list(outputs.values())
         self.last_input_feed: dict[str, np.ndarray] | None = None
+        self.call_count = 0
 
     def run(self, output_names, input_feed):
+        self.call_count += 1
         self.last_input_feed = input_feed
         return self._output_values
 
@@ -282,3 +284,136 @@ class TestPredictFromBoxAndPoints:
         obj._encode_image = _raise  # type: ignore[method-assign]
         image = np.zeros((200, 200, 3), dtype=np.uint8)
         assert obj.predict_from_box(image, box=(0.0, 0.0, 10.0, 10.0)) is None
+
+
+class TestTileStarts:
+    def test_length_within_tile_size_returns_single_tile(self):
+        assert _tile_starts(300, 512, 64) == [(0, 300)]
+        assert _tile_starts(512, 512, 64) == [(0, 512)]
+
+    def test_covers_full_length_without_gaps(self):
+        length, tile_size, overlap = 1000, 512, 64
+        starts = _tile_starts(length, tile_size, overlap)
+        assert starts[0][0] == 0
+        assert starts[-1][0] + starts[-1][1] == length
+        # 隙間が無いこと(隣接タイルが重なるか接することを確認)
+        for (s1, w1), (s2, _w2) in zip(starts, starts[1:]):
+            assert s2 <= s1 + w1
+
+    def test_all_tiles_have_requested_size_when_length_exceeds_tile_size(self):
+        starts = _tile_starts(1000, 512, 64)
+        assert all(w == 512 for _s, w in starts)
+
+
+class TestPredictFromBoxTiled:
+    def _setup_tiled_instance(self, raw_mask_shape=(64, 64)):
+        decoder_names = ["point_coords", "point_labels", "image_embed"]
+        raw_mask = np.ones((1,) + raw_mask_shape, dtype=np.float32)
+        encoder_outputs = {"image_embed": np.zeros((1, 3))}
+        return _make_instance(decoder_names, raw_mask, encoder_outputs)
+
+    def test_small_image_delegates_to_single_predict_call(self):
+        """tile_size以下の画像は分割せず、エンコーダ呼び出しは1回だけ"""
+        obj, _decoder_session, encoder_session = self._setup_tiled_instance()
+        image = np.zeros((300, 400, 3), dtype=np.uint8)
+
+        mask = obj.predict_from_box_tiled(image, box=(10.0, 10.0, 200.0, 200.0), tile_size=512)
+
+        assert mask is not None
+        assert mask.shape == (300, 400)
+        assert encoder_session.call_count == 1
+
+    def test_large_image_triggers_multiple_encoder_calls(self):
+        """tile_sizeを超える画像は複数タイルに分割され、エンコーダが複数回呼ばれる"""
+        obj, _decoder_session, encoder_session = self._setup_tiled_instance()
+        image = np.zeros((1000, 1000, 3), dtype=np.uint8)
+        # box全体を覆う(全タイルと重なる)ように設定
+        box = (0.0, 0.0, 1000.0, 1000.0)
+
+        mask = obj.predict_from_box_tiled(image, box, tile_size=512, overlap=64)
+
+        assert mask is not None
+        assert mask.shape == (1000, 1000)
+        assert encoder_session.call_count > 1
+
+    def test_tiles_not_overlapping_box_are_skipped(self):
+        """boxと重ならないタイルはエンコード自体がスキップされる(無駄な呼び出しを避ける)"""
+        obj, _decoder_session, encoder_session = self._setup_tiled_instance()
+        image = np.zeros((1200, 1200, 3), dtype=np.uint8)
+        # 画像の左上の小さな領域だけにboxを限定する
+        box = (0.0, 0.0, 50.0, 50.0)
+
+        mask = obj.predict_from_box_tiled(image, box, tile_size=512, overlap=64)
+
+        assert mask is not None
+        # 左上の1タイルだけがboxと重なるはずなので、エンコーダ呼び出しは1回のみ
+        assert encoder_session.call_count == 1
+
+    def test_stitched_mask_has_foreground_only_within_box_region(self):
+        """
+        フェイクデコーダは常に全面前景を返すため、最終的な合成マスクの
+        前景領域は「実際にエンコードされたタイル」の範囲に限定される
+        （boxと無関係なタイルはスキップされ0のまま）ことを確認する。
+        """
+        obj, _decoder_session, _encoder_session = self._setup_tiled_instance()
+        image = np.zeros((1200, 1200, 3), dtype=np.uint8)
+        box = (0.0, 0.0, 50.0, 50.0)  # 左上のみ
+
+        mask = obj.predict_from_box_tiled(image, box, tile_size=512, overlap=64)
+
+        assert mask is not None
+        # 右下(box/タイルと全く関係ない領域)は前景になっていないはず
+        assert mask[-1, -1] == 0
+
+    def test_overlap_region_uses_logical_or_between_tiles(self):
+        """重なり領域は前景優先(論理和)で統合され、値が破損しないことを確認"""
+        obj, _decoder_session, encoder_session = self._setup_tiled_instance()
+        image = np.zeros((1000, 600, 3), dtype=np.uint8)
+        box = (0.0, 0.0, 600.0, 1000.0)  # 縦方向全体を覆う(複数タイルにまたがる)
+
+        mask = obj.predict_from_box_tiled(image, box, tile_size=512, overlap=64)
+
+        assert mask is not None
+        assert encoder_session.call_count > 1
+        assert set(np.unique(mask)).issubset({0, 255})
+
+
+class TestPredictFromPointsTiled:
+    def _setup_tiled_instance(self):
+        decoder_names = ["point_coords", "point_labels", "image_embed"]
+        raw_mask = np.ones((1, 32, 32), dtype=np.float32)
+        encoder_outputs = {"image_embed": np.zeros((1, 3))}
+        return _make_instance(decoder_names, raw_mask, encoder_outputs)
+
+    def test_empty_points_returns_none(self):
+        obj, _decoder_session, _encoder_session = self._setup_tiled_instance()
+        image = np.zeros((1000, 1000, 3), dtype=np.uint8)
+        assert obj.predict_from_points_tiled(image, []) is None
+
+    def test_only_tiles_containing_points_are_encoded(self):
+        """点が含まれるタイルだけがエンコードされることを確認"""
+        obj, _decoder_session, encoder_session = self._setup_tiled_instance()
+        image = np.zeros((1200, 1200, 3), dtype=np.uint8)
+        points = [(10.0, 10.0), (20.0, 20.0)]  # 左上の1タイルにのみ含まれる
+
+        mask = obj.predict_from_points_tiled(image, points, tile_size=512, overlap=64)
+
+        assert mask is not None
+        assert encoder_session.call_count == 1
+
+    def test_points_spanning_multiple_tiles_triggers_multiple_encodes(self):
+        obj, _decoder_session, encoder_session = self._setup_tiled_instance()
+        image = np.zeros((1200, 1200, 3), dtype=np.uint8)
+        points = [(10.0, 10.0), (1100.0, 1100.0)]  # 対角の別タイルに1点ずつ
+
+        mask = obj.predict_from_points_tiled(image, points, tile_size=512, overlap=64)
+
+        assert mask is not None
+        assert encoder_session.call_count == 2
+
+    def test_small_image_delegates_to_single_predict_call(self):
+        obj, _decoder_session, encoder_session = self._setup_tiled_instance()
+        image = np.zeros((300, 300, 3), dtype=np.uint8)
+        mask = obj.predict_from_points_tiled(image, [(10.0, 10.0)], tile_size=512)
+        assert mask is not None
+        assert encoder_session.call_count == 1

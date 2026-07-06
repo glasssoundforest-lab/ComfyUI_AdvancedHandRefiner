@@ -94,6 +94,29 @@ class TestSam2RealModelInference:
         assert mask is not None
         assert mask.shape == (200, 400)
 
+    def test_predict_from_box_tiled_returns_valid_mask_on_large_image(self, sam2_inference):
+        """
+        Phase: SAM2マスクの実効解像度向上（タイル分割）。実モデルで
+        tile_sizeを超える画像を渡し、複数タイルへの分割・合成が
+        最後まで正常に完了することを確認する。
+        """
+        image = np.zeros((700, 900, 3), dtype=np.uint8)
+        mask = sam2_inference.predict_from_box_tiled(
+            image, box=(50.0, 50.0, 850.0, 650.0), tile_size=512, overlap=64
+        )
+        assert mask is not None
+        assert mask.shape == (700, 900)
+        assert mask.dtype == np.uint8
+        assert set(np.unique(mask)).issubset({0, 255})
+
+    def test_predict_from_box_tiled_matches_single_call_on_small_image(self, sam2_inference):
+        """tile_size以下の画像では、タイル分割版と通常版が同じ経路(1回のみの推論)を通る"""
+        image = np.zeros((300, 300, 3), dtype=np.uint8)
+        box = (50.0, 50.0, 250.0, 250.0)
+        mask_normal = sam2_inference.predict_from_box(image, box)
+        mask_tiled = sam2_inference.predict_from_box_tiled(image, box, tile_size=512)
+        np.testing.assert_array_equal(mask_normal, mask_tiled)
+
 
 class TestMediaPipeRealModel:
     def test_hand_landmarker_loads_and_runs_on_blank_image(self):
