@@ -174,11 +174,21 @@ class Sam2OnnxInference:
         while raw_mask.ndim > 2:
             raw_mask = raw_mask[0]
 
-        mask_prob = raw_mask if raw_mask.dtype == np.bool_ else raw_mask > 0.0
-        mask_uint8 = (mask_prob.astype(np.uint8)) * 255
+        is_bool = raw_mask.dtype == np.bool_
+        # ★重要: 閾値判定(二値化)を行う前に、連続値(確率/logit)のまま
+        # リサイズする。SAM2デコーダの生出力は元画像より低い解像度で
+        # あることが多く、先に二値化してからニアレストネイバーで拡大すると、
+        # 閾値付近でわずかにブレた値がブロック状・まだら状のノイズとして
+        # そのまま拡大されてしまう（実際に報告されたまだら模様の原因）。
+        # 連続値のまま線形補間でリサイズしてから閾値判定することで、
+        # 境界が滑らかになりノイズが解消される。
+        prob = raw_mask.astype(np.float32)
 
-        if mask_uint8.shape != (orig_h, orig_w):
-            mask_uint8 = cv2.resize(mask_uint8, (orig_w, orig_h), interpolation=cv2.INTER_NEAREST)
+        if prob.shape != (orig_h, orig_w):
+            prob = cv2.resize(prob, (orig_w, orig_h), interpolation=cv2.INTER_LINEAR)
+
+        threshold = 0.5 if is_bool else 0.0
+        mask_uint8 = (prob > threshold).astype(np.uint8) * 255
 
         return mask_uint8
 

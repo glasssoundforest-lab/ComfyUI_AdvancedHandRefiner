@@ -15,6 +15,7 @@ run()の呼び出し内容を記録するフェイクセッションで検証す
 
 from __future__ import annotations
 
+import cv2
 import numpy as np
 import pytest
 
@@ -185,6 +186,50 @@ class TestRunDecoderMaskPostProcessing:
 
         result = obj._run_decoder({}, np.zeros((1, 1, 2)), np.zeros((1, 1)), orig_size=(8, 8))
         assert result.shape == (8, 8)
+
+    def test_threshold_after_resize_avoids_blocky_noise_from_low_res_decoder_output(self):
+        """
+        ★回帰テスト: SAM2デコーダの低解像度な生出力(logit)を高解像度へ
+        拡大する際、「先に閾値判定してからニアレストネイバーで拡大」する
+        と、閾値付近でわずかに符号がブレた1画素が、拡大後にブロック状の
+        大きな誤り領域として残ってしまう（実際にユーザー環境で報告された
+        「まだら状のノイズ」の原因）。
+
+        「連続値のまま線形補間で拡大してから閾値判定する」(修正後の実装)
+        方が、そのようなノイズ状の1画素の影響が拡大後に小さく・滑らかに
+        なることを、意図的にノイズを1画素混ぜた低解像度logitマスクを使い
+        検証する。
+        """
+        low_res = np.full((8, 8), 3.0, dtype=np.float32)  # 全面前景(logit>0)
+        low_res[3, 3] = -2.0  # 閾値付近でブレた1画素(本来は前景寄りだが逆符号のノイズ)
+
+        decoder_names = ["point_coords"]
+        obj, _decoder_session, _ = _make_instance(decoder_names, low_res.reshape(1, 8, 8))
+
+        target = 80  # 8x8 -> 80x80、拡大率10倍
+        result = obj._run_decoder(
+            {}, np.zeros((1, 1, 2)), np.zeros((1, 1)), orig_size=(target, target)
+        )
+
+        # 修正前の実装(先に閾値判定してからニアレストネイバーで拡大)を
+        # 同じ入力に対して再現し、比較対象とする。
+        naive_thresholded = (low_res > 0.0).astype(np.uint8) * 255
+        naive_result = cv2.resize(
+            naive_thresholded, (target, target), interpolation=cv2.INTER_NEAREST
+        )
+
+        # 背景(0)と判定された画素数を比較する。ニアレストネイバー方式では
+        # ノイズ1画素がそのまま10x10=100画素の背景ブロックとして残るが、
+        # 線形補間してから閾値判定する修正後の実装では、周囲の前景の影響で
+        # 背景と判定される画素数はそれよりずっと少なくなるはず。
+        naive_background_px = int(np.count_nonzero(naive_result == 0))
+        fixed_background_px = int(np.count_nonzero(result == 0))
+
+        assert naive_background_px == 100  # 10x10ブロックがそのまま残る(想定通りの再現)
+        assert fixed_background_px < naive_background_px, (
+            "修正後の実装(閾値判定前にリサイズ)は、ノイズ1画素の影響範囲が"
+            "ニアレストネイバー方式より小さくなるはずだが、そうなっていない"
+        )
 
 
 class TestPredictFromBoxAndPoints:
