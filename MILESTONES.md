@@ -34,23 +34,57 @@
 
 ---
 
-## Phase 2: 実機検証（優先度: 高）
+## Phase 2: 実機検証（優先度: 高）🔶 一部完了（2026-07-06、サンドボックス内で可能な範囲）
 
-サンドボックス環境はネットワーク制限（`storage.googleapis.com` / `huggingface.co` 等へ未対応）のため、
-以下はユーザー環境（実際のComfyUI環境）でのみ検証可能。
+このサンドボックス環境は `huggingface.co` 等へのネットワークアクセスが制限されており、
+かつ `torch` のLinux向けpip配布がNVIDIA CUDAライブラリ群に依存するビルドのため、
+素朴な `pip install torch` ではCPU実行すら動作しないという制約があった
+（`libcublasLt.so` 等が無くインポート時点でエラー）。そのため以下は
+**このサンドボックス内で実際に検証できたもの**と、**ユーザーの実ComfyUI環境
+でのみ検証可能なもの**に分けて記録する。
 
-- [ ] MediaPipeモデル（`hand_landmarker.task`）の自動ダウンロード確認
-- [ ] `hand_yolov8s.pt` の自動ダウンロード + `ultralytics` によるONNX変換（初回のみ）の成否確認
-- [ ] SAM2 encoder/decoder ONNX（`sam2_hiera_tiny`）の自動ダウンロード確認
-      ※ 今回のセッションでモデル本体はリポジトリに格納済みのため、このステップは実質完了見込み
-- [ ] 実際にダウンロード/配置したSAM2 ONNXの入出力テンソル名が、想定パターン
-      （`point_coord`, `point_label`, `has_mask`, `mask_input`, `orig_im_size`,
-      `image_embed`, `high_res_feats_0/1`）と一致するか確認。ズレがあれば
-      `sam2_inference.py` のキーワードマッチングを調整
-- [ ] 実写真での3ノード連携（Orientation → MaskRefiner → SeamlessStitcher）確認
-- [ ] YOLO + SAM2 有効時の検出・セグメンテーション精度の確認
-- [ ] `use_sam2_mask` / `sam2_blend_strength` の効果を実写真で確認
-- [ ] CUDA環境（`onnxruntime-gpu`）でのGPU推論動作確認
+### ✅ サンドボックス内で実モデル・実コードで検証済み
+
+- [x] SAM2 encoder/decoder ONNX（`sam2_hiera_tiny`）の実ファイルをonnxruntimeで
+      ロードし、入出力テンソル名を確認 → **想定パターンと完全一致**
+      （`image_embed`, `high_res_feats_0/1`, `point_coords`, `point_labels`,
+      `mask_input`, `has_mask_input` 全て一致。部分文字列マッチのバグ修正が
+      正しく機能することも実モデルで確認済み）
+- [x] `Sam2OnnxInference`（実装コードそのもの）で実ONNXモデルを使い、
+      bboxプロンプト・pointプロンプト両方で実推論が最後まで通り、
+      妥当な形状のマスクが得られることを確認
+- [x] `hand_landmarker.task`（実モデル、mediapipe 0.10.33）をTask API経由で
+      ロードし、検出APIが正常に動作することを確認（Solutions API廃止後の
+      移行が正しく機能している）
+- [x] `MediaPipeHandDetector` + `Sam2HandDetector` を実際に
+      `DetectorPipeline` に組み込み、手なし画像で正しく空の結果に
+      フォールバックすることを確認
+- [x] MediaPipe由来のbbox/landmarksを模したpriorを注入し、`Sam2HandDetector`が
+      実モデルで妥当なマスクを生成することを確認
+- [x] `nodes.py` の3ノード（Orientation→MaskRefiner→Stitcher）を実検出器
+      （MediaPipe+SAM2、YOLOは未変換のため自動スキップ）で通しで実行し、
+      クラッシュしないことを確認
+- [x] `hand_yolov8s.pt` ファイル自体の整合性確認（正常なPyTorchチェックポイント
+      形式であり破損していないことをzip構造から確認）
+- [x] 上記の知見を `tests/test_integration_real_models.py` として
+      回帰テスト化（実モデルファイルが無い環境では自動的にスキップされる設計）
+
+### ⏳ ユーザーの実ComfyUI環境でのみ検証可能（サンドボックスでは不可能と判明）
+
+- [ ] `hand_yolov8s.pt` → `.onnx` 変換（`ultralytics` + 動作する`torch`が必要）。
+      このサンドボックスでは `pip install torch` してもNVIDIA CUDA関連の
+      共有ライブラリが無く `import torch` 自体が失敗した
+      （`libcublasLt.so.*` 等、正しくインストールすると数GB規模になり
+      このサンドボックスのディスク容量的にも安全でないと判断）。
+      ComfyUIは通常torchが正しくセットアップ済みのため、実環境側では
+      問題なく動作する可能性が高い
+- [ ] 変換後のYOLO ONNXでの実推論・検出精度確認
+- [ ] 実写真での検出・セグメンテーション精度そのものの妥当性
+      （このサンドボックスでの検証は「クラッシュしないこと」の確認であり、
+      精度評価ではない）
+- [ ] CUDA環境（`onnxruntime-gpu`）での実際のGPU推論動作
+- [ ] 実写真での `finger_sharpness` / `wrist_blur` / `sam2_blend_strength` の
+      見た目上の妥当性
 
 ---
 

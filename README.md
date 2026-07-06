@@ -53,14 +53,19 @@ pip install -r tests/requirements-test.txt
 pytest
 ```
 
-`geometry.py` / `detection_types.py` / `detectors/base.py` / `yolo_inference.py` /
-`sam2_inference.py` / `nodes.py`のSAM2マスクブレンドロジックをカバーする
-pytestベースの単体テスト（72件）を用意しています。詳細は [`tests/README.md`](./tests/README.md) を参照してください。
+- `tests/test_*.py`（Phase 1）: フェイクセッション/モックによるロジック単体テスト（72件）
+- `tests/test_integration_real_models.py`（Phase 2）: 実際のSAM2 ONNXモデル・
+  MediaPipeモデルを使った統合テスト（実モデルファイルが無い環境では自動スキップ）
+
+詳細は [`tests/README.md`](./tests/README.md) を参照してください。
 
 ## 現在の開発状況
 
-検出器抽象化レイヤー（YOLO / MediaPipe / SAM2）の実装が完了し、モデルデータの配置・単体テスト整備も完了しています。
-実際のComfyUI環境（サンドボックス外）での通し検証が次のステップです。
+検出器抽象化レイヤー（YOLO / MediaPipe / SAM2）の実装、モデルデータの配置、単体テスト整備に加え、
+サンドボックス内で可能な範囲の実機検証（SAM2/MediaPipeの実モデルでの動作確認）まで完了しています。
+
+YOLOの`.pt→.onnx`変換と実写真での精度検証は、`torch`が正しくセットアップされたユーザーの
+実ComfyUI環境でのみ実施可能です（詳細は [`MILESTONES.md`](./MILESTONES.md) のPhase 2を参照）。
 
 今後の開発マイルストーンの詳細は [`MILESTONES.md`](./MILESTONES.md) を参照してください。
 

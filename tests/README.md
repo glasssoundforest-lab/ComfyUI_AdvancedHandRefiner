@@ -38,6 +38,7 @@ pytest
 | `test_yolo_inference.py` | `utils/yolo_inference.py`（レターボックス・NMS・座標復元） |
 | `test_sam2_inference.py` | `utils/sam2_inference.py`（デコーダ入力名解決、プロンプト構築） |
 | `test_nodes_sam2_blend.py` | `nodes.py`（`AdvancedHandMaskRefiner._blend_with_sam2_mask`） |
+| `test_integration_real_models.py` | **Phase 2**: 実際のSAM2 ONNXモデル・MediaPipeモデルを使った統合テスト（実モデルファイルが無い/mediapipe未インストールの環境では自動スキップ） |
 
 ## 未カバー（実機検証が必要、Phase 2）
 
