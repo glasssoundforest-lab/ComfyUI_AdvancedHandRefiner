@@ -1,0 +1,15 @@
+# テスト実行に必要な依存関係
+#
+# 本体(nodes.py等)は ComfyUI 経由で torch / opencv-python / numpy /
+# onnxruntime 等が提供される前提だが、tests/ 配下のテストは
+# tests/conftest.py の torch スタブにより、torch が無い環境でも
+# 実行できるように設計されている。
+#
+# 実行方法:
+#   pip install -r tests/requirements-test.txt
+#   pytest
+
+pytest>=8.0
+opencv-python-headless>=4.8
+numpy>=1.24
+onnxruntime>=1.16

@@ -17,17 +17,20 @@
 
 ---
 
-## Phase 1: テスト基盤整備（優先度: 高）
+## Phase 1: テスト基盤整備（優先度: 高）✅ 完了（2026-07-06）
 
-- [ ] `pytest` 導入・ディレクトリ構成整備（`tests/`）
-- [ ] `geometry.py` の幾何学関数群のテスト（回転角度・回転変換・逆変換の数値精度）
-- [ ] `detection_types.py` / `detectors/base.py` の統合ロジックのテスト
+- [x] `pytest` 導入・ディレクトリ構成整備（`tests/`）
+- [x] `geometry.py` の幾何学関数群のテスト（回転角度・回転変換・逆変換の数値精度）
+- [x] `detection_types.py` / `detectors/base.py` の統合ロジックのテスト
       （`HandDetection.merge()`、`DetectorPipeline`、`_merge_results`）
-- [ ] `yolo_inference.py` のレターボックス変換・NMS・座標復元テスト
-      （合成ONNXモデルを使った検証はセッション内で実施済み → テストコード化）
-- [ ] `sam2_inference.py` のプロンプト構築・入出力名の動的解決ロジックのテスト
-      （同様に合成ONNXモデルでのテストを流用）
-- [ ] `nodes.py` の `AdvancedHandMaskRefiner._blend_with_sam2_mask()` のブレンド強度テスト
+- [x] `yolo_inference.py` のレターボックス変換・NMS・座標復元テスト
+      （フェイクonnxruntimeセッションで既知の座標を使い、手計算した期待値と一致することを確認）
+- [x] `sam2_inference.py` のプロンプト構築・入出力名の動的解決ロジックのテスト
+      （`has_mask_input`/`mask_input`の部分文字列マッチバグの回帰テストを含む）
+- [x] `nodes.py` の `AdvancedHandMaskRefiner._blend_with_sam2_mask()` のブレンド強度テスト
+
+72件のテスト全てパス。詳細は [`tests/README.md`](./tests/README.md) を参照。
+実際のMediaPipe/YOLO/SAM2モデルを使った検出精度そのものはPhase 2（実機検証）で確認する。
 
 ---
 
