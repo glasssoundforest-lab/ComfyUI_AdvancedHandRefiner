@@ -12,7 +12,7 @@ import numpy as np
 import pytest
 
 from utils.detection_types import BoundingBox, DetectionResult, HandDetection
-from utils.detectors.base import DetectorPipeline, HandDetector, _merge_results
+from utils.detectors.base import DetectorPipeline, HandDetector, _bbox_iou, _merge_results
 
 
 class _StubDetector(HandDetector):
@@ -76,6 +76,129 @@ class TestMergeResults:
         new = DetectionResult(hands=[HandDetection(source="mediapipe")])
         merged = _merge_results(prior, new)
         assert len(merged.hands) == 2
+
+
+class TestBboxIou:
+    def test_identical_boxes_have_iou_one(self):
+        a = BoundingBox(0, 0, 10, 10)
+        assert _bbox_iou(a, a) == pytest.approx(1.0)
+
+    def test_non_overlapping_boxes_have_iou_zero(self):
+        a = BoundingBox(0, 0, 10, 10)
+        b = BoundingBox(100, 100, 110, 110)
+        assert _bbox_iou(a, b) == pytest.approx(0.0)
+
+    def test_partial_overlap(self):
+        a = BoundingBox(0, 0, 10, 10)  # area=100
+        b = BoundingBox(5, 5, 15, 15)  # area=100, intersection=5x5=25
+        # union = 100+100-25=175, iou=25/175
+        assert _bbox_iou(a, b) == pytest.approx(25.0 / 175.0)
+
+
+class TestMergeResultsMultiHandIoU:
+    """複数手が写っている場合のIoUベースのマッチングを検証"""
+
+    def test_two_hands_matched_correctly_regardless_of_order(self):
+        """
+        prior(YOLO)が[左手, 右手]の順、new(MediaPipe)が[右手, 左手]の
+        逆順で返しても、bboxのIoUで正しく対応付けられることを確認
+        """
+        left_bbox = BoundingBox(0, 0, 50, 50)
+        right_bbox = BoundingBox(200, 200, 250, 250)
+
+        prior = DetectionResult(
+            hands=[
+                HandDetection(bbox=left_bbox, source="yolo", confidence=0.9),
+                HandDetection(bbox=right_bbox, source="yolo", confidence=0.8),
+            ]
+        )
+        # new側は順序が逆(右手が先)、bboxはprior側とほぼ同じ位置(僅かにズレていてもIoUがしきい値を超える)
+        new = DetectionResult(
+            hands=[
+                HandDetection(
+                    bbox=BoundingBox(202, 202, 252, 252), source="mediapipe", confidence=0.7
+                ),
+                HandDetection(
+                    bbox=BoundingBox(2, 2, 52, 52), source="mediapipe", confidence=0.6
+                ),
+            ]
+        )
+
+        merged = _merge_results(prior, new)
+        assert len(merged.hands) == 2
+
+        # 1つ目(prior[0]=左手)は、new側の「左手寄りのbbox」と対応付けられているはず
+        left_merged = merged.hands[0]
+        assert left_merged.bbox == left_bbox  # priorのbboxがそのまま優先される
+        assert left_merged.source == "yolo+mediapipe"
+
+        right_merged = merged.hands[1]
+        assert right_merged.bbox == right_bbox
+        assert right_merged.source == "yolo+mediapipe"
+
+    def test_non_overlapping_new_hand_is_added_as_separate_hand(self):
+        """
+        new側に、prior側のどの手ともIoUが低い(=別の手と思われる)bboxが
+        含まれる場合、統合はせず新しい手として追加されることを確認
+        """
+        prior = DetectionResult(
+            hands=[HandDetection(bbox=BoundingBox(0, 0, 50, 50), source="yolo", confidence=0.9)]
+        )
+        new = DetectionResult(
+            hands=[
+                HandDetection(
+                    bbox=BoundingBox(500, 500, 550, 550), source="mediapipe", confidence=0.7
+                )
+            ]
+        )
+
+        merged = _merge_results(prior, new)
+        assert len(merged.hands) == 2
+        # 1つ目はマージされずprior単独のまま
+        assert merged.hands[0].source == "yolo"
+        # 2つ目はnew単独のまま追加されている
+        assert merged.hands[1].source == "mediapipe"
+
+    def test_low_iou_below_threshold_is_not_matched(self):
+        """IoUがしきい値未満のわずかな重なりは、同一の手とみなさない"""
+        prior = DetectionResult(
+            hands=[HandDetection(bbox=BoundingBox(0, 0, 100, 100), source="yolo")]
+        )
+        # 隅がわずかに重なるだけ(IoUはしきい値0.3よりずっと小さい)
+        new = DetectionResult(
+            hands=[HandDetection(bbox=BoundingBox(90, 90, 190, 190), source="mediapipe")]
+        )
+
+        merged = _merge_results(prior, new)
+        assert len(merged.hands) == 2  # 別の手として扱われる
+
+    def test_three_hands_all_matched_correctly(self):
+        """3つの手が写っている場合でも、全て正しく対応付けられることを確認"""
+        boxes = [
+            BoundingBox(0, 0, 40, 40),
+            BoundingBox(100, 100, 140, 140),
+            BoundingBox(300, 300, 340, 340),
+        ]
+        prior = DetectionResult(
+            hands=[HandDetection(bbox=b, source="yolo", confidence=0.9) for b in boxes]
+        )
+        # 順序をシャッフルし、僅かにズレたbboxで返す
+        shuffled = [boxes[2], boxes[0], boxes[1]]
+        new = DetectionResult(
+            hands=[
+                HandDetection(
+                    bbox=BoundingBox(b.x1 + 1, b.y1 + 1, b.x2 + 1, b.y2 + 1),
+                    source="mediapipe",
+                )
+                for b in shuffled
+            ]
+        )
+
+        merged = _merge_results(prior, new)
+        assert len(merged.hands) == 3
+        for original_box, merged_hand in zip(boxes, merged.hands):
+            assert merged_hand.bbox == original_box
+            assert merged_hand.source == "yolo+mediapipe"
 
 
 class TestDetectorPipeline:

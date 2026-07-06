@@ -19,7 +19,7 @@ from typing import Any
 
 import numpy as np
 
-from utils.detection_types import DetectionResult, HandDetection
+from utils.detection_types import BoundingBox, DetectionResult, HandDetection
 
 logger = logging.getLogger("HandRefiner")
 
@@ -129,13 +129,48 @@ class DetectorPipeline:
         return result if result is not None else DetectionResult()
 
 
+#: 2つのbboxを「同一の手」とみなすIoUの最低しきい値。
+#: 手同士は通常ある程度離れているため、緩めの値でも誤対応のリスクは低い。
+IOU_MATCH_THRESHOLD = 0.3
+
+
+def _bbox_iou(a: BoundingBox, b: BoundingBox) -> float:
+    """2つのBoundingBoxのIoU（Intersection over Union）を計算する"""
+    ix1 = max(a.x1, b.x1)
+    iy1 = max(a.y1, b.y1)
+    ix2 = min(a.x2, b.x2)
+    iy2 = min(a.y2, b.y2)
+
+    iw = max(0.0, ix2 - ix1)
+    ih = max(0.0, iy2 - iy1)
+    intersection = iw * ih
+
+    area_a = max(0.0, a.width) * max(0.0, a.height)
+    area_b = max(0.0, b.width) * max(0.0, b.height)
+    union = area_a + area_b - intersection
+
+    if union <= 0.0:
+        return 0.0
+    return intersection / union
+
+
 def _merge_results(prior: DetectionResult | None, new: DetectionResult) -> DetectionResult:
     """
     prior（これまでの統合結果）と new（今回の検出器の結果）をマージする。
 
-    現状は「hands のインデックスが対応する同一の手」という単純な
-    前提で HandDetection.merge() を使う（先頭検出器が手の個数・順序を
-    決定し、後続の検出器はその順序に沿って情報を補完していく想定）。
+    複数の手が写っている場合を考慮し、bboxのIoUに基づいて
+    「同一の手」を対応付ける。両者にbboxがあり、IoUが
+    `IOU_MATCH_THRESHOLD` 以上であれば同一の手としてマージする。
+
+    以下のケースでは、後方互換のため単純な先頭からの順序対応に
+    フォールバックする（landmarksのみでbboxを持たない検出器
+    （現状のMediaPipe実装等）を扱うため）:
+      - prior側の手がbboxを持たない
+      - new側にIoU一致する手が見つからない（bbox非対応の検出器等）
+
+    IoUで対応が見つからず、かつ new 側に対応付けられていない手が
+    残っている場合は、それらは「新たに見つかった別の手」として
+    結果に追加される（複数手対応）。
     """
     if prior is None or prior.is_empty:
         return new
@@ -143,14 +178,45 @@ def _merge_results(prior: DetectionResult | None, new: DetectionResult) -> Detec
     if new.is_empty:
         return prior
 
+    new_available = list(range(len(new.hands)))
     merged_hands: list[HandDetection] = []
-    max_len = max(len(prior.hands), len(new.hands))
-    for i in range(max_len):
-        if i < len(prior.hands) and i < len(new.hands):
-            merged_hands.append(prior.hands[i].merge(new.hands[i]))
-        elif i < len(prior.hands):
-            merged_hands.append(prior.hands[i])
+
+    for p_hand in prior.hands:
+        match_idx: int | None = None
+
+        if p_hand.bbox is not None:
+            best_iou = 0.0
+            any_new_has_bbox = False
+            for j in new_available:
+                n_bbox = new.hands[j].bbox
+                if n_bbox is None:
+                    continue
+                any_new_has_bbox = True
+                iou = _bbox_iou(p_hand.bbox, n_bbox)
+                if iou > best_iou:
+                    best_iou = iou
+                    match_idx = j
+            if best_iou < IOU_MATCH_THRESHOLD:
+                match_idx = None
+                if not any_new_has_bbox and new_available:
+                    # new側にbbox情報が一つも無い(bbox非対応の検出器)場合のみ、
+                    # 後方互換のため先頭要素へフォールバックする。
+                    # new側にbboxがあるのにIoUが低い場合は、genuinely別の手
+                    # とみなし、フォールバックしない。
+                    match_idx = new_available[0]
+        elif new_available:
+            # p_hand自体がbboxを持たない場合も同様にフォールバックする
+            match_idx = new_available[0]
+
+        if match_idx is not None:
+            merged_hands.append(p_hand.merge(new.hands[match_idx]))
+            new_available.remove(match_idx)
         else:
-            merged_hands.append(new.hands[i])
+            merged_hands.append(p_hand)
+
+    # prior側のどの手にも対応付かなかったnew側の手は、新たに検出された
+    # 別の手として結果に追加する（複数手対応）
+    for j in new_available:
+        merged_hands.append(new.hands[j])
 
     return DetectionResult(hands=merged_hands)

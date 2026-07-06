@@ -5,6 +5,18 @@ Reinhardのカラー転送（LAB色空間での平均・標準偏差マッチン
 マスク周辺のリング状領域（貼り付け境界のすぐ外側）の統計量を基準に
 適用する。inpaint結果全体ではなく「境界付近の色調」を基準にすることで、
 照明・肌色の局所的な変化に追従しやすくする。
+
+★現状のステータス（2026-07-07時点）: 未使用（デッドコード候補）
+    nodes.py の AdvancedHandSeamlessStitcher は、このモジュールを
+    呼び出していない。同ノードの `color_match_strength` パラメータは
+    名前が似ているが実際には全く別の処理
+    （cv2.seamlessCloneによるPoisson blendingと単純アルファブレンドの
+    重み付け）であり、このモジュールのReinhardカラー転送とは無関係。
+
+    実写真での比較検証（Poisson blendingだけで境界の色調が十分自然に
+    見えるか、それともこのReinhard転送を追加すべきか）がまだ行われて
+    いないため、統合するか削除するかの判断を保留している
+    （MILESTONES.md Phase 4参照）。
 """
 
 from __future__ import annotations

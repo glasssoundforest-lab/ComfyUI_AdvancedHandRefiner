@@ -109,15 +109,36 @@
 
 ---
 
-## Phase 4: 検出・統合ロジックの高度化（優先度: 中）
+## Phase 4: 検出・統合ロジックの高度化（優先度: 中）🔶 一部完了（2026-07-07）
 
-- [ ] `DetectorPipeline` の統合ロジック高度化
-      （現状は先頭検出器基準の単純統合。複数の手がある場合のIoUベースの対応付けが将来的に必要）
-- [ ] 複数手対応（現状 `result.best` の1つのみ処理。hand_index選択 or バッチ処理を検討）
-- [ ] `color_match.py`（Reinhardカラー転送、現在未使用）を統合するか削除するか、
-      実写真比較検証後に判断
-- [ ] YOLO事前変換済みONNXの配布検討（`ultralytics` 依存を排除できるか、
-      ライセンス・保守コストとのトレードオフを検討）
+- [x] `DetectorPipeline` の統合ロジック高度化 ✅
+      bboxのIoU（`IOU_MATCH_THRESHOLD=0.3`）に基づくマッチングに変更。
+      両者にbboxがあればIoUで対応付け、無い場合（bbox非対応の検出器）は
+      後方互換のため先頭要素への順序対応にフォールバックする。
+      IoUが低い場合は誤って統合せず、別々の手として扱う（複数手対応）。
+      `utils/detectors/base.py`の`_bbox_iou`/`_merge_results`、
+      `tests/test_detector_pipeline.py`に11件のテストを追加（計93件）
+- [x] 複数手対応 ✅
+      `AdvancedHandOrientationOptimizer` / `AdvancedHandMaskRefiner`に
+      `hand_index`パラメータ（デフォルト0=最も信頼度の高い手、従来の
+      `result.best`と同じ）を追加。範囲外の値は警告を出しつつ最後の
+      手にクランプする（クラッシュしない設計）。`nodes.py`の
+      `_select_hand()`ヘルパーとして実装、`tests/test_nodes_hand_selection.py`
+      でテスト。
+      なお、MediaPipe側は元々`num_hands=2`で複数手のbboxを返す設計だった
+      ため、今回のIoU修正によって「YOLOとMediaPipeが異なる順序で手を
+      返した場合に誤って統合される」という潜在バグも同時に解消された
+- [x] YOLO事前変換済みONNXの配布 ✅ 【Phase 2で実施済み】
+      `hand_yolov8s.onnx`を本リポジトリに同梱済みのため、`ultralytics`
+      無しでも動作する。改めての対応は不要と判断
+- [ ] `color_match.py`（Reinhardカラー転送、現在未使用）を統合するか削除するか
+      → **引き続き判断保留**。実写真での比較検証（Poisson blendingのみで
+      境界の色調が十分自然に見えるか）が必要なため、このサンドボックスでは
+      判断材料が無い。モジュール冒頭に「未使用（デッドコード候補）」で
+      あることを明記するコメントを追加し、状況を明確化するに留めた
+      （`nodes.py`の`color_match_strength`パラメータは名前が似ているが
+      別処理＝Poisson blending/単純合成のブレンド強度であり、この
+      モジュールとは無関係であることも明記）
 
 ---
 

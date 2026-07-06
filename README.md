@@ -48,8 +48,10 @@ pip install -r requirements.txt
 
 手の検出は `YOLO（バウンディングボックス） → MediaPipe（骨格ランドマーク） → SAM2（画素単位セグメンテーション）`
 の3段階パイプラインで構成されており、各検出器は互いの結果を補完し合います。
-各検出器はモデルファイルが無い場合に自動的にスキップされるため、`models/`配下の
-一部が欠けていてもクラッシュせず動作します（ただし機能は限定されます）。
+複数の手が写っている場合、各検出器間の対応付けはbboxのIoU（Intersection over
+Union）に基づいて行われるため、検出器ごとに手の順序が異なっていても正しく
+統合されます。各検出器はモデルファイルが無い場合に自動的にスキップされるため、
+`models/`配下の一部が欠けていてもクラッシュせず動作します（ただし機能は限定されます）。
 
 - **YOLO** (`hand_yolov8s.pt`/`.onnx`, `Bingsu/adetailer`配布): 手の見逃しを減らすバウンディングボックス検出
 - **MediaPipe** (`hand_landmarker.task`, Google公式): 手の向き・関節構造の把握
@@ -67,6 +69,7 @@ inpaintノードに渡す前段として使うことを想定しています。
 | `image` | IMAGE | (必須) | 入力画像 |
 | `padding` | INT | 32（0〜256, step 8） | クロップ時に手の周囲へ追加する余白ピクセル数 |
 | `min_detection_confidence` | FLOAT | 0.5（0.1〜1.0） | 検出パイプライン全体の最低信頼度しきい値 |
+| `hand_index` | INT | 0（0〜19） | 複数の手が検出された場合に処理対象とする手のインデックス（0=最も信頼度が高い手）。範囲外の値は警告の上、最後の手にクランプされる |
 
 **出力**: `cropped_image`（回転・クロップ後の画像）, `remap_info`（`SeamlessStitcher`に渡す逆変換情報）
 
@@ -86,6 +89,7 @@ inpaintノードに渡す前段として使うことを想定しています。
 | `min_detection_confidence` | FLOAT | 0.5（0.1〜1.0） | 検出パイプライン全体の最低信頼度しきい値 |
 | `use_sam2_mask` | BOOLEAN | False | SAM2のセグメンテーションマスクを併用するか |
 | `sam2_blend_strength` | FLOAT | 0.5（0.0〜1.0） | `use_sam2_mask=True`時のブレンド強度。0で粗いマスクのみ、1でSAM2マスク優先。両方が前景と判定した領域は強度に関わらず前景として維持されます |
+| `hand_index` | INT | 0（0〜19） | 複数の手が検出された場合に処理対象とする手のインデックス（0=最も信頼度が高い手）。範囲外の値は警告の上、最後の手にクランプされる |
 
 **出力**: `refined_mask`（補正後マスク）
 
@@ -135,14 +139,17 @@ pytest
 - ✅ Phase 1: 検出器抽象化レイヤー（YOLO / MediaPipe / SAM2）実装、pytestベースの単体テスト整備（72件）
 - ✅ Phase 2: 実機検証（SAM2/MediaPipe/YOLOすべて実モデル・実環境で動作確認済み。
   詳細は [`MILESTONES.md`](./MILESTONES.md) のPhase 2を参照）
-- 🔶 Phase 3: ドキュメント整備（`requirements.txt`作成、本README充実化）— 現在ここ
+- ✅ Phase 3: ドキュメント整備（`requirements.txt`作成、本README充実化）
+- 🔶 Phase 4: 検出・統合ロジックの高度化（IoUベースの複数手マッチング、
+  `hand_index`パラメータによる複数手対応）— 現在ここ。
+  `color_match.py`の統合/削除判断のみ実写真検証待ちで保留中
 
 今後の開発マイルストーンの詳細は [`MILESTONES.md`](./MILESTONES.md) を参照してください。
 
 ### 直近の次アクション
 
-1. 実写真での3ノード連携・見た目の確認（Phase 2残タスク）
-2. 検出・統合ロジックの高度化（複数手対応など、Phase 4）
+1. 実写真での3ノード連携・見た目の確認（Phase 2残タスク、`color_match.py`の判断にも必要）
+2. Phase 5: パフォーマンス/UX改善（バッチ処理対応、実行モード選択パラメータ等）
 
 ## ライセンス
 

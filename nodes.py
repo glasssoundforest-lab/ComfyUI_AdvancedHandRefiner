@@ -44,6 +44,34 @@ def _detect_hands(image_rgb: np.ndarray, min_detection_confidence: float) -> Det
     )
 
 
+def _select_hand(result: DetectionResult, hand_index: int):
+    """
+    DetectionResult から hand_index 番目の手を選択する。
+
+    result.hands は各検出器が信頼度順にソートして返す契約になっており、
+    統合後もその順序は概ね維持される（0 = 最も信頼度が高い手 = 従来の
+    result.best と同じ）。範囲外のインデックスが指定された場合は、
+    警告を出したうえで最後の要素にクランプする（クラッシュを避けるため）。
+
+    Returns:
+        HandDetection、または手が一つも検出できていない場合は None
+    """
+    if result.is_empty:
+        return None
+
+    if hand_index < 0 or hand_index >= len(result.hands):
+        logger.warning(
+            "hand_index=%d は検出された手の数(%d)の範囲外です。"
+            "最後の手(index=%d)を使用します。",
+            hand_index,
+            len(result.hands),
+            len(result.hands) - 1,
+        )
+        hand_index = len(result.hands) - 1
+
+    return result.hands[hand_index]
+
+
 def _tensor_to_numpy_rgb(image: torch.Tensor) -> np.ndarray:
     """ComfyUIの IMAGE テンソル（1, H, W, C, 0-1 float）を
     RGB uint8 ndarray（H, W, C）に変換する"""
@@ -72,6 +100,10 @@ class AdvancedHandOrientationOptimizer:
                     "FLOAT",
                     {"default": 0.5, "min": 0.1, "max": 1.0, "step": 0.05},
                 ),
+                "hand_index": (
+                    "INT",
+                    {"default": 0, "min": 0, "max": 19, "step": 1},
+                ),
             },
         }
 
@@ -81,14 +113,19 @@ class AdvancedHandOrientationOptimizer:
     CATEGORY = "HandRefiner"
 
     def optimize_orientation(
-        self, image: torch.Tensor, padding: int, min_detection_confidence: float = 0.5
+        self,
+        image: torch.Tensor,
+        padding: int,
+        min_detection_confidence: float = 0.5,
+        hand_index: int = 0,
     ):
         img_rgb = _tensor_to_numpy_rgb(image)
         orig_h, orig_w = img_rgb.shape[:2]
 
         result = _detect_hands(img_rgb, min_detection_confidence)
+        selected = _select_hand(result, hand_index)
 
-        if result.is_empty or result.best.landmarks is None:
+        if selected is None or selected.landmarks is None:
             logger.warning(
                 "HandOrientationOptimizer: 手が検出できませんでした。"
                 "入力画像をそのまま返します。"
@@ -102,8 +139,8 @@ class AdvancedHandOrientationOptimizer:
             }
             return (image, remap_info)
 
-        # 最も信頼度の高い手（DetectorPipelineが信頼度順にソート済み）
-        points_px = result.best.landmarks
+        # 最も信頼度の高い手、またはhand_indexで指定された手
+        points_px = selected.landmarks
 
         angle = compute_rotation_angle(points_px)
         rotated_img, new_center = rotate_image(img_rgb, angle)
@@ -169,6 +206,10 @@ class AdvancedHandMaskRefiner:
                     "FLOAT",
                     {"default": 0.5, "min": 0.0, "max": 1.0, "step": 0.05},
                 ),
+                "hand_index": (
+                    "INT",
+                    {"default": 0, "min": 0, "max": 19, "step": 1},
+                ),
             },
         }
 
@@ -185,6 +226,7 @@ class AdvancedHandMaskRefiner:
         min_detection_confidence: float = 0.5,
         use_sam2_mask: bool = False,
         sam2_blend_strength: float = 0.5,
+        hand_index: int = 0,
     ):
         img_rgb = _tensor_to_numpy_rgb(image)
         h, w = img_rgb.shape[:2]
@@ -200,19 +242,20 @@ class AdvancedHandMaskRefiner:
             coarse_mask = cv2.resize(coarse_mask, (w, h), interpolation=cv2.INTER_NEAREST)
 
         result = _detect_hands(img_rgb, min_detection_confidence)
+        selected = _select_hand(result, hand_index)
 
-        if result.is_empty or result.best.landmarks is None:
+        if selected is None or selected.landmarks is None:
             logger.warning(
                 "HandMaskRefiner: 手が検出できませんでした。入力マスクをそのまま返します。"
             )
             return (mask,)
 
-        landmarks_px = result.best.landmarks
+        landmarks_px = selected.landmarks
 
         base_mask = coarse_mask
         if use_sam2_mask:
             base_mask = self._blend_with_sam2_mask(
-                coarse_mask, result.best.mask, sam2_blend_strength
+                coarse_mask, selected.mask, sam2_blend_strength
             )
 
         refined = sharpen_finger_contours(base_mask, landmarks_px, finger_sharpness)
