@@ -42,6 +42,7 @@ pytest
 | `test_nodes_batch_and_mode.py` | `nodes.py`(バッチ処理、`detection_mode`実行モード選択) |
 | `test_mask_refine.py` | `utils/mask_refine.py`(`soften_wrist_boundary`の最適化前後の数値的同一性、境界値) |
 | `test_lazy_model_download.py` | `utils/detectors/{yolo,sam2}_detector.py`(`is_available()`の初回自動取得ロジック) |
+| `test_comfyui_style_import.py` | ★重要: ComfyUI本体の実際の読み込み処理を再現し、プラグイン全体が正しくimportできるかを検証（相対/絶対importの不整合を検出する回帰テスト） |
 | `test_integration_real_models.py` | **Phase 2**: 実際のSAM2 ONNXモデル・MediaPipeモデルを使った統合テスト（実モデルファイルが無い/mediapipe未インストールの環境では自動スキップ） |
 
 ## 未カバー（実機検証が必要、Phase 2）
