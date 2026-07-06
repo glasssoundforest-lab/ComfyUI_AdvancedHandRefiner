@@ -53,6 +53,20 @@ class TestComputeRotationAngle:
         angle = geometry.compute_rotation_angle(landmarks)
         assert abs(angle) == pytest.approx(180.0, abs=1e-6)
 
+    def test_degenerate_case_wrist_equals_middle_mcp_returns_zero_without_crashing(self):
+        """
+        極端な手のポーズ（握りこぶし等）でランドマークが極端に近接し、
+        手首と中指付け根が(ほぼ)同一点になった場合でもクラッシュせず、
+        角度0（回転なし）という安全なフォールバック値を返すことを確認。
+        atan2(0, 0) はPythonでは例外を投げず0.0を返す仕様に依拠している。
+        """
+        landmarks = [(0.0, 0.0)] * 21
+        landmarks[geometry.WRIST_IDX] = (150.0, 150.0)
+        landmarks[geometry.MIDDLE_FINGER_MCP_IDX] = (150.0, 150.0)  # 完全に同一点
+
+        angle = geometry.compute_rotation_angle(landmarks)
+        assert angle == pytest.approx(0.0, abs=1e-9)
+
 
 class TestRotateImageAndPoints:
     def test_vertical_line_becomes_horizontal_after_90_degree_rotation(self):

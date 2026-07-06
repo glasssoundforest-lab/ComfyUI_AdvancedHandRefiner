@@ -106,6 +106,14 @@ def soften_wrist_boundary(
     手首から一定半径内だけに限定してぼかしを適用し、指先側には
     影響を与えないようにする。
 
+    パフォーマンス上の注意: 重み `weight = clip(1 - dist/radius, 0, 1)` は
+    `dist >= radius` で厳密に0になる（＝その画素では blended = mask）。
+    そのため、手首から半径radius以内のバウンディングボックスだけで
+    重み計算・ブレンドを行い、それ以外の領域は元のmaskをそのまま使えば、
+    画像全体で計算した場合と数値的に完全に同一の結果になる。
+    高解像度画像（例: 4096x4096）でradiusが小さい場合、この最適化により
+    無駄な全画素距離計算（O(H*W)）を避けられる。
+
     Args:
         mask: (H, W) の0-255 uint8マスク
         landmarks_px: 21点のランドマーク座標（ピクセル単位）
@@ -122,11 +130,27 @@ def soften_wrist_boundary(
 
     h, w = mask.shape[:2]
     wrist_x, wrist_y = landmarks_px[WRIST_IDX]
-
     radius = float(ksize) * 1.5
-    yy, xx = np.mgrid[0:h, 0:w]
+
+    # 手首を中心とした半径radiusのバウンディングボックス（画像範囲でクリップ）
+    x0 = max(0, int(np.floor(wrist_x - radius)))
+    x1 = min(w, int(np.ceil(wrist_x + radius)) + 1)
+    y0 = max(0, int(np.floor(wrist_y - radius)))
+    y1 = min(h, int(np.ceil(wrist_y + radius)) + 1)
+
+    result = mask.copy()
+    if x1 <= x0 or y1 <= y0:
+        # 手首がバウンディングボックスの計算上どこにも該当しない
+        # （通常は起こらないが、安全のため元maskをそのまま返す）
+        return result
+
+    yy, xx = np.mgrid[y0:y1, x0:x1]
     dist = np.sqrt((xx - wrist_x) ** 2 + (yy - wrist_y) ** 2)
     weight = np.clip(1.0 - (dist / radius), 0.0, 1.0).astype(np.float32)
 
-    blended = mask.astype(np.float32) * (1.0 - weight) + blurred.astype(np.float32) * weight
-    return np.clip(blended, 0, 255).astype(np.uint8)
+    local_mask = mask[y0:y1, x0:x1].astype(np.float32)
+    local_blurred = blurred[y0:y1, x0:x1].astype(np.float32)
+    blended_local = local_mask * (1.0 - weight) + local_blurred * weight
+
+    result[y0:y1, x0:x1] = np.clip(blended_local, 0, 255).astype(np.uint8)
+    return result

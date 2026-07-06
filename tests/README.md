@@ -37,7 +37,11 @@ pytest
 | `test_detector_pipeline.py` | `utils/detectors/base.py`（`DetectorPipeline`, `_merge_results`） |
 | `test_yolo_inference.py` | `utils/yolo_inference.py`（レターボックス・NMS・座標復元） |
 | `test_sam2_inference.py` | `utils/sam2_inference.py`（デコーダ入力名解決、プロンプト構築） |
-| `test_nodes_sam2_blend.py` | `nodes.py`（`AdvancedHandMaskRefiner._blend_with_sam2_mask`） |
+| `test_nodes_sam2_blend.py` | `nodes.py`(`AdvancedHandMaskRefiner._blend_with_sam2_mask`) |
+| `test_nodes_hand_selection.py` | `nodes.py`(`_select_hand` — 複数手選択ロジック) |
+| `test_nodes_batch_and_mode.py` | `nodes.py`(バッチ処理、`detection_mode`実行モード選択) |
+| `test_mask_refine.py` | `utils/mask_refine.py`(`soften_wrist_boundary`の最適化前後の数値的同一性、境界値) |
+| `test_lazy_model_download.py` | `utils/detectors/{yolo,sam2}_detector.py`(`is_available()`の初回自動取得ロジック) |
 | `test_integration_real_models.py` | **Phase 2**: 実際のSAM2 ONNXモデル・MediaPipeモデルを使った統合テスト（実モデルファイルが無い/mediapipe未インストールの環境では自動スキップ） |
 
 ## 未カバー（実機検証が必要、Phase 2）

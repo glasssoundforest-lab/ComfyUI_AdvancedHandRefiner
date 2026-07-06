@@ -66,6 +66,16 @@ def compute_rotation_angle(landmarks: list[tuple[float, float]]) -> float:
     dx = middle_mcp[0] - wrist[0]
     dy = middle_mcp[1] - wrist[1]
 
+    # ★退化ケースへの対処: 手首と中指付け根がほぼ同一点の場合（極端な手の
+    # ポーズや検出ノイズにより landmarks が潰れた場合）、方向ベクトルの
+    # 大きさが実質0になる。この場合 dy はしばしば厳密に 0.0 になり、
+    # -dy が IEEE754 の -0.0 になることで atan2(0.0, -0.0) が
+    # 0 ではなく π（=180度、画像の天地が反転する回転）を返してしまう
+    # 浮動小数点特有の罠がある。方向が定まらない以上、回転しない(角度0)
+    # ことが最も安全なフォールバックであるため、明示的にガードする。
+    if math.hypot(dx, dy) < 1e-6:
+        return 0.0
+
     # atan2(dx, -dy): 真上向き(dx=0, dy<0)のとき角度0になるように定義。
     # cv2.getRotationMatrix2D は反時計回りが正のため、そのまま使える角度を返す。
     angle_rad = math.atan2(dx, -dy)

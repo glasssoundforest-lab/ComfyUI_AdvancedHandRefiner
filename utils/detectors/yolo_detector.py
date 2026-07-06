@@ -48,19 +48,38 @@ class YoloHandDetector(HandDetector):
         self._model_name = model_name
         self._confidence_threshold = confidence_threshold
         self._iou_threshold = iou_threshold
+        self._download_attempted = False
 
     def is_available(self) -> bool:
         """
         既にONNXモデルがダウンロード・変換済みであれば True を返す。
-        未取得の場合、このメソッド自体は追加のダウンロードを発生させない
-        （detect() 呼び出し時に初めてダウンロード・変換が走る）。
 
-        ★注意: 初回は「未取得＝利用不可」としてスキップされるため、
-        DetectorPipeline経由での初回実行時はYOLOが自動的にスキップ
-        される。明示的にモデルを使いたい場合は、事前に
-        utils.yolo_hand_model.ensure_onnx_model() を呼んでおくか、
-        detect() を直接一度呼び出してモデルを取得しておく必要がある。
+        未取得の場合、このプロセス内でまだ取得を試みていなければ
+        （初回のみ）ensure_onnx_model() を一度だけ呼び、ダウンロード・
+        変換を試みる。ネットワーク不通や ultralytics/torch 未整備等で
+        失敗した場合は静かに False を返し、以降このプロセスでは
+        毎回リトライしない（呼び出しのたびに遅い失敗を繰り返すのを防ぐ）。
+        ユーザーが後からモデルを手動配置した場合は、ファイル存在チェックに
+        より次回以降 True になる。
         """
+        if is_onnx_model_available(self._model_name):
+            return True
+
+        if self._download_attempted:
+            return False
+
+        self._download_attempted = True
+        try:
+            ensure_onnx_model(self._model_name)
+        except Exception as e:
+            logger.warning(
+                "YoloHandDetector: 初回モデル取得に失敗しました (%s)。"
+                "このプロセスでは以降YOLOをスキップします"
+                "（models/yolo/ に手動でモデルを配置すれば再度有効になります）。",
+                e,
+            )
+            return False
+
         return is_onnx_model_available(self._model_name)
 
     def _get_inference(self) -> YoloOnnxInference:

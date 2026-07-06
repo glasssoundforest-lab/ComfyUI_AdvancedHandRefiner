@@ -24,24 +24,49 @@ logger = logging.getLogger("HandRefiner")
 
 BASE_MODEL_PATH = os.path.join(os.path.dirname(__file__), "models")
 
-# 検出パイプライン: YOLO(bbox) → MediaPipe(landmarks) → SAM2(segmentation mask) の
-# 3段階。各検出器の is_available() が False を返す場合（対応する ONNX/task
-# モデルファイルが models/ 配下に存在しない場合）は DetectorPipeline 側で
-# 自動的にスキップされ、残りの検出器のみで処理が継続する。
-_detector_pipeline = DetectorPipeline(
-    [
-        YoloHandDetector(),
-        MediaPipeHandDetector(),
-        Sam2HandDetector(),
-    ]
-)
+# 各検出器のインスタンスは重い初期化(モデルロード等)を伴いうるため、
+# モードによらず使い回せるよう一度だけ生成しておく。
+_yolo_detector = YoloHandDetector()
+_mediapipe_detector = MediaPipeHandDetector()
+_sam2_detector = Sam2HandDetector()
+
+#: detection_mode パラメータの選択肢。
+#: SAM2はエンコーダ推論が比較的重いため、精度よりレイテンシを優先したい
+#: 場合に "mediapipe_only" / "yolo_mediapipe" でスキップできるようにする。
+DETECTION_MODES = ["full", "yolo_mediapipe", "mediapipe_only"]
+
+_pipeline_cache: dict[str, DetectorPipeline] = {}
 
 
-def _detect_hands(image_rgb: np.ndarray, min_detection_confidence: float) -> DetectionResult:
+def _get_detector_pipeline(detection_mode: str) -> DetectorPipeline:
+    """detection_modeに応じたDetectorPipelineを取得する（初回のみ構築しキャッシュする）"""
+    if detection_mode not in DETECTION_MODES:
+        logger.warning(
+            "detection_mode=%r は不明な値です。'full' にフォールバックします。",
+            detection_mode,
+        )
+        detection_mode = "full"
+
+    if detection_mode not in _pipeline_cache:
+        if detection_mode == "mediapipe_only":
+            detectors = [_mediapipe_detector]
+        elif detection_mode == "yolo_mediapipe":
+            detectors = [_yolo_detector, _mediapipe_detector]
+        else:  # "full"
+            detectors = [_yolo_detector, _mediapipe_detector, _sam2_detector]
+        _pipeline_cache[detection_mode] = DetectorPipeline(detectors)
+
+    return _pipeline_cache[detection_mode]
+
+
+def _detect_hands(
+    image_rgb: np.ndarray,
+    min_detection_confidence: float,
+    detection_mode: str = "full",
+) -> DetectionResult:
     """統一検出パイプラインを実行するヘルパー"""
-    return _detector_pipeline.run(
-        image_rgb, min_hand_detection_confidence=min_detection_confidence
-    )
+    pipeline = _get_detector_pipeline(detection_mode)
+    return pipeline.run(image_rgb, min_hand_detection_confidence=min_detection_confidence)
 
 
 def _select_hand(result: DetectionResult, hand_index: int):
@@ -72,10 +97,10 @@ def _select_hand(result: DetectionResult, hand_index: int):
     return result.hands[hand_index]
 
 
-def _tensor_to_numpy_rgb(image: torch.Tensor) -> np.ndarray:
-    """ComfyUIの IMAGE テンソル（1, H, W, C, 0-1 float）を
-    RGB uint8 ndarray（H, W, C）に変換する"""
-    arr = image[0].cpu().numpy()
+def _tensor_to_numpy_rgb(image: torch.Tensor, index: int = 0) -> np.ndarray:
+    """ComfyUIの IMAGE テンソル（B, H, W, C, 0-1 float）のうち、
+    index番目の画像を RGB uint8 ndarray（H, W, C）に変換する"""
+    arr = image[index].cpu().numpy()
     arr = np.clip(arr * 255.0, 0, 255).astype(np.uint8)
     return arr
 
@@ -104,6 +129,7 @@ class AdvancedHandOrientationOptimizer:
                     "INT",
                     {"default": 0, "min": 0, "max": 19, "step": 1},
                 ),
+                "detection_mode": (DETECTION_MODES, {"default": "full"}),
             },
         }
 
@@ -118,11 +144,20 @@ class AdvancedHandOrientationOptimizer:
         padding: int,
         min_detection_confidence: float = 0.5,
         hand_index: int = 0,
+        detection_mode: str = "full",
     ):
+        if image.shape[0] > 1:
+            logger.warning(
+                "HandOrientationOptimizer: このノードは現在バッチの先頭画像のみ"
+                "処理します（クロップ後のサイズが手ごとに異なりうるため、"
+                "複数画像をまとめて1つのIMAGEテンソルに格納できません）。"
+                "バッチ処理したい場合は、画像ごとにこのノードを個別に"
+                "実行してください。"
+            )
         img_rgb = _tensor_to_numpy_rgb(image)
         orig_h, orig_w = img_rgb.shape[:2]
 
-        result = _detect_hands(img_rgb, min_detection_confidence)
+        result = _detect_hands(img_rgb, min_detection_confidence, detection_mode)
         selected = _select_hand(result, hand_index)
 
         if selected is None or selected.landmarks is None:
@@ -137,7 +172,7 @@ class AdvancedHandOrientationOptimizer:
                 "original_size": (orig_w, orig_h),
                 "rotated_size": (orig_w, orig_h),
             }
-            return (image, remap_info)
+            return (image[0:1], remap_info)
 
         # 最も信頼度の高い手、またはhand_indexで指定された手
         points_px = selected.landmarks
@@ -172,10 +207,10 @@ class AdvancedHandOrientationOptimizer:
         cropped_tensor = _numpy_rgb_to_tensor(cropped)
         return (cropped_tensor, remap_info)
 
-def _mask_tensor_to_numpy(mask: torch.Tensor) -> np.ndarray:
-    """ComfyUIの MASK テンソル（1, H, W, 0-1 float）を
-    0-255 uint8 ndarray（H, W）に変換する"""
-    arr = mask[0].cpu().numpy()
+def _mask_tensor_to_numpy(mask: torch.Tensor, index: int = 0) -> np.ndarray:
+    """ComfyUIの MASK テンソル（B, H, W, 0-1 float）のうち、
+    index番目のマスクを 0-255 uint8 ndarray（H, W）に変換する"""
+    arr = mask[index].cpu().numpy()
     return np.clip(arr * 255.0, 0, 255).astype(np.uint8)
 
 
@@ -210,6 +245,7 @@ class AdvancedHandMaskRefiner:
                     "INT",
                     {"default": 0, "min": 0, "max": 19, "step": 1},
                 ),
+                "detection_mode": (DETECTION_MODES, {"default": "full"}),
             },
         }
 
@@ -227,10 +263,59 @@ class AdvancedHandMaskRefiner:
         use_sam2_mask: bool = False,
         sam2_blend_strength: float = 0.5,
         hand_index: int = 0,
+        detection_mode: str = "full",
     ):
-        img_rgb = _tensor_to_numpy_rgb(image)
+        batch_size = image.shape[0]
+        if mask.shape[0] not in (1, batch_size):
+            logger.warning(
+                "HandMaskRefiner: image のバッチサイズ(%d)と mask のバッチサイズ(%d)が"
+                "一致しません。mask 側の先頭要素を全バッチ共通で使用します。",
+                batch_size,
+                mask.shape[0],
+            )
+
+        refined_list: list[np.ndarray] = []
+        for i in range(batch_size):
+            mask_index = i if mask.shape[0] == batch_size else 0
+            refined_list.append(
+                self._refine_single(
+                    image,
+                    mask,
+                    i,
+                    mask_index,
+                    wrist_blur,
+                    finger_sharpness,
+                    min_detection_confidence,
+                    use_sam2_mask,
+                    sam2_blend_strength,
+                    hand_index,
+                    detection_mode,
+                )
+            )
+
+        refined_tensor = torch.from_numpy(
+            np.stack([r.astype(np.float32) / 255.0 for r in refined_list], axis=0)
+        )
+        return (refined_tensor,)
+
+    def _refine_single(
+        self,
+        image: torch.Tensor,
+        mask: torch.Tensor,
+        image_index: int,
+        mask_index: int,
+        wrist_blur: int,
+        finger_sharpness: float,
+        min_detection_confidence: float,
+        use_sam2_mask: bool,
+        sam2_blend_strength: float,
+        hand_index: int,
+        detection_mode: str = "full",
+    ) -> np.ndarray:
+        """バッチ中の1枚分のマスク精緻化処理（refine_hand_maskから呼ばれる内部ヘルパー）"""
+        img_rgb = _tensor_to_numpy_rgb(image, image_index)
         h, w = img_rgb.shape[:2]
-        coarse_mask = _mask_tensor_to_numpy(mask)
+        coarse_mask = _mask_tensor_to_numpy(mask, mask_index)
 
         if coarse_mask.shape[:2] != (h, w):
             logger.warning(
@@ -241,14 +326,16 @@ class AdvancedHandMaskRefiner:
             )
             coarse_mask = cv2.resize(coarse_mask, (w, h), interpolation=cv2.INTER_NEAREST)
 
-        result = _detect_hands(img_rgb, min_detection_confidence)
+        result = _detect_hands(img_rgb, min_detection_confidence, detection_mode)
         selected = _select_hand(result, hand_index)
 
         if selected is None or selected.landmarks is None:
             logger.warning(
-                "HandMaskRefiner: 手が検出できませんでした。入力マスクをそのまま返します。"
+                "HandMaskRefiner: 手が検出できませんでした(image_index=%d)。"
+                "このバッチ要素は入力マスクをそのまま返します。",
+                image_index,
             )
-            return (mask,)
+            return coarse_mask
 
         landmarks_px = selected.landmarks
 
@@ -260,9 +347,7 @@ class AdvancedHandMaskRefiner:
 
         refined = sharpen_finger_contours(base_mask, landmarks_px, finger_sharpness)
         refined = soften_wrist_boundary(refined, landmarks_px, wrist_blur)
-
-        refined_tensor = _numpy_mask_to_tensor(refined)
-        return (refined_tensor,)
+        return refined
 
     @staticmethod
     def _blend_with_sam2_mask(
@@ -349,6 +434,14 @@ class AdvancedHandSeamlessStitcher:
         inpainted_rgb = _tensor_to_numpy_rgb(inpainted_image)
         mask_np = _mask_tensor_to_numpy(refined_mask)
 
+        if original_image.shape[0] > 1:
+            logger.warning(
+                "HandSeamlessStitcher: このノードは現在バッチの先頭画像のみ"
+                "処理します。remap_info は1画像分の逆変換情報のみを保持する"
+                "設計のため、バッチ処理したい場合は画像ごとに"
+                "OrientationOptimizer→...→SeamlessStitcherを個別に実行してください。"
+            )
+
         orig_h, orig_w = orig_rgb.shape[:2]
 
         # remap_info の記録サイズと実際の元画像サイズが食い違う場合
@@ -362,7 +455,7 @@ class AdvancedHandSeamlessStitcher:
                 remap_info.get("original_size"),
                 (orig_w, orig_h),
             )
-            return (original_image,)
+            return (original_image[0:1],)
 
         # inpainted_image・refined_mask は crop_box のサイズと一致している
         # 前提（OrientationOptimizer→(inpaint)→MaskRefinerの座標系を継承）。
@@ -385,7 +478,7 @@ class AdvancedHandSeamlessStitcher:
                 "HandSeamlessStitcher: 逆変換後の画像サイズが元画像と "
                 "一致しません。元画像をそのまま返します。"
             )
-            return (original_image,)
+            return (original_image[0:1],)
 
         # 回転によって生じた「元画像には存在しない余白」領域を
         # 合成対象から除外する
@@ -397,7 +490,7 @@ class AdvancedHandSeamlessStitcher:
                 "HandSeamlessStitcher: 合成対象マスクがほぼ空です。"
                 "元画像をそのまま返します。"
             )
-            return (original_image,)
+            return (original_image[0:1],)
 
         # 1) シンプルなアルファブレンド（マスクに基づく単純合成）
         alpha = (effective_mask.astype(np.float32) / 255.0)[:, :, None]

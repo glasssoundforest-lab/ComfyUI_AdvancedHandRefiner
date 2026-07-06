@@ -46,13 +46,35 @@ class Sam2HandDetector(HandDetector):
 
     def __init__(self, model_name: str = DEFAULT_MODEL_NAME):
         self._model_name = model_name
+        self._download_attempted = False
 
     def is_available(self) -> bool:
         """
         既にencoder/decoderのONNXモデルがダウンロード済みであれば True を返す。
-        未取得の場合、このメソッド自体は追加のダウンロードを発生させない
-        （detect() 呼び出し時に初めてダウンロードが走る）。
+
+        未取得の場合、このプロセス内でまだ取得を試みていなければ
+        （初回のみ）ensure_sam2_models() を一度だけ呼び、ダウンロードを
+        試みる。失敗した場合は静かに False を返し、以降このプロセスでは
+        毎回リトライしない（YoloHandDetector.is_available()と同じ方針）。
         """
+        if is_sam2_available(self._model_name):
+            return True
+
+        if self._download_attempted:
+            return False
+
+        self._download_attempted = True
+        try:
+            ensure_sam2_models(self._model_name)
+        except Exception as e:
+            logger.warning(
+                "Sam2HandDetector: 初回モデル取得に失敗しました (%s)。"
+                "このプロセスでは以降SAM2をスキップします"
+                "（models/sam2/ に手動でモデルを配置すれば再度有効になります）。",
+                e,
+            )
+            return False
+
         return is_sam2_available(self._model_name)
 
     def _get_inference(self) -> Sam2OnnxInference:

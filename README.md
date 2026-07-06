@@ -70,10 +70,14 @@ inpaintノードに渡す前段として使うことを想定しています。
 | `padding` | INT | 32（0〜256, step 8） | クロップ時に手の周囲へ追加する余白ピクセル数 |
 | `min_detection_confidence` | FLOAT | 0.5（0.1〜1.0） | 検出パイプライン全体の最低信頼度しきい値 |
 | `hand_index` | INT | 0（0〜19） | 複数の手が検出された場合に処理対象とする手のインデックス（0=最も信頼度が高い手）。範囲外の値は警告の上、最後の手にクランプされる |
+| `detection_mode` | 選択式 | `full` | 検出パイプラインの実行モード。`full`=YOLO+MediaPipe+SAM2、`yolo_mediapipe`=SAM2を省略、`mediapipe_only`=MediaPipeのみ（最速）|
 
 **出力**: `cropped_image`（回転・クロップ後の画像）, `remap_info`（`SeamlessStitcher`に渡す逆変換情報）
 
 手が検出できなかった場合は、警告ログを出して入力画像をそのまま返します（クラッシュしません）。
+バッチサイズ>1の画像が入力された場合は、警告ログを出したうえで先頭画像のみを処理します
+（検出した手ごとにクロップサイズが異なりうるため、複数画像を1つのIMAGEテンソルに
+まとめられないという構造的制約によるものです）。
 
 ### ✨ Advanced Anatomical Mask Refiner (`AdvancedHandMaskRefiner`)
 
@@ -90,12 +94,14 @@ inpaintノードに渡す前段として使うことを想定しています。
 | `use_sam2_mask` | BOOLEAN | False | SAM2のセグメンテーションマスクを併用するか |
 | `sam2_blend_strength` | FLOAT | 0.5（0.0〜1.0） | `use_sam2_mask=True`時のブレンド強度。0で粗いマスクのみ、1でSAM2マスク優先。両方が前景と判定した領域は強度に関わらず前景として維持されます |
 | `hand_index` | INT | 0（0〜19） | 複数の手が検出された場合に処理対象とする手のインデックス（0=最も信頼度が高い手）。範囲外の値は警告の上、最後の手にクランプされる |
+| `detection_mode` | 選択式 | `full` | 検出パイプラインの実行モード。`full`=YOLO+MediaPipe+SAM2、`yolo_mediapipe`=SAM2を省略、`mediapipe_only`=MediaPipeのみ（最速）|
 
 **出力**: `refined_mask`（補正後マスク）
 
 手が検出できなかった場合は、入力マスクをそのまま返します。`use_sam2_mask=True`でも
 検出パイプラインにSAM2が含まれていない/セグメンテーションに失敗した場合は、
-粗いマスクにフォールバックします。
+粗いマスクにフォールバックします。このノードはバッチ入力に対応しており、
+バッチ内の各画像・マスクを独立して処理します。
 
 ### 🪡 Seamless Stitch & Color Matcher (`AdvancedHandSeamlessStitcher`)
 
@@ -111,6 +117,9 @@ inpaintノードに渡す前段として使うことを想定しています。
 | `color_match_strength` | FLOAT | 0.8（0.0〜1.0） | 境界周辺の色調マッチングの強さ（0で無効） |
 
 **出力**: `final_image`（合成後の最終画像）
+
+バッチサイズ>1の画像が入力された場合は、警告ログを出したうえで先頭画像のみを処理します
+（`remap_info`が1画像分の逆変換情報のみを保持する設計のため）。
 
 ## モデルファイル
 
@@ -140,16 +149,21 @@ pytest
 - ✅ Phase 2: 実機検証（SAM2/MediaPipe/YOLOすべて実モデル・実環境で動作確認済み。
   詳細は [`MILESTONES.md`](./MILESTONES.md) のPhase 2を参照）
 - ✅ Phase 3: ドキュメント整備（`requirements.txt`作成、本README充実化）
-- 🔶 Phase 4: 検出・統合ロジックの高度化（IoUベースの複数手マッチング、
-  `hand_index`パラメータによる複数手対応）— 現在ここ。
-  `color_match.py`の統合/削除判断のみ実写真検証待ちで保留中
+- ✅ Phase 4: 検出・統合ロジックの高度化（IoUベースの複数手マッチング、
+  `hand_index`パラメータによる複数手対応）
+- 🔶 Phase 5: パフォーマンス/UX改善（`soften_wrist_boundary`の局所計算最適化、
+  `detection_mode`実行モード選択、`AdvancedHandMaskRefiner`のバッチ対応）— 現在ここ。
+  `Orientation`/`Stitcher`のバッチ対応はクロップサイズが手ごとに異なる構造的制約により保留
+- この過程で、回転角度算出の浮動小数点特有の退化バグ（手首と中指付け根が同一点になる
+  ケースで180度回転してしまう）を発見・修正済み
 
 今後の開発マイルストーンの詳細は [`MILESTONES.md`](./MILESTONES.md) を参照してください。
 
 ### 直近の次アクション
 
-1. 実写真での3ノード連携・見た目の確認（Phase 2残タスク、`color_match.py`の判断にも必要）
-2. Phase 5: パフォーマンス/UX改善（バッチ処理対応、実行モード選択パラメータ等）
+1. 実写真での3ノード連携・見た目の確認（`wrist_blur`/`finger_sharpness`/
+   `sam2_blend_strength`の推奨値検証、`color_match.py`統合可否の判断を含む）
+2. `Orientation`/`Stitcher`のバッチ対応方針の検討
 
 ## ライセンス
 
