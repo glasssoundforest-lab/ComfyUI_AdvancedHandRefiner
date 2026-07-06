@@ -73,7 +73,9 @@
 
 - [x] `hand_yolov8s.pt` → `.onnx` 変換（`ultralytics` + 動作する`torch`が必要）✅
       **ユーザー環境（Windows portable, torch 2.12.1+cu130）で実施・成功を確認（2026-07-06）**。
-      `models/yolo/hand_yolov8s.onnx`（42.7MB, opset20, onnxslim最適化）が生成された。
+      `models/yolo/hand_yolov8s.onnx`（42.7MB, opset20, onnxslim最適化）が生成され、
+      **本リポジトリに同梱済み**（SAM2と同様、これで`ultralytics`/`torch`無しでも
+      onnxruntimeのみでYOLO検出器が動作する）。
       このサンドボックスでは `pip install torch` してもNVIDIA CUDA関連の
       共有ライブラリが無く `import torch` 自体が失敗したが、torchが
       正しくセットアップされたComfyUI環境では問題なく変換できることを確認
