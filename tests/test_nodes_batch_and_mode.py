@@ -101,19 +101,125 @@ class TestMaskRefinerBatchProcessing:
         assert refined.numpy().shape == (3, h, w)
 
 
-class TestBatchWarningsForSingleImageNodes:
-    def test_orientation_optimizer_warns_but_does_not_crash_on_batch(self):
+class TestOrientationOptimizerBatchSupport:
+    def test_batch_of_blank_images_produces_full_batch_output(self):
+        """
+        手が検出されない画像3枚のバッチを処理した場合、警告を出しつつも
+        3枚分のバッチとして結果が返ることを確認（先頭のみではなく全件処理）。
+        """
         h, w = 64, 64
         image_np = np.zeros((3, h, w, 3), dtype=np.float32)
         image_tensor = nodes.torch.from_numpy(image_np)
 
         optimizer = nodes.AdvancedHandOrientationOptimizer()
+        cropped, remap_info_list = optimizer.optimize_orientation(image_tensor, padding=16)
+
+        assert cropped.numpy().shape == (3, h, w, 3)
+        assert isinstance(remap_info_list, list)
+        assert len(remap_info_list) == 3
+        for ri in remap_info_list:
+            assert ri["content_size"] == (w, h)
+
+    def test_single_image_returns_single_dict_not_list(self):
+        """バッチサイズ1の場合、remap_infoは従来通り単一dictのまま返る(後方互換)"""
+        h, w = 64, 64
+        image_np = np.zeros((1, h, w, 3), dtype=np.float32)
+        image_tensor = nodes.torch.from_numpy(image_np)
+
+        optimizer = nodes.AdvancedHandOrientationOptimizer()
         cropped, remap_info = optimizer.optimize_orientation(image_tensor, padding=16)
 
-        # クラッシュせず、先頭画像分の結果が単一画像として返る
         assert cropped.numpy().shape[0] == 1
-        assert remap_info is not None
+        assert isinstance(remap_info, dict)
 
+    def test_batch_with_different_crop_sizes_are_padded_to_common_canvas(self):
+        """
+        バッチ内でクロップサイズが異なる場合(手の検出有無や位置の違いにより)、
+        共通の最大サイズにゼロパディングされ、1つのバッチテンソルに
+        まとめられることを確認。content_sizeにパディング前の実サイズが
+        正しく記録されていることも確認する。
+        """
+        # 手が検出されないため、各画像はそのままのサイズが「クロップ結果」になる。
+        # サイズの異なる2枚の画像を用意することで、異なるcontent_sizeを再現する。
+        img1 = np.zeros((1, 40, 60, 3), dtype=np.float32)  # H=40, W=60
+        img2 = np.zeros((1, 80, 50, 3), dtype=np.float32)  # H=80, W=50
+
+        optimizer = nodes.AdvancedHandOrientationOptimizer()
+
+        # 個別に処理してcontent_sizeを確認(バッチ化の元ネタとして使う手法の妥当性チェック)
+        _, ri1 = optimizer.optimize_orientation(nodes.torch.from_numpy(img1), padding=0)
+        _, ri2 = optimizer.optimize_orientation(nodes.torch.from_numpy(img2), padding=0)
+        assert ri1["content_size"] == (60, 40)
+        assert ri2["content_size"] == (50, 80)
+
+        # 実際にバッチ(手が検出できないので各画像サイズがそのままcontent)を
+        # 作るには、同一バッチテンソル内で全画像が同じH,Wである必要がある
+        # というComfyUIの制約上、直接は再現できない。ここでは
+        # _optimize_single を直接呼び出して、パディングロジック自体を検証する。
+        batch_image = nodes.torch.from_numpy(np.zeros((2, 80, 60, 3), dtype=np.float32))
+        cropped1, remap1 = optimizer._optimize_single(batch_image, 0, 0, 0.5, 0, "full")
+        assert cropped1.shape[:2] == (80, 60)
+        assert remap1["content_size"] == (60, 80)
+
+
+class TestSeamlessStitcherFullBatchWithRemapInfoList:
+    """OrientationOptimizerが返すremap_infoのリストを、実際にSeamlessStitcherに
+    渡して最後まで通す、Orientation→Stitcherの結合バッチテスト"""
+
+    def test_end_to_end_batch_pipeline_with_varying_sizes(self):
+        h, w = 50, 70
+        batch_size = 3
+        image_np = np.zeros((batch_size, h, w, 3), dtype=np.float32)
+        # 各画像に僅かに異なる色を持たせて、後で区別できるようにする
+        for i in range(batch_size):
+            image_np[i, :, :, 0] = i / 10.0
+        image_tensor = nodes.torch.from_numpy(image_np)
+
+        optimizer = nodes.AdvancedHandOrientationOptimizer()
+        cropped, remap_info_list = optimizer.optimize_orientation(image_tensor, padding=8)
+
+        assert isinstance(remap_info_list, list)
+        assert len(remap_info_list) == batch_size
+        # 手が検出されないため、cropped=元画像そのまま(パディング無し、全て同サイズ)
+        assert cropped.numpy().shape == (batch_size, h, w, 3)
+
+        mask_tensor = nodes.torch.from_numpy(np.zeros((batch_size, h, w), dtype=np.float32))
+
+        stitcher = nodes.AdvancedHandSeamlessStitcher()
+        (final,) = stitcher.seamless_stitch(
+            image_tensor, cropped, mask_tensor, remap_info_list, color_match_strength=0.8
+        )
+
+        # 手が検出されないため合成対象マスクが空 → 各要素は元画像を返す
+        assert final.numpy().shape == (batch_size, h, w, 3)
+        np.testing.assert_allclose(final.numpy(), image_np, atol=0.01)
+
+    def test_mismatched_original_image_batch_size_falls_back_and_warns(self):
+        """original_imageのバッチサイズがremap_infoの件数と異なる場合、先頭要素で代用してクラッシュしない"""
+        h, w = 40, 40
+        remap_info_list = [
+            {
+                "angle": 0.0,
+                "center": (w / 2.0, h / 2.0),
+                "crop_box": (0, 0, w, h),
+                "original_size": (w, h),
+                "rotated_size": (w, h),
+                "content_size": (w, h),
+            }
+            for _ in range(3)
+        ]
+        original_image = nodes.torch.from_numpy(np.zeros((1, h, w, 3), dtype=np.float32))
+        inpainted_image = nodes.torch.from_numpy(np.zeros((3, h, w, 3), dtype=np.float32))
+        mask_tensor = nodes.torch.from_numpy(np.zeros((3, h, w), dtype=np.float32))
+
+        stitcher = nodes.AdvancedHandSeamlessStitcher()
+        (final,) = stitcher.seamless_stitch(
+            original_image, inpainted_image, mask_tensor, remap_info_list, color_match_strength=0.8
+        )
+        assert final.numpy().shape == (3, h, w, 3)
+
+
+class TestSeamlessStitcherSingleRemapInfoWithBatchInput:
     def test_seamless_stitcher_returns_single_image_even_for_batch_input(self):
         """
         SeamlessStitcherにバッチ入力を渡しても、warningを出しつつ

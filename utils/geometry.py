@@ -43,6 +43,12 @@ class RemapInfo(TypedDict):
     crop_box: tuple[int, int, int, int]  # (x1, y1, x2, y2) 回転後座標系
     original_size: tuple[int, int]  # (width, height)
     rotated_size: tuple[int, int]  # (width, height) 回転後の画像サイズ
+    content_size: tuple[int, int]  # (width, height) 実際のクロップ内容のサイズ。
+    # バッチ処理時、手ごとに異なるクロップサイズをIMAGEテンソルに
+    # まとめるため、共通キャンバスサイズへ左上寄せでゼロパディングする
+    # ことがある。content_sizeはパディングを除いた実際の内容サイズを表し、
+    # SeamlessStitcher側でパディングを取り除く際に使う。バッチでない場合は
+    # 画像そのもののサイズと一致する（パディング無し）。
 
 
 def compute_rotation_angle(landmarks: list[tuple[float, float]]) -> float:

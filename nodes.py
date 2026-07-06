@@ -146,15 +146,49 @@ class AdvancedHandOrientationOptimizer:
         hand_index: int = 0,
         detection_mode: str = "full",
     ):
-        if image.shape[0] > 1:
-            logger.warning(
-                "HandOrientationOptimizer: このノードは現在バッチの先頭画像のみ"
-                "処理します（クロップ後のサイズが手ごとに異なりうるため、"
-                "複数画像をまとめて1つのIMAGEテンソルに格納できません）。"
-                "バッチ処理したい場合は、画像ごとにこのノードを個別に"
-                "実行してください。"
+        batch_size = image.shape[0]
+
+        crops: list[np.ndarray] = []
+        remap_infos: list[RemapInfo] = []
+        for i in range(batch_size):
+            cropped, remap_info = self._optimize_single(
+                image, i, padding, min_detection_confidence, hand_index, detection_mode
             )
-        img_rgb = _tensor_to_numpy_rgb(image)
+            crops.append(cropped)
+            remap_infos.append(remap_info)
+
+        if batch_size == 1:
+            # 単一画像の場合はパディング不要。remap_infoも単一dictのまま返す
+            # （従来の戻り値の型・挙動を完全に維持する）。
+            return (_numpy_rgb_to_tensor(crops[0]), remap_infos[0])
+
+        # 複数画像の場合、検出した手ごとにクロップサイズが異なりうるため、
+        # 全画像の最大サイズに合わせて左上寄せでゼロパディングしてから
+        # 1つのバッチテンソルにまとめる。remap_info側にはパディング前の
+        # 実サイズ(content_size)を記録しておき、Stitcher側で除去できるようにする。
+        canvas_h = max(c.shape[0] for c in crops)
+        canvas_w = max(c.shape[1] for c in crops)
+
+        padded_batch = np.zeros((batch_size, canvas_h, canvas_w, 3), dtype=np.float32)
+        for i, cropped in enumerate(crops):
+            ch, cw = cropped.shape[:2]
+            padded_batch[i, :ch, :cw, :] = cropped.astype(np.float32) / 255.0
+            remap_infos[i]["content_size"] = (cw, ch)
+
+        cropped_tensor = torch.from_numpy(padded_batch)
+        return (cropped_tensor, remap_infos)
+
+    def _optimize_single(
+        self,
+        image: torch.Tensor,
+        image_index: int,
+        padding: int,
+        min_detection_confidence: float,
+        hand_index: int,
+        detection_mode: str,
+    ) -> tuple[np.ndarray, RemapInfo]:
+        """バッチ中の1枚分の向き最適化処理（optimize_orientationから呼ばれる内部ヘルパー）"""
+        img_rgb = _tensor_to_numpy_rgb(image, image_index)
         orig_h, orig_w = img_rgb.shape[:2]
 
         result = _detect_hands(img_rgb, min_detection_confidence, detection_mode)
@@ -162,8 +196,9 @@ class AdvancedHandOrientationOptimizer:
 
         if selected is None or selected.landmarks is None:
             logger.warning(
-                "HandOrientationOptimizer: 手が検出できませんでした。"
-                "入力画像をそのまま返します。"
+                "HandOrientationOptimizer: 手が検出できませんでした"
+                "(image_index=%d)。入力画像をそのまま返します。",
+                image_index,
             )
             remap_info: RemapInfo = {
                 "angle": 0.0,
@@ -171,8 +206,9 @@ class AdvancedHandOrientationOptimizer:
                 "crop_box": (0, 0, orig_w, orig_h),
                 "original_size": (orig_w, orig_h),
                 "rotated_size": (orig_w, orig_h),
+                "content_size": (orig_w, orig_h),
             }
-            return (image[0:1], remap_info)
+            return img_rgb, remap_info
 
         # 最も信頼度の高い手、またはhand_indexで指定された手
         points_px = selected.landmarks
@@ -188,24 +224,26 @@ class AdvancedHandOrientationOptimizer:
 
         if x2 <= x1 or y2 <= y1:
             logger.warning(
-                "HandOrientationOptimizer: クロップ範囲が不正です。"
-                "回転後画像全体を返します。"
+                "HandOrientationOptimizer: クロップ範囲が不正です"
+                "(image_index=%d)。回転後画像全体を返します。",
+                image_index,
             )
             cropped = rotated_img
             crop_box = (0, 0, rotated_w, rotated_h)
         else:
             cropped = rotated_img[y1:y2, x1:x2]
 
+        crop_h, crop_w = cropped.shape[:2]
         remap_info = {
             "angle": angle,
             "center": new_center,
             "crop_box": crop_box,
             "original_size": (orig_w, orig_h),
             "rotated_size": (rotated_w, rotated_h),
+            "content_size": (crop_w, crop_h),
         }
 
-        cropped_tensor = _numpy_rgb_to_tensor(cropped)
-        return (cropped_tensor, remap_info)
+        return cropped, remap_info
 
 def _mask_tensor_to_numpy(mask: torch.Tensor, index: int = 0) -> np.ndarray:
     """ComfyUIの MASK テンソル（B, H, W, 0-1 float）のうち、
@@ -427,20 +465,83 @@ class AdvancedHandSeamlessStitcher:
         original_image: torch.Tensor,
         inpainted_image: torch.Tensor,
         refined_mask: torch.Tensor,
-        remap_info: RemapInfo,
+        remap_info: RemapInfo | list[RemapInfo],
         color_match_strength: float,
     ):
-        orig_rgb = _tensor_to_numpy_rgb(original_image)
-        inpainted_rgb = _tensor_to_numpy_rgb(inpainted_image)
-        mask_np = _mask_tensor_to_numpy(refined_mask)
+        if isinstance(remap_info, list):
+            # OrientationOptimizerがバッチ処理した場合、remap_infoは
+            # 1画像ごとのdictのリストになる。各要素に対応する
+            # original_image/inpainted_image/refined_maskのバッチ要素を
+            # 突き合わせて処理する（バッチサイズが1のテンソルは全要素で
+            # 使い回す＝ブロードキャスト）。
+            batch_size = len(remap_info)
+            orig_bs = original_image.shape[0]
+            inpaint_bs = inpainted_image.shape[0]
+            mask_bs = refined_mask.shape[0]
 
+            for name, bs in (("original_image", orig_bs), ("inpainted_image", inpaint_bs), ("refined_mask", mask_bs)):
+                if bs not in (1, batch_size):
+                    logger.warning(
+                        "HandSeamlessStitcher: %s のバッチサイズ(%d)がremap_infoの"
+                        "件数(%d)と一致しません。先頭要素を全バッチ共通で使用します。",
+                        name,
+                        bs,
+                        batch_size,
+                    )
+
+            results = []
+            for i in range(batch_size):
+                oi = i if orig_bs == batch_size else 0
+                ii = i if inpaint_bs == batch_size else 0
+                mi = i if mask_bs == batch_size else 0
+                results.append(
+                    self._stitch_single(
+                        original_image, inpainted_image, refined_mask,
+                        remap_info[i], color_match_strength, oi, ii, mi,
+                    )
+                )
+            stacked = np.stack([r.astype(np.float32) / 255.0 for r in results], axis=0)
+            return (torch.from_numpy(stacked),)
+
+        # 単一画像の場合（従来通りの挙動）
         if original_image.shape[0] > 1:
             logger.warning(
-                "HandSeamlessStitcher: このノードは現在バッチの先頭画像のみ"
-                "処理します。remap_info は1画像分の逆変換情報のみを保持する"
-                "設計のため、バッチ処理したい場合は画像ごとに"
-                "OrientationOptimizer→...→SeamlessStitcherを個別に実行してください。"
+                "HandSeamlessStitcher: remap_infoが単一画像分のため、"
+                "original_imageのバッチのうち先頭画像のみ処理します。"
             )
+        final_rgb = self._stitch_single(
+            original_image, inpainted_image, refined_mask, remap_info, color_match_strength, 0, 0, 0
+        )
+        return (_numpy_rgb_to_tensor(final_rgb),)
+
+    def _stitch_single(
+        self,
+        original_image: torch.Tensor,
+        inpainted_image: torch.Tensor,
+        refined_mask: torch.Tensor,
+        remap_info: RemapInfo,
+        color_match_strength: float,
+        orig_index: int,
+        inpaint_index: int,
+        mask_index: int,
+    ) -> np.ndarray:
+        """バッチ中の1枚分の合成処理（seamless_stitchから呼ばれる内部ヘルパー）。
+        常にRGB numpy配列(H,W,3)を返す（失敗時はorig_rgbにフォールバックする）。"""
+        orig_rgb = _tensor_to_numpy_rgb(original_image, orig_index)
+        inpainted_rgb = _tensor_to_numpy_rgb(inpainted_image, inpaint_index)
+        mask_np = _mask_tensor_to_numpy(refined_mask, mask_index)
+
+        # バッチ処理でOrientationOptimizerが共通キャンバスへゼロパディング
+        # している場合、content_sizeで実際の内容サイズまで切り出して
+        # パディング分を除去する（単一画像の場合はcontent_size==実サイズ
+        # なので、このスライスは実質的に何もしない）。
+        content_size = remap_info.get("content_size")
+        if content_size is not None:
+            cw, ch = content_size
+            if inpainted_rgb.shape[:2] != (ch, cw) and ch > 0 and cw > 0:
+                inpainted_rgb = inpainted_rgb[:ch, :cw]
+            if mask_np.shape[:2] != (ch, cw) and ch > 0 and cw > 0:
+                mask_np = mask_np[:ch, :cw]
 
         orig_h, orig_w = orig_rgb.shape[:2]
 
@@ -455,7 +556,7 @@ class AdvancedHandSeamlessStitcher:
                 remap_info.get("original_size"),
                 (orig_w, orig_h),
             )
-            return (original_image[0:1],)
+            return orig_rgb
 
         # inpainted_image・refined_mask は crop_box のサイズと一致している
         # 前提（OrientationOptimizer→(inpaint)→MaskRefinerの座標系を継承）。
@@ -478,7 +579,7 @@ class AdvancedHandSeamlessStitcher:
                 "HandSeamlessStitcher: 逆変換後の画像サイズが元画像と "
                 "一致しません。元画像をそのまま返します。"
             )
-            return (original_image[0:1],)
+            return orig_rgb
 
         # 回転によって生じた「元画像には存在しない余白」領域を
         # 合成対象から除外する
@@ -490,7 +591,7 @@ class AdvancedHandSeamlessStitcher:
                 "HandSeamlessStitcher: 合成対象マスクがほぼ空です。"
                 "元画像をそのまま返します。"
             )
-            return (original_image[0:1],)
+            return orig_rgb
 
         # 1) シンプルなアルファブレンド（マスクに基づく単純合成）
         alpha = (effective_mask.astype(np.float32) / 255.0)[:, :, None]
@@ -529,4 +630,4 @@ class AdvancedHandSeamlessStitcher:
         )
         final = np.clip(final, 0, 255).astype(np.uint8)
 
-        return (_numpy_rgb_to_tensor(final),)
+        return final

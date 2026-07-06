@@ -1,8 +1,8 @@
 # ComfyUI_AdvancedHandRefiner — 開発マイルストーン
 
 最終更新: 2026-07-07
-現在のフェーズ: Phase 1〜4完了、Phase 5一部完了・未着手事項一部対応。
-残るは実写真での見た目確認と、それに伴う`color_match.py`の統合/削除判断。
+現在のフェーズ: Phase 1〜5 全て完了（未着手事項も対応可能な範囲は解消）。
+残るは実写真での見た目確認と、それに伴う`color_match.py`の統合/削除判断のみ。
 
 ---
 
@@ -12,8 +12,8 @@
 [Phase 1] テスト基盤整備      ✅ 完了
 [Phase 2] 実機検証            ✅ ほぼ完了(実写真での精度確認のみ残)
 [Phase 3] ドキュメント整備    ✅ 完了
-[Phase 4] 検出ロジック高度化  🔶 一部完了(color_match.py判断保留)
-[Phase 5] パフォーマンス/UX改善 🔶 一部完了(Orientation/Stitcherのバッチ対応は構造上保留)
+[Phase 4] 検出ロジック高度化  🔶 ほぼ完了(color_match.py判断のみ保留)
+[Phase 5] パフォーマンス/UX改善 ✅ 完了(3ノード全てバッチ対応済み)
 ```
 
 ---
@@ -143,7 +143,7 @@
 
 ---
 
-## Phase 5: パフォーマンス / UX改善（優先度: 低）✅ 一部完了（2026-07-07）
+## Phase 5: パフォーマンス / UX改善（優先度: 低）✅ 完了（2026-07-07）
 
 - [x] パフォーマンス最適化 ✅
       `soften_wrist_boundary()`の`np.mgrid`全画素距離計算を、手首周辺の
@@ -152,23 +152,31 @@
       4096x4096画像でも高速に完了することを確認。最適化前のナイーブな
       実装との数値的同一性を`tests/test_mask_refine.py`で5パターンの
       境界ケース（画像端付近等）を含めて回帰テスト化
-- [x] バッチ処理対応 ✅ 【`AdvancedHandMaskRefiner`のみ、設計上の理由により部分対応】
+- [x] バッチ処理対応 ✅ 【全3ノード対応、当初の想定を上回り完全対応】
       `AdvancedHandMaskRefiner`はimage/maskが常に同一のH,Wを持つため、
-      バッチの各要素を独立処理してスタックする方式で安全に対応した
+      バッチの各要素を独立処理してスタックする方式で対応した
       （`_refine_single()`ヘルパーに分離）。
-      一方、`AdvancedHandOrientationOptimizer`と`AdvancedHandSeamlessStitcher`は、
-      検出した手ごとにクロップサイズが異なりうる（ComfyUIのIMAGE
-      テンソルは同一バッチ内で全画像が同じH,Wである必要があるため、
-      サイズの異なるクロップ結果を1つのテンソルにまとめられない）
-      という構造的制約があり、無理に対応すると精度を落とすリサイズ処理を
-      挟む必要が生じる。実写真での検証が伴わないまま導入するのは
-      リスクが高いと判断し、**現状は据え置き**とした。
-      代わりに、バッチサイズ>1が渡された場合は警告ログを出したうえで
-      先頭画像のみを処理する（従来は無警告でサイレントに先頭画像だけを
-      使っていた）よう明確化した。この過程で、「手が検出できない」
-      フォールバック経路が元のバッチ全体をそのまま返してしまい、
-      成功経路（常に単一画像を返す）と挙動が矛盾していた小さな不整合も
-      発見・修正した
+      `AdvancedHandOrientationOptimizer`/`AdvancedHandSeamlessStitcher`は、
+      検出した手ごとにクロップサイズが異なりうる（ComfyUIのIMAGEテンソルは
+      同一バッチ内で全画像が同じH,Wである必要がある）という構造的制約が
+      あったが、以下の設計で解決した:
+        - `RemapInfo`に`content_size`（パディング前の実サイズ）を追加
+        - `OrientationOptimizer`はバッチの各要素を個別処理した後、
+          バッチ内の最大サイズへ左上寄せでゼロパディングして1つの
+          IMAGEテンソルにまとめる。`remap_info`はバッチサイズ1の場合は
+          従来通り単一dict、2以上の場合はdictのリストを返す（後方互換）
+        - `SeamlessStitcher`は`remap_info`がリストか単一dictかを判定し、
+          リストの場合は各要素ごとに`content_size`でパディングを除去して
+          から従来通りの逆変換・合成処理を行い、結果をスタックする
+        - `original_image`/`inpainted_image`/`refined_mask`のバッチ数が
+          `remap_info`の件数と異なる場合は、警告を出しつつ先頭要素を
+          全体で使い回す（ブロードキャスト）ことでクラッシュを回避
+      この過程で、「手が検出できない」フォールバック経路が元のバッチ全体を
+      そのまま返してしまい、成功経路（常に単一/バッチ整合の画像を返す）と
+      挙動が矛盾していた小さな不整合も発見・修正した。
+      `tests/test_nodes_batch_and_mode.py`に、サイズの異なるクロップの
+      パディング、Orientation→Stitcherの結合バッチ処理、バッチサイズ
+      不一致時のフォールバック等を含むテストを追加
 - [x] 検出器の実行モード選択パラメータ ✅
       `AdvancedHandOrientationOptimizer` / `AdvancedHandMaskRefiner`に
       `detection_mode`パラメータ（`full` / `yolo_mediapipe` / `mediapipe_only`）
@@ -221,5 +229,7 @@
 
 1. 実写真での3ノード連携・見た目の確認（`wrist_blur`/`finger_sharpness`/
    `sam2_blend_strength`の推奨値検証、`color_match.py`統合可否の判断を含む）
-2. `AdvancedHandOrientationOptimizer` / `AdvancedHandSeamlessStitcher`の
-   バッチ対応方針の検討（クロップサイズが手ごとに異なる問題への対処法）
+2. バッチ処理を実写真・複数手の組み合わせで実際にワークフロー上で試し、
+   共通キャンバスへのパディングが後段のinpaintノードの挙動に悪影響を
+   与えないか確認（パディング領域が黒塗りになるため、inpaintノード側の
+   マスク外領域の扱い次第では見た目に影響する可能性がある）
