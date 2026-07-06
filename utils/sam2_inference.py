@@ -35,7 +35,7 @@ class Sam2OnnxInference:
     def __init__(self, encoder_path: Path, decoder_path: Path):
         import onnxruntime as ort
 
-        from utils.onnx_providers import get_available_providers
+        from .onnx_providers import get_available_providers
 
         providers = get_available_providers()
         self._encoder_session = ort.InferenceSession(str(encoder_path), providers=providers)

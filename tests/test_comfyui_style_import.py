@@ -115,3 +115,46 @@ class TestComfyUIStyleLoading:
             # INPUT_TYPES はComfyUIから@classmethodとして呼ばれる
             input_types = cls.INPUT_TYPES()
             assert "required" in input_types
+
+    def test_sam2_and_yolo_inference_lazy_imports_resolve(
+        self, comfyui_style_loaded_module
+    ):
+        """
+        ★回帰テスト: Sam2OnnxInference / YoloOnnxInference の __init__ 内で
+        使われている遅延import（utils.onnx_providers）が、ComfyUI経由の
+        読み込みでも正しく解決されることを確認する。
+
+        2026-07-07に、nodes.py直下のimportは修正したものの、
+        utils/sam2_inference.py・utils/yolo_inference.py内部の遅延import
+        （関数内で `from utils.onnx_providers import ...` としていた箇所）を
+        見落としており、実機で
+        "YoloHandDetector: モデルの準備に失敗しました (No module named
+        'utils.onnx_providers')" という不具合が発生した。
+        単に「パッケージ全体をimportできるか」だけを見る前のテストでは、
+        __init__内でしか実行されないこの種の遅延importの不具合を検出
+        できなかったため、実際にモデルをロードするところまで検証する。
+        """
+        sam2_module = comfyui_style_loaded_module.nodes.Sam2HandDetector
+        yolo_module = comfyui_style_loaded_module.nodes.YoloHandDetector
+
+        # 実際にbundleされているモデルファイルを使ってインスタンス化する
+        # （is_available()経由で実際に__init__まで到達させる）。
+        assert sam2_module().is_available() is True, (
+            "SAM2モデルが利用可能なはずなのに is_available() が False。"
+            "utils.sam2_inference内の遅延importが壊れている可能性がある。"
+        )
+        assert yolo_module().is_available() is True, (
+            "YOLOモデルが利用可能なはずなのに is_available() が False。"
+            "utils.yolo_inference内の遅延importが壊れている可能性がある。"
+        )
+
+        # is_available()はモデルファイルの存在チェックのみで、実際に
+        # onnxruntime.InferenceSession(...)を生成する__init__までは
+        # 通らないため、_get_inference()を直接呼んで最後まで検証する。
+        sam2_detector = sam2_module()
+        inference = sam2_detector._get_inference()
+        assert inference is not None
+
+        yolo_detector = yolo_module()
+        yolo_inference = yolo_detector._get_inference()
+        assert yolo_inference is not None

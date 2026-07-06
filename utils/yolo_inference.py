@@ -92,7 +92,7 @@ class YoloOnnxInference:
     def __init__(self, onnx_path: Path):
         import onnxruntime as ort
 
-        from utils.onnx_providers import get_available_providers
+        from .onnx_providers import get_available_providers
 
         self._session = ort.InferenceSession(
             str(onnx_path), providers=get_available_providers()
