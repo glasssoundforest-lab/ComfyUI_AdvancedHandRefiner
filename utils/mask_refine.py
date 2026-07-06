@@ -14,7 +14,7 @@ from __future__ import annotations
 import cv2
 import numpy as np
 
-from utils.geometry import FINGER_CHAINS, WRIST_IDX
+from .geometry import FINGER_CHAINS, WRIST_IDX
 
 
 def _draw_finger_strokes(

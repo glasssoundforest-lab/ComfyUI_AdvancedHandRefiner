@@ -23,10 +23,10 @@ from typing import Any
 
 import numpy as np
 
-from utils.detection_types import BoundingBox, DetectionResult, HandDetection
-from utils.detectors.base import HandDetector
-from utils.yolo_hand_model import DEFAULT_MODEL_NAME, ensure_onnx_model, is_onnx_model_available
-from utils.yolo_inference import YoloOnnxInference
+from ..detection_types import BoundingBox, DetectionResult, HandDetection
+from ..yolo_hand_model import DEFAULT_MODEL_NAME, ensure_onnx_model, is_onnx_model_available
+from ..yolo_inference import YoloOnnxInference
+from .base import HandDetector
 
 logger = logging.getLogger("HandRefiner")
 

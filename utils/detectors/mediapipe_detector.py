@@ -14,9 +14,9 @@ from typing import Any
 
 import numpy as np
 
-from utils.detection_types import BoundingBox, DetectionResult, HandDetection
-from utils.detectors.base import HandDetector
-from utils.hand_landmarker import detect_hand_landmarks
+from ..detection_types import BoundingBox, DetectionResult, HandDetection
+from ..hand_landmarker import detect_hand_landmarks
+from .base import HandDetector
 
 logger = logging.getLogger("HandRefiner")
 

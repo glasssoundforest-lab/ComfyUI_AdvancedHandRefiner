@@ -5,20 +5,45 @@ import cv2
 import numpy as np
 import torch
 
-from utils.detection_types import DetectionResult
-from utils.detectors.base import DetectorPipeline
-from utils.detectors.mediapipe_detector import MediaPipeHandDetector
-from utils.detectors.sam2_detector import Sam2HandDetector
-from utils.detectors.yolo_detector import YoloHandDetector
-from utils.geometry import (
-    RemapInfo,
-    compute_padded_bbox,
-    compute_rotation_angle,
-    inverse_transform_image,
-    rotate_image,
-    rotate_points,
-)
-from utils.mask_refine import sharpen_finger_contours, soften_wrist_boundary
+# ★重要: ComfyUIはカスタムノードのフォルダ自体をsys.pathに追加しないため、
+# 「from utils.xxx import yyy」のような絶対importは、ComfyUI経由で
+# 本モジュールが `<プラグインフォルダ名>.nodes` として読み込まれた場合に
+# 「No module named 'utils.xxx'」で失敗する（utils/がトップレベルの
+# importable パッケージとしてsys.path上に存在しないため）。
+# そのため、まずパッケージ内の相対importを試み、失敗した場合
+# （pytest等でnodes.pyを単体のトップレベルモジュールとしてimportして
+# おり、相対importの前提となる親パッケージが存在しない場合）は
+# 従来通りの絶対importにフォールバックする。
+try:
+    from .utils.detection_types import DetectionResult
+    from .utils.detectors.base import DetectorPipeline
+    from .utils.detectors.mediapipe_detector import MediaPipeHandDetector
+    from .utils.detectors.sam2_detector import Sam2HandDetector
+    from .utils.detectors.yolo_detector import YoloHandDetector
+    from .utils.geometry import (
+        RemapInfo,
+        compute_padded_bbox,
+        compute_rotation_angle,
+        inverse_transform_image,
+        rotate_image,
+        rotate_points,
+    )
+    from .utils.mask_refine import sharpen_finger_contours, soften_wrist_boundary
+except ImportError:
+    from utils.detection_types import DetectionResult
+    from utils.detectors.base import DetectorPipeline
+    from utils.detectors.mediapipe_detector import MediaPipeHandDetector
+    from utils.detectors.sam2_detector import Sam2HandDetector
+    from utils.detectors.yolo_detector import YoloHandDetector
+    from utils.geometry import (
+        RemapInfo,
+        compute_padded_bbox,
+        compute_rotation_angle,
+        inverse_transform_image,
+        rotate_image,
+        rotate_points,
+    )
+    from utils.mask_refine import sharpen_finger_contours, soften_wrist_boundary
 
 logger = logging.getLogger("HandRefiner")
 

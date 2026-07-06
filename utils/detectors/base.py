@@ -19,7 +19,7 @@ from typing import Any
 
 import numpy as np
 
-from utils.detection_types import BoundingBox, DetectionResult, HandDetection
+from ..detection_types import BoundingBox, DetectionResult, HandDetection
 
 logger = logging.getLogger("HandRefiner")
 

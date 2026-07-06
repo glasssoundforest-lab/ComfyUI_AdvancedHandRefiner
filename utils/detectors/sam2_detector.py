@@ -28,10 +28,10 @@ from typing import Any
 
 import numpy as np
 
-from utils.detection_types import DetectionResult, HandDetection
-from utils.detectors.base import HandDetector
-from utils.sam2_inference import Sam2OnnxInference
-from utils.sam2_model import DEFAULT_MODEL_NAME, ensure_sam2_models, is_sam2_available
+from ..detection_types import DetectionResult, HandDetection
+from ..sam2_inference import Sam2OnnxInference
+from ..sam2_model import DEFAULT_MODEL_NAME, ensure_sam2_models, is_sam2_available
+from .base import HandDetector
 
 logger = logging.getLogger("HandRefiner")
 
