@@ -10,6 +10,8 @@ from __future__ import annotations
 
 from unittest.mock import patch
 
+import math
+
 import cv2
 import numpy as np
 import pytest
@@ -656,3 +658,90 @@ class TestAssessHandOverallQuality:
         landmarks = _make_landmark_hand()
         result = assess_hand_overall_quality(mask, landmarks)
         assert result["is_abnormal"] is False
+
+
+class TestFuzzRobustness:
+    """
+    ★別角度からの精度向上の一環（2026-07-07）: 新しい検出能力を追加する
+    のではなく、これまで開発した全ての関数が、ランダムに生成した多様な
+    パラメータの組み合わせでクラッシュしない・明らかに壊れた値
+    （負の本数、NaN等）を返さないことを広く検証する、頑健性テスト。
+    個別の精度チューニングで細かい閾値をいじる際に、想定していない
+    パラメータの組み合わせで例外が発生する退行を早期に検出する狙い。
+    """
+
+    def test_random_mask_configurations_do_not_crash(self):
+        rng = np.random.default_rng(123)
+        for _ in range(150):
+            num_fingers = int(rng.integers(2, 8))
+            n_missing = int(rng.integers(0, min(2, num_fingers)))
+            missing = (
+                rng.choice(num_fingers, size=n_missing, replace=False).tolist()
+                if n_missing > 0
+                else None
+            )
+            spread = float(rng.uniform(60, 170))
+            finger_length = float(rng.uniform(30, 130))
+            finger_width = float(rng.uniform(8, 35))
+            palm_radius = float(rng.uniform(20, 70))
+
+            mask = generate_synthetic_hand_mask(
+                num_fingers=num_fingers,
+                missing_fingers=missing,
+                spread_angle_deg=spread,
+                finger_length=finger_length,
+                finger_width=finger_width,
+                palm_radius=palm_radius,
+            )
+
+            hull = estimate_finger_count(mask)
+            skeleton = estimate_finger_count_skeleton(mask)
+            radial = estimate_finger_count_radial(mask)
+            combined = assess_hand_quality(mask)
+
+            for value in (hull, skeleton, radial):
+                assert isinstance(value, int)
+                assert value >= 0
+            assert isinstance(combined["is_abnormal"], bool)
+
+    def test_random_landmark_configurations_do_not_crash(self):
+        rng = np.random.default_rng(456)
+        for _ in range(150):
+            landmarks = [(0.0, 0.0)]
+            for finger_idx in range(5):
+                base_angle = rng.uniform(0, 2 * math.pi)
+                base_len = rng.uniform(5, 150)
+                pts = []
+                for joint in range(4):
+                    jitter_angle = base_angle + rng.uniform(-0.3, 0.3)
+                    jitter_len = base_len * (joint + 1) / 4 * rng.uniform(0.5, 1.5)
+                    pts.append(
+                        (math.cos(jitter_angle) * jitter_len, math.sin(jitter_angle) * jitter_len)
+                    )
+                landmarks.extend(pts)
+
+            result = assess_landmark_plausibility(landmarks)
+            assert isinstance(result["is_abnormal"], bool)
+            assert isinstance(result["suspicious_fingers"], list)
+
+    def test_random_mask_and_landmark_combinations_via_overall_quality(self):
+        rng = np.random.default_rng(789)
+        for _ in range(80):
+            num_fingers = int(rng.integers(3, 8))
+            mask = generate_synthetic_hand_mask(
+                num_fingers=num_fingers,
+                spread_angle_deg=float(rng.uniform(80, 160)),
+            )
+            landmarks = _make_landmark_hand()
+            result = assess_hand_overall_quality(mask, landmarks)
+            assert isinstance(result["is_abnormal"], bool)
+            assert result["deficiency_source"] in ("landmark", "mask_fallback")
+
+    def test_degenerate_tiny_masks_do_not_crash(self):
+        """1〜数ピクセルだけの極端に小さいマスクでもクラッシュしないことを確認する"""
+        for size in [(1, 1), (2, 2), (3, 3), (5, 5)]:
+            mask = np.full(size, 255, dtype=np.uint8)
+            estimate_finger_count(mask)
+            estimate_finger_count_skeleton(mask)
+            estimate_finger_count_radial(mask)
+            assess_hand_quality(mask)
