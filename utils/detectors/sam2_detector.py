@@ -93,6 +93,57 @@ def _leakage_ratio(mask: np.ndarray, trust_region: np.ndarray) -> float:
     return outside / total
 
 
+#: _remove_components_far_from_trust_region で、連結成分ごとの
+#: 「信頼領域外にある割合」がこれを超える場合にその成分を除去する。
+_COMPONENT_OUTSIDE_RATIO_THRESHOLD = 0.7
+
+
+def _remove_components_far_from_trust_region(
+    mask: np.ndarray, trust_region: np.ndarray, outside_ratio_threshold: float
+) -> np.ndarray:
+    """
+    最終的に採用されたマスクに対して行う、より一般的な精度向上策。
+
+    `_choose_between_with_and_without_points`のはみ出しチェックは、
+    「bbox+landmarks併用」と「bboxのみ」の**どちらを採用するか**を
+    決めるための相対比較にすぎない。そのため、両方の候補が同じように
+    手とは無関係な領域（背景・服・髪の毛等）を誤って巻き込んでいた
+    場合、どちらを選んでもその誤検出は残ってしまう。
+
+    この関数は、最終的に採用されたマスクに対して連結成分ごとに
+    ランドマーク周辺の信頼領域からの逸脱度を確認し、成分自身の面積の
+    `outside_ratio_threshold`を超える割合が信頼領域の外側にある場合、
+    その成分をノイズ・誤検出とみなして除去する。手の本体（通常は
+    信頼領域と大きく重なる）は残しつつ、手から明確に離れた場所に
+    別途生じた誤検出の塊だけを取り除く。
+
+    Args:
+        mask: 0-255 uint8マスク
+        trust_region: `_build_landmark_trust_region`で構築した信頼領域
+        outside_ratio_threshold: 成分の面積のうちこの割合を超えて
+            信頼領域外にある場合に除去する（0-1）
+
+    Returns:
+        クリーンアップ後の0-255 uint8マスク
+    """
+    binary = (mask > 0).astype(np.uint8)
+    n, labels, stats, _ = cv2.connectedComponentsWithStats(binary, connectivity=8)
+    if n <= 1:
+        return mask
+
+    cleaned = np.zeros_like(binary)
+    for i in range(1, n):
+        component = labels == i
+        area = int(stats[i, cv2.CC_STAT_AREA])
+        if area == 0:
+            continue
+        outside = int(np.count_nonzero(component & (trust_region == 0)))
+        if (outside / area) <= outside_ratio_threshold:
+            cleaned[component] = 1
+
+    return (cleaned * 255).astype(np.uint8)
+
+
 #: bbox+landmarks併用の結果を「bboxのみ」の結果と比較し、bboxのみの方が
 #: この倍率以上前景面積が広い場合に、bboxのみの結果を採用する安全策の
 #: しきい値。MediaPipeのlandmarksがイラスト調の画像等で不正確な場合、
@@ -255,6 +306,7 @@ class Sam2HandDetector(HandDetector):
                 mask = self._choose_between_with_and_without_points(
                     mask_with_points, mask_box_only, prior_hand.landmarks
                 )
+                mask = self._cleanup_far_from_landmarks(mask, prior_hand.landmarks)
             else:
                 mask = inference.predict_from_box_tiled(
                     image_rgb, box, points=None, tile_size=tile_size, overlap=tile_overlap
@@ -268,15 +320,38 @@ class Sam2HandDetector(HandDetector):
             )
 
         if prior_hand.landmarks:
-            return inference.predict_from_points_tiled(
+            mask = inference.predict_from_points_tiled(
                 image_rgb, prior_hand.landmarks, tile_size=tile_size, overlap=tile_overlap
             )
+            return self._cleanup_far_from_landmarks(mask, prior_hand.landmarks)
 
         logger.warning(
             "Sam2HandDetector: この手にはbbox・landmarksのいずれも無いため "
             "セグメンテーションできません。"
         )
         return None
+
+    def _cleanup_far_from_landmarks(
+        self, mask: np.ndarray | None, landmarks: list[tuple[float, float]]
+    ) -> np.ndarray | None:
+        """
+        最終的なマスクに対し、ランドマーク周辺の信頼領域から大きく外れた
+        連結成分（背景等を誤って巻き込んだ誤検出）を除去する。
+
+        `_choose_between_with_and_without_points`の比較用はみ出しチェックは
+        「2つの候補のどちらを選ぶか」の判断にしか使われないため、両方の
+        候補が同じように誤検出していた場合はすり抜けてしまう。この
+        最終クリーンアップは、採用が確定したマスクそのものに対して
+        連結成分単位で適用することで、そのようなケースも救う。
+        """
+        if mask is None:
+            return None
+        trust_region = _build_landmark_trust_region(
+            landmarks, mask.shape[:2], _TRUST_REGION_MARGIN_RATIO
+        )
+        return _remove_components_far_from_trust_region(
+            mask, trust_region, _COMPONENT_OUTSIDE_RATIO_THRESHOLD
+        )
 
     def _choose_between_with_and_without_points(
         self,

@@ -18,6 +18,8 @@ get_inputs()/get_outputs() から実際の名前を動的に取得し、
 from __future__ import annotations
 
 import logging
+import os
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any
 
@@ -38,6 +40,15 @@ _TILE_OVERLAP_DEFAULT = 64
 #: predict_from_box_tiled/predict_from_points_tiled の合成後クリーンアップで
 #: 除去する孤立領域の面積しきい値（画素数）のデフォルト値。
 _DESPECKLE_MIN_AREA_DEFAULT = 30
+
+#: タイル分割推論を並列実行する際の最大ワーカー数。
+#: onnxruntimeのInferenceSession.run()は、異なるスレッドから同一
+#: セッションを並行して呼び出しても安全（スレッドセーフ）であるため、
+#: タイルごとのエンコード・デコードをスレッドプールで並列化することで、
+#: タイル分割による処理時間の増加を緩和できる。CPUコア数に応じて
+#: 上限を決めるが、際限なく増やしても効果は頭打ちになるため
+#: 上限を設ける。
+_MAX_TILE_WORKERS = min(4, os.cpu_count() or 1)
 
 
 def _tile_starts(length: int, tile_size: int, overlap: int) -> list[tuple[int, int]]:
@@ -223,14 +234,12 @@ class Sam2OnnxInference:
             return _remove_small_regions(mask, despeckle_min_area)
 
         x1, y1, x2, y2 = box
-        prob_sum = np.zeros((h, w), dtype=np.float32)
-        weight = np.zeros((h, w), dtype=np.float32)
-        any_tile_succeeded = False
 
+        # 各タイルのローカルboxをあらかじめ計算し、boxと重ならないタイルは
+        # 除外する（無駄なエンコード呼び出しを避ける）。
+        jobs: list[tuple[int, int, int, int, float, float, float, float, list[tuple[float, float]] | None]] = []
         for ty, tile_h in _tile_starts(h, tile_size, overlap):
             for tx, tile_w in _tile_starts(w, tile_size, overlap):
-                # boxをこのタイルのローカル座標系へクリップする。
-                # 重ならない場合はスキップ（無駄なエンコード呼び出しを避ける）。
                 local_x1 = max(0.0, x1 - tx)
                 local_y1 = max(0.0, y1 - ty)
                 local_x2 = min(float(tile_w), x2 - tx)
@@ -247,23 +256,42 @@ class Sam2OnnxInference:
                         if tx <= px < tx + tile_w and ty <= py < ty + tile_h
                     ] or None
 
-                tile_img = image_rgb[ty : ty + tile_h, tx : tx + tile_w]
-                try:
-                    tile_prob = self._predict_prob_from_box(
-                        tile_img, (local_x1, local_y1, local_x2, local_y2), local_points
-                    )
-                except Exception as e:
-                    logger.warning(
-                        "Sam2HandDetector: タイル(x=%d,y=%d)の推論に失敗しました (%s)",
-                        tx,
-                        ty,
-                        e,
-                    )
-                    continue
+                jobs.append((ty, tile_h, tx, tile_w, local_x1, local_y1, local_x2, local_y2, local_points))
 
-                any_tile_succeeded = True
-                prob_sum[ty : ty + tile_h, tx : tx + tile_w] += tile_prob
-                weight[ty : ty + tile_h, tx : tx + tile_w] += 1.0
+        def _process(job):
+            ty, tile_h, tx, tile_w, lx1, ly1, lx2, ly2, lp = job
+            tile_img = image_rgb[ty : ty + tile_h, tx : tx + tile_w]
+            try:
+                prob = self._predict_prob_from_box(tile_img, (lx1, ly1, lx2, ly2), lp)
+                return (ty, tile_h, tx, tile_w, prob)
+            except Exception as e:
+                logger.warning(
+                    "Sam2HandDetector: タイル(x=%d,y=%d)の推論に失敗しました (%s)", tx, ty, e
+                )
+                return None
+
+        prob_sum = np.zeros((h, w), dtype=np.float32)
+        weight = np.zeros((h, w), dtype=np.float32)
+        any_tile_succeeded = False
+
+        # ★パフォーマンス最適化: onnxruntimeのInferenceSession.run()は
+        # 異なるスレッドから同一セッションを並行して呼び出しても安全
+        # （スレッドセーフ）であるため、タイルごとのエンコード・デコードを
+        # スレッドプールで並列実行する。タイル数が1以下なら並列化の
+        # オーバーヘッドを避けて直列実行する。
+        if len(jobs) > 1:
+            with ThreadPoolExecutor(max_workers=min(_MAX_TILE_WORKERS, len(jobs))) as executor:
+                results = list(executor.map(_process, jobs))
+        else:
+            results = [_process(job) for job in jobs]
+
+        for res in results:
+            if res is None:
+                continue
+            ty, tile_h, tx, tile_w, prob = res
+            any_tile_succeeded = True
+            prob_sum[ty : ty + tile_h, tx : tx + tile_w] += prob
+            weight[ty : ty + tile_h, tx : tx + tile_w] += 1.0
 
         if not any_tile_succeeded:
             return None
@@ -316,13 +344,8 @@ class Sam2OnnxInference:
             return mask_with, mask_without
 
         x1, y1, x2, y2 = box
-        prob_sum_with = np.zeros((h, w), dtype=np.float32)
-        weight_with = np.zeros((h, w), dtype=np.float32)
-        prob_sum_without = np.zeros((h, w), dtype=np.float32)
-        weight_without = np.zeros((h, w), dtype=np.float32)
-        any_with = False
-        any_without = False
 
+        jobs: list[tuple[int, int, int, int, float, float, float, float, list[tuple[float, float]] | None]] = []
         for ty, tile_h in _tile_starts(h, tile_size, overlap):
             for tx, tile_w in _tile_starts(w, tile_size, overlap):
                 local_x1 = max(0.0, x1 - tx)
@@ -341,67 +364,87 @@ class Sam2OnnxInference:
                         if tx <= px < tx + tile_w and ty <= py < ty + tile_h
                     ] or None
 
-                tile_img = image_rgb[ty : ty + tile_h, tx : tx + tile_w]
-                try:
-                    # ★エンコードはタイルごとに1回だけ実行し、以降の
-                    # 2種類のデコードで使い回す。
-                    encoder_outputs, scale, orig_size = self._encode_image(tile_img)
-                except Exception as e:
-                    logger.warning(
-                        "Sam2HandDetector: タイル(x=%d,y=%d)のエンコードに失敗しました (%s)",
-                        tx,
-                        ty,
-                        e,
-                    )
-                    continue
+                jobs.append((ty, tile_h, tx, tile_w, local_x1, local_y1, local_x2, local_y2, local_points))
 
-                box_coords = [
-                    [local_x1 * scale, local_y1 * scale],
-                    [local_x2 * scale, local_y2 * scale],
-                ]
+        def _process(job):
+            ty, tile_h, tx, tile_w, lx1, ly1, lx2, ly2, lp = job
+            tile_img = image_rgb[ty : ty + tile_h, tx : tx + tile_w]
+            try:
+                # ★エンコードはタイルごとに1回だけ実行し、以降の
+                # 2種類のデコードで使い回す。
+                encoder_outputs, scale, orig_size = self._encode_image(tile_img)
+            except Exception as e:
+                logger.warning(
+                    "Sam2HandDetector: タイル(x=%d,y=%d)のエンコードに失敗しました (%s)",
+                    tx,
+                    ty,
+                    e,
+                )
+                return (ty, tile_h, tx, tile_w, None, None)
 
-                # 1) points併用のデコード
-                try:
-                    coords = list(box_coords)
-                    labels = [2, 3]
-                    if local_points:
-                        coords.extend([[px * scale, py * scale] for px, py in local_points])
-                        labels.extend([1] * len(local_points))
-                    point_coords = np.array([coords], dtype=np.float32)
-                    point_labels = np.array([labels], dtype=np.float32)
-                    tile_prob_with = self._run_decoder_prob(
-                        encoder_outputs, point_coords, point_labels, orig_size
-                    )
-                    any_with = True
-                    prob_sum_with[ty : ty + tile_h, tx : tx + tile_w] += tile_prob_with
-                    weight_with[ty : ty + tile_h, tx : tx + tile_w] += 1.0
-                except Exception as e:
-                    logger.warning(
-                        "Sam2HandDetector: タイル(x=%d,y=%d)のpoints併用デコードに"
-                        "失敗しました (%s)",
-                        tx,
-                        ty,
-                        e,
-                    )
+            box_coords = [[lx1 * scale, ly1 * scale], [lx2 * scale, ly2 * scale]]
 
-                # 2) bboxのみのデコード（同じencoder_outputsを使い回す）
-                try:
-                    point_coords_box_only = np.array([box_coords], dtype=np.float32)
-                    point_labels_box_only = np.array([[2, 3]], dtype=np.float32)
-                    tile_prob_without = self._run_decoder_prob(
-                        encoder_outputs, point_coords_box_only, point_labels_box_only, orig_size
-                    )
-                    any_without = True
-                    prob_sum_without[ty : ty + tile_h, tx : tx + tile_w] += tile_prob_without
-                    weight_without[ty : ty + tile_h, tx : tx + tile_w] += 1.0
-                except Exception as e:
-                    logger.warning(
-                        "Sam2HandDetector: タイル(x=%d,y=%d)のbboxのみデコードに"
-                        "失敗しました (%s)",
-                        tx,
-                        ty,
-                        e,
-                    )
+            tile_prob_with = None
+            try:
+                coords = list(box_coords)
+                labels = [2, 3]
+                if lp:
+                    coords.extend([[px * scale, py * scale] for px, py in lp])
+                    labels.extend([1] * len(lp))
+                point_coords = np.array([coords], dtype=np.float32)
+                point_labels = np.array([labels], dtype=np.float32)
+                tile_prob_with = self._run_decoder_prob(
+                    encoder_outputs, point_coords, point_labels, orig_size
+                )
+            except Exception as e:
+                logger.warning(
+                    "Sam2HandDetector: タイル(x=%d,y=%d)のpoints併用デコードに"
+                    "失敗しました (%s)",
+                    tx,
+                    ty,
+                    e,
+                )
+
+            tile_prob_without = None
+            try:
+                point_coords_box_only = np.array([box_coords], dtype=np.float32)
+                point_labels_box_only = np.array([[2, 3]], dtype=np.float32)
+                tile_prob_without = self._run_decoder_prob(
+                    encoder_outputs, point_coords_box_only, point_labels_box_only, orig_size
+                )
+            except Exception as e:
+                logger.warning(
+                    "Sam2HandDetector: タイル(x=%d,y=%d)のbboxのみデコードに"
+                    "失敗しました (%s)",
+                    tx,
+                    ty,
+                    e,
+                )
+
+            return (ty, tile_h, tx, tile_w, tile_prob_with, tile_prob_without)
+
+        prob_sum_with = np.zeros((h, w), dtype=np.float32)
+        weight_with = np.zeros((h, w), dtype=np.float32)
+        prob_sum_without = np.zeros((h, w), dtype=np.float32)
+        weight_without = np.zeros((h, w), dtype=np.float32)
+        any_with = False
+        any_without = False
+
+        if len(jobs) > 1:
+            with ThreadPoolExecutor(max_workers=min(_MAX_TILE_WORKERS, len(jobs))) as executor:
+                results = list(executor.map(_process, jobs))
+        else:
+            results = [_process(job) for job in jobs]
+
+        for ty, tile_h, tx, tile_w, tile_prob_with, tile_prob_without in results:
+            if tile_prob_with is not None:
+                any_with = True
+                prob_sum_with[ty : ty + tile_h, tx : tx + tile_w] += tile_prob_with
+                weight_with[ty : ty + tile_h, tx : tx + tile_w] += 1.0
+            if tile_prob_without is not None:
+                any_without = True
+                prob_sum_without[ty : ty + tile_h, tx : tx + tile_w] += tile_prob_without
+                weight_without[ty : ty + tile_h, tx : tx + tile_w] += 1.0
 
         mask_with = None
         if any_with:
@@ -487,10 +530,7 @@ class Sam2OnnxInference:
                 return mask
             return _remove_small_regions(mask, despeckle_min_area)
 
-        prob_sum = np.zeros((h, w), dtype=np.float32)
-        weight = np.zeros((h, w), dtype=np.float32)
-        any_tile_succeeded = False
-
+        jobs: list[tuple[int, int, int, int, list[tuple[float, float]]]] = []
         for ty, tile_h in _tile_starts(h, tile_size, overlap):
             for tx, tile_w in _tile_starts(w, tile_size, overlap):
                 local_points = [
@@ -500,22 +540,37 @@ class Sam2OnnxInference:
                 ]
                 if not local_points:
                     continue
+                jobs.append((ty, tile_h, tx, tile_w, local_points))
 
-                tile_img = image_rgb[ty : ty + tile_h, tx : tx + tile_w]
-                try:
-                    tile_prob = self._predict_prob_from_points(tile_img, local_points)
-                except Exception as e:
-                    logger.warning(
-                        "Sam2HandDetector: タイル(x=%d,y=%d)の推論に失敗しました (%s)",
-                        tx,
-                        ty,
-                        e,
-                    )
-                    continue
+        def _process(job):
+            ty, tile_h, tx, tile_w, lp = job
+            tile_img = image_rgb[ty : ty + tile_h, tx : tx + tile_w]
+            try:
+                prob = self._predict_prob_from_points(tile_img, lp)
+                return (ty, tile_h, tx, tile_w, prob)
+            except Exception as e:
+                logger.warning(
+                    "Sam2HandDetector: タイル(x=%d,y=%d)の推論に失敗しました (%s)", tx, ty, e
+                )
+                return None
 
-                any_tile_succeeded = True
-                prob_sum[ty : ty + tile_h, tx : tx + tile_w] += tile_prob
-                weight[ty : ty + tile_h, tx : tx + tile_w] += 1.0
+        prob_sum = np.zeros((h, w), dtype=np.float32)
+        weight = np.zeros((h, w), dtype=np.float32)
+        any_tile_succeeded = False
+
+        if len(jobs) > 1:
+            with ThreadPoolExecutor(max_workers=min(_MAX_TILE_WORKERS, len(jobs))) as executor:
+                results = list(executor.map(_process, jobs))
+        else:
+            results = [_process(job) for job in jobs]
+
+        for res in results:
+            if res is None:
+                continue
+            ty, tile_h, tx, tile_w, prob = res
+            any_tile_succeeded = True
+            prob_sum[ty : ty + tile_h, tx : tx + tile_w] += prob
+            weight[ty : ty + tile_h, tx : tx + tile_w] += 1.0
 
         if not any_tile_succeeded:
             return None

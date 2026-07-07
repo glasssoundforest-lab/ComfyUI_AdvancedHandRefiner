@@ -21,7 +21,12 @@ import numpy as np
 import pytest
 
 from utils.detection_types import BoundingBox, HandDetection
-from utils.detectors.sam2_detector import Sam2HandDetector, _build_landmark_trust_region, _leakage_ratio
+from utils.detectors.sam2_detector import (
+    Sam2HandDetector,
+    _build_landmark_trust_region,
+    _leakage_ratio,
+    _remove_components_far_from_trust_region,
+)
 
 
 class _FakeInference:
@@ -222,3 +227,66 @@ class TestLandmarkTrustRegion:
         region = _build_landmark_trust_region(landmarks, (100, 100), margin_ratio=0.1)
         mask = _make_offset_mask((100, 100), (0, 0), 10)
         assert _leakage_ratio(mask, region) > 0.8
+
+
+class TestRemoveComponentsFarFromTrustRegion:
+    def test_component_mostly_inside_trust_region_is_kept(self):
+        landmarks = _cluster_landmarks(center=(50.0, 50.0), spread=15.0)
+        region = _build_landmark_trust_region(landmarks, (100, 100), margin_ratio=0.15)
+        mask = _make_centered_mask((100, 100), (50.0, 50.0), 15)
+
+        result = _remove_components_far_from_trust_region(mask, region, 0.7)
+        np.testing.assert_array_equal(result, mask)
+
+    def test_component_mostly_outside_trust_region_is_removed(self):
+        landmarks = _cluster_landmarks(center=(50.0, 50.0), spread=15.0)
+        region = _build_landmark_trust_region(landmarks, (100, 100), margin_ratio=0.1)
+        far_mask = _make_offset_mask((100, 100), (0, 0), 10)
+
+        result = _remove_components_far_from_trust_region(far_mask, region, 0.7)
+        assert np.count_nonzero(result) == 0
+
+    def test_only_the_offending_component_is_removed_others_kept(self):
+        """
+        本体(信頼領域内)は残しつつ、離れた場所の別成分だけを除去する
+        （ユーザー指摘を受けて追加した最終クリーンアップの主眼）。
+        """
+        landmarks = _cluster_landmarks(center=(50.0, 50.0), spread=15.0)
+        region = _build_landmark_trust_region(landmarks, (100, 100), margin_ratio=0.1)
+
+        mask = _make_centered_mask((100, 100), (50.0, 50.0), 15)
+        far_component = _make_offset_mask((100, 100), (85, 85), 10)
+        mask = np.maximum(mask, far_component)
+
+        result = _remove_components_far_from_trust_region(mask, region, 0.7)
+
+        assert result[50, 50] == 255  # 本体は維持
+        assert result[90, 90] == 0  # 離れた誤検出成分は除去
+
+
+class TestSegmentOneHandAppliesFinalCleanup:
+    def test_final_mask_has_leaked_component_removed_even_when_both_candidates_leak(self):
+        """
+        ★ユーザー指摘への対応: bbox+landmarks併用・bboxのみの両方の候補が
+        同じように無関係な場所を巻き込んでいた場合でも(比較だけでは検出
+        できない)、最終的に採用されたマスクに対する連結成分単位の
+        クリーンアップにより、その誤検出部分が除去されることを確認する。
+        """
+        landmarks = _cluster_landmarks(center=(50.0, 50.0), spread=15.0)
+
+        # 両方の候補とも、本体(信頼領域内)+同じ場所の離れた誤検出成分を含む
+        main_body = _make_centered_mask((100, 100), (50.0, 50.0), 20)
+        leaked_component = _make_offset_mask((100, 100), (85, 85), 10)
+        mask_with_points = np.maximum(main_body, leaked_component)
+        mask_box_only = np.maximum(main_body, leaked_component)  # 同じ誤検出を含む
+
+        inference = _FakeInference(mask_with_points, mask_box_only)
+        detector = Sam2HandDetector()
+        prior_hand = HandDetection(bbox=BoundingBox(0, 0, 100, 100), landmarks=landmarks, source="mediapipe")
+
+        result = detector._segment_one_hand(
+            inference, np.zeros((100, 100, 3), dtype=np.uint8), prior_hand
+        )
+
+        assert result[50, 50] == 255  # 本体は維持
+        assert result[90, 90] == 0  # 両候補共通の誤検出成分は最終クリーンアップで除去
