@@ -39,6 +39,17 @@ logger = logging.getLogger("HandRefiner")
 _inference_cache: dict[str, Sam2OnnxInference] = {}
 
 
+#: bbox+landmarks併用の結果を「bboxのみ」の結果と比較し、bboxのみの方が
+#: この倍率以上前景面積が広い場合に、bboxのみの結果を採用する安全策の
+#: しきい値。MediaPipeのlandmarksがイラスト調の画像等で不正確な場合、
+#: それを前景点として強制するとSAM2がかえって混乱し、bboxのみの場合より
+#: 大幅に小さいマスクしか得られないことが実写データで確認されたための対策。
+#: bbox面積に対する絶対的な割合ではなく相対比較にしているのは、bboxの
+#: パディング量によって「本来どの程度前景で埋まるべきか」が変わり、
+#: 絶対しきい値では正しく判定できないケースが実写データで確認されたため。
+_BOX_ONLY_PREFERENCE_RATIO = 1.2
+
+
 class Sam2HandDetector(HandDetector):
     """SAM2を使うセグメンテーション検出器"""
 
@@ -156,11 +167,18 @@ class Sam2HandDetector(HandDetector):
         1つの手について、優先順位に従ってプロンプトを構築し
         セグメンテーションを実行する。
 
-        bbox・landmarksの両方が揃っている場合は、両方を同時にSAM2へ
+        bbox・landmarksの両方が揃っている場合は、まず両方を同時にSAM2へ
         渡す（bboxだけでは手がかりが乏しいタイル分割時の各タイルにおいて、
         landmarksの具体的な点情報が指の折り重なり等の複雑な形状の
-        判断材料になる。実写データで、bbox単体だと不安定だった領域が
-        landmarks併用で改善することを確認済み）。
+        判断材料になり、実写データで改善することを確認済み）。
+
+        ★ただし実写データで、MediaPipeのlandmarksがイラスト調の画像等で
+        不正確な場合（握り込んだ指の関節位置を誤検出している等）、それを
+        前景点として強制するとSAM2がかえって混乱し、bboxのみの場合より
+        大幅に小さいマスクしか得られない逆効果になるケースが確認された。
+        そのため、bboxのみで再推論した結果とも比較し、bboxのみの方が
+        明らかに前景面積が広い場合（`_BOX_ONLY_PREFERENCE_RATIO`倍以上）は
+        そちらを採用する安全策を設けている。
         """
         if prior_hand.bbox is not None:
             box = prior_hand.bbox.to_int_tuple()
@@ -171,6 +189,12 @@ class Sam2HandDetector(HandDetector):
                 tile_size=tile_size,
                 overlap=tile_overlap,
             )
+
+            if mask is not None and prior_hand.landmarks:
+                mask = self._prefer_box_only_if_significantly_better(
+                    inference, image_rgb, box, mask, tile_size, tile_overlap
+                )
+
             if mask is not None:
                 return mask
             logger.warning(
@@ -188,3 +212,38 @@ class Sam2HandDetector(HandDetector):
             "セグメンテーションできません。"
         )
         return None
+
+    def _prefer_box_only_if_significantly_better(
+        self,
+        inference: Sam2OnnxInference,
+        image_rgb: np.ndarray,
+        box: tuple[int, int, int, int],
+        mask_with_points: np.ndarray,
+        tile_size: int,
+        tile_overlap: int,
+    ) -> np.ndarray:
+        """
+        bboxのみで再推論した結果と比較し、そちらの方が明らかに前景面積が
+        広い場合はそちらを採用する（landmarksが不正確でSAM2を誤誘導して
+        いる可能性への対策）。
+        """
+        box_only_mask = inference.predict_from_box_tiled(
+            image_rgb, box, points=None, tile_size=tile_size, overlap=tile_overlap
+        )
+        if box_only_mask is None:
+            return mask_with_points
+
+        area_with_points = float(np.count_nonzero(mask_with_points))
+        area_box_only = float(np.count_nonzero(box_only_mask))
+
+        if area_box_only >= area_with_points * _BOX_ONLY_PREFERENCE_RATIO:
+            logger.warning(
+                "Sam2HandDetector: bbox+landmarks併用時の前景面積(%d px)が、"
+                "bboxのみの場合(%d px)より大幅に少ないため、bboxのみの"
+                "結果を採用します（landmarksが不正確な可能性があります）。",
+                int(area_with_points),
+                int(area_box_only),
+            )
+            return box_only_mask
+
+        return mask_with_points
