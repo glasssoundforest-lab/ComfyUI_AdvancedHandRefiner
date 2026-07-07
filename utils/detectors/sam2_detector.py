@@ -233,20 +233,31 @@ class Sam2HandDetector(HandDetector):
         そのため、bboxのみで再推論した結果とも比較し、bboxのみの方が
         明らかに前景面積が広い場合（`_BOX_ONLY_PREFERENCE_RATIO`倍以上）は
         そちらを採用する安全策を設けている。
+
+        ★パフォーマンス上の注意: landmarksがある場合、比較のために
+        「points併用」「bboxのみ」の2パターンのセグメンテーションが
+        必要になるが、`predict_from_box_with_and_without_points_tiled()`
+        を使うことで、SAM2エンコーダ（最も計算コストが高い部分）の
+        実行はタイルごとに1回だけで済み、軽量なデコードだけを2回行う
+        （エンコーダを2回実行する無駄を避けている）。
         """
         if prior_hand.bbox is not None:
             box = prior_hand.bbox.to_int_tuple()
-            mask = inference.predict_from_box_tiled(
-                image_rgb,
-                box,
-                points=prior_hand.landmarks,
-                tile_size=tile_size,
-                overlap=tile_overlap,
-            )
 
-            if mask is not None and prior_hand.landmarks:
-                mask = self._prefer_box_only_if_significantly_better(
-                    inference, image_rgb, box, mask, prior_hand.landmarks, tile_size, tile_overlap
+            if prior_hand.landmarks:
+                mask_with_points, mask_box_only = inference.predict_from_box_with_and_without_points_tiled(
+                    image_rgb,
+                    box,
+                    prior_hand.landmarks,
+                    tile_size=tile_size,
+                    overlap=tile_overlap,
+                )
+                mask = self._choose_between_with_and_without_points(
+                    mask_with_points, mask_box_only, prior_hand.landmarks
+                )
+            else:
+                mask = inference.predict_from_box_tiled(
+                    image_rgb, box, points=None, tile_size=tile_size, overlap=tile_overlap
                 )
 
             if mask is not None:
@@ -267,20 +278,15 @@ class Sam2HandDetector(HandDetector):
         )
         return None
 
-    def _prefer_box_only_if_significantly_better(
+    def _choose_between_with_and_without_points(
         self,
-        inference: Sam2OnnxInference,
-        image_rgb: np.ndarray,
-        box: tuple[int, int, int, int],
-        mask_with_points: np.ndarray,
+        mask_with_points: np.ndarray | None,
+        mask_box_only: np.ndarray | None,
         landmarks: list[tuple[float, float]],
-        tile_size: int,
-        tile_overlap: int,
-    ) -> np.ndarray:
+    ) -> np.ndarray | None:
         """
-        bboxのみで再推論した結果と比較し、そちらの方が明らかに前景面積が
-        広い場合はそちらを採用する（landmarksが不正確でSAM2を誤誘導して
-        いる可能性への対策）。
+        「points併用」と「bboxのみ」の2つのマスクのうち、どちらを採用するか
+        決める。
 
         ★注意（重要な安全策）: 単純に「面積が広い方を採用する」だけでは、
         bboxのみの推論がたまたま服・髪の毛等、手とは無関係な領域を
@@ -290,14 +296,13 @@ class Sam2HandDetector(HandDetector):
         外側に大きくはみ出していないか（`_MAX_LEAKAGE_RATIO`以下か）も
         あわせて確認し、はみ出しが大きい場合は面積が広くても採用しない。
         """
-        box_only_mask = inference.predict_from_box_tiled(
-            image_rgb, box, points=None, tile_size=tile_size, overlap=tile_overlap
-        )
-        if box_only_mask is None:
+        if mask_with_points is None:
+            return mask_box_only
+        if mask_box_only is None:
             return mask_with_points
 
         area_with_points = float(np.count_nonzero(mask_with_points))
-        area_box_only = float(np.count_nonzero(box_only_mask))
+        area_box_only = float(np.count_nonzero(mask_box_only))
 
         if area_box_only < area_with_points * _BOX_ONLY_PREFERENCE_RATIO:
             return mask_with_points
@@ -305,7 +310,7 @@ class Sam2HandDetector(HandDetector):
         trust_region = _build_landmark_trust_region(
             landmarks, mask_with_points.shape[:2], _TRUST_REGION_MARGIN_RATIO
         )
-        leakage = _leakage_ratio(box_only_mask, trust_region)
+        leakage = _leakage_ratio(mask_box_only, trust_region)
 
         if leakage > _MAX_LEAKAGE_RATIO:
             logger.warning(
@@ -325,4 +330,4 @@ class Sam2HandDetector(HandDetector):
             int(area_with_points),
             int(area_box_only),
         )
-        return box_only_mask
+        return mask_box_only

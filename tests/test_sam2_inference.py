@@ -622,3 +622,68 @@ class TestRemoveSmallRegions:
 
         assert result[31, 31] == 0, "本体から遠いノイズが除去されずに残ってしまった"
         assert result[10, 10] == 255  # 本体は維持される
+
+
+class TestPredictFromBoxWithAndWithoutPointsTiled:
+    def _setup_tiled_instance(self, raw_mask_shape=(64, 64)):
+        decoder_names = ["point_coords", "point_labels", "image_embed"]
+        raw_mask = np.ones((1,) + raw_mask_shape, dtype=np.float32)
+        encoder_outputs = {"image_embed": np.zeros((1, 3))}
+        return _make_instance(decoder_names, raw_mask, encoder_outputs)
+
+    def test_encoder_is_called_once_per_tile_not_twice(self):
+        """
+        ★パフォーマンス回帰テスト: points併用・bboxのみの両方のマスクを
+        得る際、タイルごとにエンコーダは1回だけ呼ばれ(2回の独立呼び出しに
+        よる二重実行を避ける)、デコードだけが2回行われることを確認する。
+        """
+        obj, _decoder_session, encoder_session = self._setup_tiled_instance()
+        image = np.zeros((1000, 1000, 3), dtype=np.uint8)
+        box = (0.0, 0.0, 1000.0, 1000.0)
+        points = [(10.0, 10.0), (900.0, 900.0)]
+
+        mask_with, mask_without = obj.predict_from_box_with_and_without_points_tiled(
+            image, box, points, tile_size=512, overlap=64
+        )
+
+        assert mask_with is not None
+        assert mask_without is not None
+        assert mask_with.shape == (1000, 1000)
+        assert mask_without.shape == (1000, 1000)
+
+        # 個別に2回(predict_from_box_tiledをpoints有り/無しで呼ぶ)実行した
+        # 場合と比べて、エンコーダ呼び出し回数が半分(タイル数と同じ)に
+        # 収まっていることを確認する。
+        num_tiles = len(_tile_starts(1000, 512, 64)) ** 2
+        assert encoder_session.call_count == num_tiles
+
+    def test_small_image_delegates_to_two_single_predict_calls(self):
+        """tile_size以下の画像では分割せず、それぞれ1回ずつ(計2回)のpredict_from_box呼び出しになる"""
+        obj, _decoder_session, encoder_session = self._setup_tiled_instance()
+        image = np.zeros((300, 300, 3), dtype=np.uint8)
+
+        mask_with, mask_without = obj.predict_from_box_with_and_without_points_tiled(
+            image, box=(10.0, 10.0, 200.0, 200.0), points=[(50.0, 50.0)], tile_size=512
+        )
+
+        assert mask_with is not None
+        assert mask_without is not None
+        assert encoder_session.call_count == 2
+
+    def test_results_match_separate_calls(self):
+        """結果が、従来のpredict_from_box_tiledを個別に2回呼んだ場合と一致することを確認"""
+        obj, _decoder_session, _encoder_session = self._setup_tiled_instance()
+        image = np.zeros((1000, 1000, 3), dtype=np.uint8)
+        box = (0.0, 0.0, 1000.0, 1000.0)
+        points = [(10.0, 10.0), (900.0, 900.0)]
+
+        mask_with_combined, mask_without_combined = obj.predict_from_box_with_and_without_points_tiled(
+            image, box, points, tile_size=512, overlap=64
+        )
+
+        obj2, _decoder_session2, _encoder_session2 = self._setup_tiled_instance()
+        mask_with_separate = obj2.predict_from_box_tiled(image, box, points=points, tile_size=512, overlap=64)
+        mask_without_separate = obj2.predict_from_box_tiled(image, box, points=None, tile_size=512, overlap=64)
+
+        np.testing.assert_array_equal(mask_with_combined, mask_with_separate)
+        np.testing.assert_array_equal(mask_without_combined, mask_without_separate)

@@ -25,13 +25,19 @@ from utils.detectors.sam2_detector import Sam2HandDetector, _build_landmark_trus
 
 
 class _FakeInference:
-    """predict_from_box_tiledの呼び出しを記録し、pointsの有無に応じて
-    異なる固定マスクを返すフェイクSam2OnnxInference"""
+    """predict_from_box_with_and_without_points_tiledの呼び出しを記録し、
+    固定のマスクペアを返すフェイクSam2OnnxInference"""
 
     def __init__(self, mask_with_points: np.ndarray | None, mask_box_only: np.ndarray | None):
         self._mask_with_points = mask_with_points
         self._mask_box_only = mask_box_only
         self.calls: list[dict] = []
+
+    def predict_from_box_with_and_without_points_tiled(
+        self, image_rgb, box, points, tile_size=512, overlap=64, despeckle_min_area=30
+    ):
+        self.calls.append({"box": box, "points": points, "tile_size": tile_size})
+        return self._mask_with_points, self._mask_box_only
 
     def predict_from_box_tiled(self, image_rgb, box, points=None, tile_size=512, overlap=64):
         self.calls.append({"box": box, "points": points, "tile_size": tile_size})

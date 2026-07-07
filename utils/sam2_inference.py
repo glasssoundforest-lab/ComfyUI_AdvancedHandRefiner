@@ -275,6 +275,152 @@ class Sam2OnnxInference:
         mask_uint8 = (avg_prob > 0.0).astype(np.uint8) * 255
         return _remove_small_regions(mask_uint8, despeckle_min_area)
 
+    def predict_from_box_with_and_without_points_tiled(
+        self,
+        image_rgb: np.ndarray,
+        box: tuple[float, float, float, float],
+        points: list[tuple[float, float]] | None,
+        tile_size: int = _TILE_SIZE_DEFAULT,
+        overlap: int = _TILE_OVERLAP_DEFAULT,
+        despeckle_min_area: int = _DESPECKLE_MIN_AREA_DEFAULT,
+    ) -> tuple[np.ndarray | None, np.ndarray | None]:
+        """
+        `predict_from_box_tiled`の「points併用」版と「bboxのみ」版の
+        両方のマスクを、タイルごとのエンコード結果を使い回すことで、
+        SAM2エンコーダの呼び出し回数を実質半分に抑えて計算する。
+
+        `Sam2HandDetector`の安全策（bbox+landmarks併用がSAM2を誤誘導
+        している可能性がある場合に、bboxのみの結果と比較して採用するか
+        決める）では、従来`predict_from_box_tiled`を2回（points有り・
+        無し）独立に呼んでいたため、同じ画像に対してSAM2エンコーダ
+        （最も計算コストが高い部分）を2回実行する無駄が生じていた。
+        エンコーダの出力は`points`の有無に関わらず同じ画像内容に対して
+        同一であるため、タイルごとにエンコードは1回だけ行い、デコード
+        （軽量）だけを「points併用」「bboxのみ」の2パターンで実行する
+        ことで、この無駄を解消する。
+
+        Returns:
+            (points併用マスク, bboxのみマスク) のタプル。
+            それぞれ独立に None になり得る（全タイル失敗時等）。
+        """
+        h, w = image_rgb.shape[:2]
+
+        if h <= tile_size and w <= tile_size:
+            mask_with = self.predict_from_box(image_rgb, box, points)
+            mask_without = self.predict_from_box(image_rgb, box, None)
+            if despeckle_min_area > 0:
+                if mask_with is not None:
+                    mask_with = _remove_small_regions(mask_with, despeckle_min_area)
+                if mask_without is not None:
+                    mask_without = _remove_small_regions(mask_without, despeckle_min_area)
+            return mask_with, mask_without
+
+        x1, y1, x2, y2 = box
+        prob_sum_with = np.zeros((h, w), dtype=np.float32)
+        weight_with = np.zeros((h, w), dtype=np.float32)
+        prob_sum_without = np.zeros((h, w), dtype=np.float32)
+        weight_without = np.zeros((h, w), dtype=np.float32)
+        any_with = False
+        any_without = False
+
+        for ty, tile_h in _tile_starts(h, tile_size, overlap):
+            for tx, tile_w in _tile_starts(w, tile_size, overlap):
+                local_x1 = max(0.0, x1 - tx)
+                local_y1 = max(0.0, y1 - ty)
+                local_x2 = min(float(tile_w), x2 - tx)
+                local_y2 = min(float(tile_h), y2 - ty)
+
+                if local_x2 <= local_x1 or local_y2 <= local_y1:
+                    continue
+
+                local_points = None
+                if points:
+                    local_points = [
+                        (px - tx, py - ty)
+                        for px, py in points
+                        if tx <= px < tx + tile_w and ty <= py < ty + tile_h
+                    ] or None
+
+                tile_img = image_rgb[ty : ty + tile_h, tx : tx + tile_w]
+                try:
+                    # ★エンコードはタイルごとに1回だけ実行し、以降の
+                    # 2種類のデコードで使い回す。
+                    encoder_outputs, scale, orig_size = self._encode_image(tile_img)
+                except Exception as e:
+                    logger.warning(
+                        "Sam2HandDetector: タイル(x=%d,y=%d)のエンコードに失敗しました (%s)",
+                        tx,
+                        ty,
+                        e,
+                    )
+                    continue
+
+                box_coords = [
+                    [local_x1 * scale, local_y1 * scale],
+                    [local_x2 * scale, local_y2 * scale],
+                ]
+
+                # 1) points併用のデコード
+                try:
+                    coords = list(box_coords)
+                    labels = [2, 3]
+                    if local_points:
+                        coords.extend([[px * scale, py * scale] for px, py in local_points])
+                        labels.extend([1] * len(local_points))
+                    point_coords = np.array([coords], dtype=np.float32)
+                    point_labels = np.array([labels], dtype=np.float32)
+                    tile_prob_with = self._run_decoder_prob(
+                        encoder_outputs, point_coords, point_labels, orig_size
+                    )
+                    any_with = True
+                    prob_sum_with[ty : ty + tile_h, tx : tx + tile_w] += tile_prob_with
+                    weight_with[ty : ty + tile_h, tx : tx + tile_w] += 1.0
+                except Exception as e:
+                    logger.warning(
+                        "Sam2HandDetector: タイル(x=%d,y=%d)のpoints併用デコードに"
+                        "失敗しました (%s)",
+                        tx,
+                        ty,
+                        e,
+                    )
+
+                # 2) bboxのみのデコード（同じencoder_outputsを使い回す）
+                try:
+                    point_coords_box_only = np.array([box_coords], dtype=np.float32)
+                    point_labels_box_only = np.array([[2, 3]], dtype=np.float32)
+                    tile_prob_without = self._run_decoder_prob(
+                        encoder_outputs, point_coords_box_only, point_labels_box_only, orig_size
+                    )
+                    any_without = True
+                    prob_sum_without[ty : ty + tile_h, tx : tx + tile_w] += tile_prob_without
+                    weight_without[ty : ty + tile_h, tx : tx + tile_w] += 1.0
+                except Exception as e:
+                    logger.warning(
+                        "Sam2HandDetector: タイル(x=%d,y=%d)のbboxのみデコードに"
+                        "失敗しました (%s)",
+                        tx,
+                        ty,
+                        e,
+                    )
+
+        mask_with = None
+        if any_with:
+            covered = weight_with > 0
+            avg = np.zeros((h, w), dtype=np.float32)
+            avg[covered] = prob_sum_with[covered] / weight_with[covered]
+            mask_with = (avg > 0.0).astype(np.uint8) * 255
+            mask_with = _remove_small_regions(mask_with, despeckle_min_area)
+
+        mask_without = None
+        if any_without:
+            covered = weight_without > 0
+            avg = np.zeros((h, w), dtype=np.float32)
+            avg[covered] = prob_sum_without[covered] / weight_without[covered]
+            mask_without = (avg > 0.0).astype(np.uint8) * 255
+            mask_without = _remove_small_regions(mask_without, despeckle_min_area)
+
+        return mask_with, mask_without
+
     def predict_from_points(
         self,
         image_rgb: np.ndarray,
