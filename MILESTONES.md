@@ -734,6 +734,55 @@ onnxruntimeの`InferenceSession.run()`は異なるスレッドから同一
 
 ---
 
+## 🚨 重大バグ修正（2026-07-07）: rotate_points()の回転方向がrotate_image()と逆だった
+
+**症状（実写データで報告）**: `process_all_hands=True`で複数手の
+`cropped_image`を確認したところ、**手が全く写っていない**（背景の
+髪の毛・服の生地だけが写った）クロップ画像になっていた。
+
+**原因（根本的なバグ）**: `utils/geometry.py`の`rotate_points()`が、
+数学の教科書的な「反時計回りを正」とする一般的な回転行列の式
+（`rx = dx*cos - dy*sin, ry = dx*sin + dy*cos`）をそのまま使っていたが、
+これは`rotate_image()`が内部で使っている`cv2.getRotationMatrix2D`が
+実際に画素に対して行う変換とは**符号が逆**だった。cv2の回転行列は
+画像座標系（Y軸が下向き）を前提としているため、数学的な標準の回転
+行列とは符号が反転する。
+
+この不整合により、`angle`が0度や180度に近い場合を除き、
+「回転後の画像のどこに手があるか」という`rotate_points()`の予測が
+実際の画素位置と一致せず、結果として**クロップ範囲が手とは全く
+関係ない場所を切り出してしまう**という重大な不具合が生じていた。
+
+**発覚しなかった理由**: 既存のテストは、`rotate_points()`単体の
+内部無矛盾性（中心点は動かない、距離が保存される等）や、
+forward（`rotate_points`）/inverse（`inverse_transform_point`）の
+往復整合性しか検証しておらず、「`rotate_image()`が実際に画素をどう
+動かすか」との整合性を一度も直接検証していなかった。往復変換は
+同じ（誤った）符号規約を forward/inverse 両方が一貫して使っていた
+ため、内部的には矛盾なく見えてしまっていた。
+
+**修正**: `rotate_points()`を、`cv2.getRotationMatrix2D`の実際の変換式
+（`rx = dx*cos + dy*sin, ry = -dx*sin + dy*cos`）に合わせて修正。
+連動して、その正しい逆変換となるよう`inverse_transform_point()`も
+修正した（`-angle`ではなく`angle`をそのまま使う）。なお
+`inverse_transform_image()`は`cv2.getRotationMatrix2D`を直接使っていた
+ため、この不具合の影響を受けておらず修正不要だった。
+
+**検証**: 既知の位置にマーカーを描画した合成画像を使い、`rotate_image()`
+による実際の画素位置と`rotate_points()`の予測位置を複数の角度
+（30°, 90°, 145°, -60°, 200°）で直接突き合わせ、修正後は完全に一致
+することを確認した。修正前のコードに戻すと実際に30px等の大きなズレで
+失敗することも確認済み。実際のユーザー画像（複数手の全身イラスト）でも、
+修正後は正しく手が写ったクロップ画像が得られることを確認した。
+
+`tests/test_geometry.py`に`test_rotate_points_matches_actual_pixel_rotation`
+を追加。これは「rotate_pointsの予測」と「rotate_imageの実際の画素移動」を
+直接クロスチェックする、今回の不具合の再発を確実に防ぐための回帰テスト。
+既存の207件は全て変更無しでパス（内部整合性のみを見るテストだったため）。
+計208件全てパス。
+
+---
+
 ## 直近の次アクション（着手順）
 
 1. 実写真での3ノード連携・見た目の確認（`wrist_blur`/`finger_sharpness`/

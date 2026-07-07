@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import math
 
+import cv2
 import numpy as np
 import pytest
 
@@ -69,6 +70,47 @@ class TestComputeRotationAngle:
 
 
 class TestRotateImageAndPoints:
+    def test_rotate_points_matches_actual_pixel_rotation(self):
+        """
+        ★重大バグの回帰テスト（2026-07-07）: rotate_points()が予測する
+        回転後の座標が、rotate_image()（cv2.warpAffine）が実際に画素を
+        動かす先と一致することを、既知のマーカー点を使って直接検証する。
+
+        以前、rotate_points()は数学の教科書的な「反時計回りを正」とする
+        一般的な回転行列の式をそのまま使っていたが、これは
+        cv2.getRotationMatrix2Dが実際に画素に対して行う変換とは
+        符号が逆だった。この不整合により、実際のユーザーデータで
+        「クロップ範囲が手とは全く関係ない場所を切り出してしまう」という
+        重大な不具合が発生した。
+
+        これまでのテストは、rotate_points単体の内部無矛盾性（中心点は
+        動かない、距離が保存される等）や、forward/inverseの往復整合性
+        しか検証しておらず、「rotate_imageが実際に画素をどう動かすか」
+        との整合性を一度も直接検証していなかったため、この符号の誤りを
+        長らく見逃していた。このテストはその穴を埋める。
+        """
+        img = np.zeros((100, 100, 3), dtype=np.uint8)
+        marker_orig = (80.0, 50.0)  # 中心(50,50)から見て右に離れた既知の点
+        cv2.circle(img, (int(marker_orig[0]), int(marker_orig[1])), 3, (255, 255, 255), -1)
+
+        for angle in [30.0, 90.0, 145.0, -60.0, 200.0]:
+            old_center = (50.0, 50.0)
+            rotated_img, new_center = geometry.rotate_image(img, angle)
+            predicted = geometry.rotate_points([marker_orig], angle, old_center, new_center)[0]
+
+            gray = cv2.cvtColor(rotated_img, cv2.COLOR_BGR2GRAY)
+            ys, xs = np.where(gray > 200)
+            assert len(xs) > 0, f"angle={angle}: マーカーが回転後画像から消失した"
+            actual = (float(xs.mean()), float(ys.mean()))
+
+            diff = math.hypot(predicted[0] - actual[0], predicted[1] - actual[1])
+            assert diff < 1.0, (
+                f"angle={angle}: rotate_points()の予測位置{predicted}が、"
+                f"rotate_image()による実際の画素位置{actual}と一致しない"
+                f"(ズレ={diff:.2f}px)。回転方向の符号が実際の画素回転と"
+                "食い違っている可能性がある。"
+            )
+
     def test_vertical_line_becomes_horizontal_after_90_degree_rotation(self):
         """縦線が90度回転で横線になることを確認(画像回転+座標変換の一貫性)"""
         img = np.zeros((100, 50, 3), dtype=np.uint8)

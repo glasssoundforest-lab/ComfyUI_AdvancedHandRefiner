@@ -127,6 +127,34 @@ def rotate_points(
     """
     rotate_image() と同じ回転・平行移動を座標点群に適用する。
 
+    ★重大バグ修正（2026-07-07）: 以前の実装は
+    `rx = dx*cos - dy*sin, ry = dx*sin + dy*cos` という、数学の教科書的な
+    「反時計回りを正」とする一般的な回転行列の式をそのまま使っていたが、
+    これは`rotate_image()`が内部で使っている`cv2.getRotationMatrix2D`が
+    実際に画素に対して行う変換とは**逆方向**だった。
+
+    `cv2.getRotationMatrix2D`は、画像上で見て角度が正の値のとき反時計回り
+    に回転するよう設計されているが、その内部の行列は
+    `dx' = cos*dx + sin*dy, dy' = -sin*dx + cos*dy`
+    という式になっており（画像座標系はY軸が下向きのため、数学的な
+    反時計回りの行列とは符号が反転する）、以前の実装はこれと符号が
+    逆だった。
+
+    この不整合により、`angle`が0度や180度に近い場合を除き、
+    「回転後の画像のどこに手があるか」という予測（このrotate_points関数
+    の出力）が実際の画素位置と一致せず、結果としてクロップ範囲が
+    手とは全く関係ない場所を切り出してしまうという重大な不具合が
+    実際のユーザーデータ（複数の手が写った画像で顕著に発生）で
+    確認された。既存のテストは、このrotate_points単体の内部無矛盾性
+    （中心点は動かない、距離が保存される等）や、rotate_points同士の
+    往復（forward/inverse）の整合性しか検証しておらず、
+    「rotate_imageが実際に画素をどう動かすか」との整合性を一度も
+    直接検証していなかったため、この符号の誤りを見逃していた。
+
+    実際に画像へ既知のマーカー点を描画し、`rotate_image`で回転させた
+    実際の画素位置と、この関数が予測する位置を数値的に突き合わせる
+    ことで、修正後は完全に一致することを確認した。
+
     Args:
         points: [(x, y), ...] 元画像座標系の点群
         angle: rotate_image() に渡したのと同じ角度
@@ -142,8 +170,8 @@ def rotate_points(
     result = []
     for x, y in points:
         dx, dy = x - old_center[0], y - old_center[1]
-        rx = dx * cos_a - dy * sin_a
-        ry = dx * sin_a + dy * cos_a
+        rx = dx * cos_a + dy * sin_a
+        ry = -dx * sin_a + dy * cos_a
         result.append((rx + new_center[0], ry + new_center[1]))
     return result
 
@@ -182,6 +210,16 @@ def inverse_transform_point(
     """
     クロップ・回転後座標系の点を、元画像座標系に逆変換する。
     Stitcher ノードで inpaint 結果を元画像に貼り戻す際に使う。
+
+    ★重大バグ修正（2026-07-07）に伴う追従修正: `rotate_points()`の
+    回転方向のバグを修正したことに伴い、その正しい逆変換となるよう
+    こちらも修正した。以前の実装（`-angle`を使う）は、修正前の
+    （cv2.warpAffineの実際の回転方向とは逆だった）`rotate_points()`に
+    対しては正しい逆変換だったが、それ自体が実際の画素回転とは
+    整合していなかった。`rotate_points()`を修正した今、この関数も
+    `-angle`ではなく`angle`をそのまま使うのが正しい逆変換になる
+    （回転行列が直交行列であることから、正しい逆変換は同じ角度・
+    転置した符号のパターンで得られるため）。
     """
     x1, y1, _x2, _y2 = remap_info["crop_box"]
     rx = point[0] + x1
@@ -193,7 +231,7 @@ def inverse_transform_point(
     orig_w, orig_h = remap_info["original_size"]
     old_center = (orig_w / 2.0, orig_h / 2.0)
 
-    rad = math.radians(-angle)
+    rad = math.radians(angle)
     cos_a, sin_a = math.cos(rad), math.sin(rad)
     dx, dy = rx - new_center[0], ry - new_center[1]
     ox = dx * cos_a - dy * sin_a
