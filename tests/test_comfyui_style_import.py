@@ -98,6 +98,7 @@ class TestComfyUIStyleLoading:
             "AdvancedHandOrientationOptimizer",
             "AdvancedHandMaskRefiner",
             "AdvancedHandSeamlessStitcher",
+            "AdvancedHandQualityChecker",
         }
         assert set(module.NODE_DISPLAY_NAME_MAPPINGS.keys()) == set(
             module.NODE_CLASS_MAPPINGS.keys()

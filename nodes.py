@@ -29,6 +29,7 @@ try:
         rotate_image,
         rotate_points,
     )
+    from .utils.hand_quality import assess_hand_overall_quality
     from .utils.mask_refine import sharpen_finger_contours, soften_wrist_boundary
 except ImportError:
     from utils.detection_types import DetectionResult
@@ -44,6 +45,7 @@ except ImportError:
         rotate_image,
         rotate_points,
     )
+    from utils.hand_quality import assess_hand_overall_quality
     from utils.mask_refine import sharpen_finger_contours, soften_wrist_boundary
 
 logger = logging.getLogger("HandRefiner")
@@ -752,3 +754,111 @@ class AdvancedHandSeamlessStitcher:
         final = np.clip(final, 0, 255).astype(np.uint8)
 
         return final
+
+
+class AdvancedHandQualityChecker:
+    """
+    Phase 7: 検出された手が解剖学的に妥当か（指の欠損・癒着・過剰等が
+    無いか）を自動判定するノード。
+
+    内部的には Phase 6 で開発した3つの指標を組み合わせた
+    `assess_hand_overall_quality()` を使う:
+    - 凸包の凹みベースのマスク解析（指の欠損・強い癒着に強い）
+    - 骨格化ベースのマスク解析（際どい間隔の余分な指に強い）
+    - MediaPipeランドマークの関節妥当性チェック（指を握り込んだ/
+      曲げたポーズに対してマスクベースより頑健）
+
+    「欠損/癒着の疑い」はランドマークベースを優先し、「余分な指の疑い」
+    はマスクベースのみで判定する（MediaPipeは常に21点固定のため、
+    余分な指という状態自体を表現できないため）。
+
+    出力の`is_abnormal`を使い、後続のワークフローで「崩れている疑いが
+    ある場合のみinpaintし直す」といった条件分岐に利用できる
+    （例: 標準のComfyUIノードや他の条件分岐系カスタムノードと組み合わせる）。
+    """
+
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "image": ("IMAGE",),
+            },
+            "optional": {
+                "min_detection_confidence": (
+                    "FLOAT",
+                    {"default": 0.5, "min": 0.1, "max": 1.0, "step": 0.05},
+                ),
+                "hand_index": (
+                    "INT",
+                    {"default": 0, "min": 0, "max": 19, "step": 1},
+                ),
+                "detection_mode": (DETECTION_MODES, {"default": "full"}),
+                "process_all_hands": ("BOOLEAN", {"default": False}),
+                "expected_fingers": ("INT", {"default": 5, "min": 1, "max": 10, "step": 1}),
+            },
+        }
+
+    RETURN_TYPES = ("BOOLEAN", "STRING")
+    RETURN_NAMES = ("is_abnormal", "quality_report")
+    FUNCTION = "check_hand_quality"
+    CATEGORY = "HandRefiner"
+
+    def check_hand_quality(
+        self,
+        image: torch.Tensor,
+        min_detection_confidence: float = 0.5,
+        hand_index: int = 0,
+        detection_mode: str = "full",
+        process_all_hands: bool = False,
+        expected_fingers: int = 5,
+    ):
+        batch_size = image.shape[0]
+        any_abnormal = False
+        report_lines: list[str] = []
+
+        for i in range(batch_size):
+            img_rgb = _tensor_to_numpy_rgb(image, i)
+            result = _detect_hands(img_rgb, min_detection_confidence, detection_mode)
+
+            if result.is_empty:
+                report_lines.append(
+                    f"[image_index={i}] 手が検出できませんでした。品質判定はスキップされました。"
+                )
+                continue
+
+            selected_list = list(result.hands) if process_all_hands else [_select_hand(result, hand_index)]
+
+            for hand_idx, selected in enumerate(selected_list):
+                if selected is None or selected.mask is None:
+                    report_lines.append(
+                        f"[image_index={i}, hand={hand_idx}] "
+                        "マスクが取得できなかったため品質判定をスキップしました。"
+                    )
+                    continue
+
+                quality = assess_hand_overall_quality(
+                    selected.mask, selected.landmarks, expected_fingers=expected_fingers
+                )
+                if quality["is_abnormal"]:
+                    any_abnormal = True
+
+                report_lines.append(self._format_report(i, hand_idx, quality))
+
+        report_text = "\n".join(report_lines) if report_lines else "判定対象の手がありませんでした。"
+        return (any_abnormal, report_text)
+
+    @staticmethod
+    def _format_report(image_index: int, hand_index: int, quality: dict) -> str:
+        status = "⚠️ 異常の疑いあり" if quality["is_abnormal"] else "✅ 異常なし"
+        details = []
+        if quality["suspected_deficiency"]:
+            details.append(f"欠損/癒着の疑い(判定元={quality['deficiency_source']})")
+        if quality["suspected_extra"]:
+            details.append("余分な指の疑い")
+        if quality["suspicious_fingers"]:
+            details.append(f"不自然な指={quality['suspicious_fingers']}")
+        detail_str = f" ({', '.join(details)})" if details else ""
+        return (
+            f"[image_index={image_index}, hand={hand_index}] {status}{detail_str} "
+            f"[hull={quality['mask_hull_count']}, skeleton={quality['mask_skeleton_count']}]"
+        )
