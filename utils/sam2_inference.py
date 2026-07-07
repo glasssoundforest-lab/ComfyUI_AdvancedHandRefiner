@@ -35,6 +35,9 @@ _TILE_SIZE_DEFAULT = 512
 #: 隣接タイル間の重なり幅（ピクセル）。タイル境界での縫い目を軽減するため
 #: 重なりを持たせ、重なり領域は論理和(前景優先)で統合する。
 _TILE_OVERLAP_DEFAULT = 64
+#: predict_from_box_tiled/predict_from_points_tiled の合成後クリーンアップで
+#: 除去する孤立領域の面積しきい値（画素数）のデフォルト値。
+_DESPECKLE_MIN_AREA_DEFAULT = 30
 
 
 def _tile_starts(length: int, tile_size: int, overlap: int) -> list[tuple[int, int]]:
@@ -114,18 +117,28 @@ class Sam2OnnxInference:
             推論に失敗した場合は None。
         """
         try:
-            encoder_outputs, scale, (orig_h, orig_w) = self._encode_image(image_rgb)
-
-            x1, y1, x2, y2 = box
-            point_coords = np.array(
-                [[[x1 * scale, y1 * scale], [x2 * scale, y2 * scale]]], dtype=np.float32
-            )
-            point_labels = np.array([[2, 3]], dtype=np.float32)
-
-            return self._run_decoder(encoder_outputs, point_coords, point_labels, (orig_h, orig_w))
+            prob = self._predict_prob_from_box(image_rgb, box)
+            return (prob > 0.0).astype(np.uint8) * 255
         except Exception as e:
             logger.warning("Sam2HandDetector: bboxプロンプトでの推論に失敗しました (%s)", e)
             return None
+
+    def _predict_prob_from_box(
+        self,
+        image_rgb: np.ndarray,
+        box: tuple[float, float, float, float],
+    ) -> np.ndarray:
+        """predict_from_boxの内部実装。二値化前の連続値(signed logit相当)を返す。
+        タイル分割時に、閾値判定前の値のまま重なり領域を平均化するために使う。"""
+        encoder_outputs, scale, (orig_h, orig_w) = self._encode_image(image_rgb)
+
+        x1, y1, x2, y2 = box
+        point_coords = np.array(
+            [[[x1 * scale, y1 * scale], [x2 * scale, y2 * scale]]], dtype=np.float32
+        )
+        point_labels = np.array([[2, 3]], dtype=np.float32)
+
+        return self._run_decoder_prob(encoder_outputs, point_coords, point_labels, (orig_h, orig_w))
 
     def predict_from_box_tiled(
         self,
@@ -133,6 +146,7 @@ class Sam2OnnxInference:
         box: tuple[float, float, float, float],
         tile_size: int = _TILE_SIZE_DEFAULT,
         overlap: int = _TILE_OVERLAP_DEFAULT,
+        despeckle_min_area: int = _DESPECKLE_MIN_AREA_DEFAULT,
     ) -> np.ndarray | None:
         """
         画像をタイル分割して、複数回のSAM2推論結果を合成することで、
@@ -148,15 +162,30 @@ class Sam2OnnxInference:
         （タイル1枚が tile_size 以下であれば `predict_from_box` 1回分と
         同等の解像度になる）。
 
+        ★重なり領域の統合方式について: 当初は二値化後の論理和（どちらかの
+        タイルが前景と判定すれば前景）で統合していたが、これは「1つの
+        タイルの誤検出（背景を前景と誤判定）が、隣接タイルの正しい判定に
+        よって一切修正されない」という欠陥があり、実写データで実際に
+        誤検出の混入が確認された。そのため、閾値判定前の連続値（signed
+        logit相当）のまま重なり領域を平均化し、最後に1回だけ閾値判定する
+        方式に変更した。これにより、あるタイルの誤検出は、隣接タイルの
+        より確信度の高い正しい判定によって平均後に打ち消されやすくなる。
+
+        ただし、この平均化方式は、境界が本質的に曖昧な領域（指の間の
+        くびれ等）では逆に小さな断片を生みやすいというトレードオフも
+        実写データで確認されたため、最後に`despeckle_min_area`未満の
+        小さな孤立領域（前景側の小片・背景側の穴）を除去する後処理を
+        addする。
+
         Args:
             image_rgb: RGB uint8 ndarray（H, W, 3）
             box: (x1, y1, x2, y2) 元画像のピクセル座標系
             tile_size: タイル1枚の一辺のサイズ（ピクセル）。画像の縦横どちらも
                 これ以下であればタイル分割せず`predict_from_box`と同じ1回の
                 推論で済ませる
-            overlap: 隣接タイル間の重なり幅（ピクセル）。タイル境界での
-                縫い目を目立たなくするために、重なり領域は前景判定の
-                論理和（どちらかのタイルが前景と判定すれば前景）で統合する
+            overlap: 隣接タイル間の重なり幅（ピクセル）
+            despeckle_min_area: 合成後に除去する孤立領域の面積しきい値
+                （画素数）。0以下を指定するとこの後処理を無効化できる
 
         Returns:
             (H, W) の0-255 uint8マスク（元画像と同じサイズ）。
@@ -168,7 +197,8 @@ class Sam2OnnxInference:
             return self.predict_from_box(image_rgb, box)
 
         x1, y1, x2, y2 = box
-        canvas = np.zeros((h, w), dtype=np.uint8)
+        prob_sum = np.zeros((h, w), dtype=np.float32)
+        weight = np.zeros((h, w), dtype=np.float32)
         any_tile_succeeded = False
 
         for ty, tile_h in _tile_starts(h, tile_size, overlap):
@@ -184,17 +214,32 @@ class Sam2OnnxInference:
                     continue
 
                 tile_img = image_rgb[ty : ty + tile_h, tx : tx + tile_w]
-                tile_mask = self.predict_from_box(
-                    tile_img, (local_x1, local_y1, local_x2, local_y2)
-                )
-                if tile_mask is None:
+                try:
+                    tile_prob = self._predict_prob_from_box(
+                        tile_img, (local_x1, local_y1, local_x2, local_y2)
+                    )
+                except Exception as e:
+                    logger.warning(
+                        "Sam2HandDetector: タイル(x=%d,y=%d)の推論に失敗しました (%s)",
+                        tx,
+                        ty,
+                        e,
+                    )
                     continue
 
                 any_tile_succeeded = True
-                region = canvas[ty : ty + tile_h, tx : tx + tile_w]
-                canvas[ty : ty + tile_h, tx : tx + tile_w] = np.maximum(region, tile_mask)
+                prob_sum[ty : ty + tile_h, tx : tx + tile_w] += tile_prob
+                weight[ty : ty + tile_h, tx : tx + tile_w] += 1.0
 
-        return canvas if any_tile_succeeded else None
+        if not any_tile_succeeded:
+            return None
+
+        covered = weight > 0
+        avg_prob = np.zeros((h, w), dtype=np.float32)
+        avg_prob[covered] = prob_sum[covered] / weight[covered]
+
+        mask_uint8 = (avg_prob > 0.0).astype(np.uint8) * 255
+        return _remove_small_regions(mask_uint8, despeckle_min_area)
 
     def predict_from_points(
         self,
@@ -216,16 +261,25 @@ class Sam2OnnxInference:
             return None
 
         try:
-            encoder_outputs, scale, (orig_h, orig_w) = self._encode_image(image_rgb)
-
-            scaled_points = [[px * scale, py * scale] for px, py in points]
-            point_coords = np.array([scaled_points], dtype=np.float32)
-            point_labels = np.array([[1] * len(points)], dtype=np.float32)
-
-            return self._run_decoder(encoder_outputs, point_coords, point_labels, (orig_h, orig_w))
+            prob = self._predict_prob_from_points(image_rgb, points)
+            return (prob > 0.0).astype(np.uint8) * 255
         except Exception as e:
             logger.warning("Sam2HandDetector: pointプロンプトでの推論に失敗しました (%s)", e)
             return None
+
+    def _predict_prob_from_points(
+        self,
+        image_rgb: np.ndarray,
+        points: list[tuple[float, float]],
+    ) -> np.ndarray:
+        """predict_from_pointsの内部実装。二値化前の連続値を返す。"""
+        encoder_outputs, scale, (orig_h, orig_w) = self._encode_image(image_rgb)
+
+        scaled_points = [[px * scale, py * scale] for px, py in points]
+        point_coords = np.array([scaled_points], dtype=np.float32)
+        point_labels = np.array([[1] * len(points)], dtype=np.float32)
+
+        return self._run_decoder_prob(encoder_outputs, point_coords, point_labels, (orig_h, orig_w))
 
     def predict_from_points_tiled(
         self,
@@ -233,11 +287,14 @@ class Sam2OnnxInference:
         points: list[tuple[float, float]],
         tile_size: int = _TILE_SIZE_DEFAULT,
         overlap: int = _TILE_OVERLAP_DEFAULT,
+        despeckle_min_area: int = _DESPECKLE_MIN_AREA_DEFAULT,
     ) -> np.ndarray | None:
         """
         `predict_from_box_tiled` のpointプロンプト版。
         各タイルには、そのタイル内に含まれる点だけを渡す（タイル内に
-        1点も含まれない場合はスキップする）。
+        1点も含まれない場合はスキップする）。重なり領域は連続値のまま
+        平均化してから最後に閾値判定し、`despeckle_min_area`未満の
+        小さな孤立領域を除去する（`predict_from_box_tiled`と同じ方針）。
         """
         if not points:
             return None
@@ -247,7 +304,8 @@ class Sam2OnnxInference:
         if h <= tile_size and w <= tile_size:
             return self.predict_from_points(image_rgb, points)
 
-        canvas = np.zeros((h, w), dtype=np.uint8)
+        prob_sum = np.zeros((h, w), dtype=np.float32)
+        weight = np.zeros((h, w), dtype=np.float32)
         any_tile_succeeded = False
 
         for ty, tile_h in _tile_starts(h, tile_size, overlap):
@@ -261,23 +319,48 @@ class Sam2OnnxInference:
                     continue
 
                 tile_img = image_rgb[ty : ty + tile_h, tx : tx + tile_w]
-                tile_mask = self.predict_from_points(tile_img, local_points)
-                if tile_mask is None:
+                try:
+                    tile_prob = self._predict_prob_from_points(tile_img, local_points)
+                except Exception as e:
+                    logger.warning(
+                        "Sam2HandDetector: タイル(x=%d,y=%d)の推論に失敗しました (%s)",
+                        tx,
+                        ty,
+                        e,
+                    )
                     continue
 
                 any_tile_succeeded = True
-                region = canvas[ty : ty + tile_h, tx : tx + tile_w]
-                canvas[ty : ty + tile_h, tx : tx + tile_w] = np.maximum(region, tile_mask)
+                prob_sum[ty : ty + tile_h, tx : tx + tile_w] += tile_prob
+                weight[ty : ty + tile_h, tx : tx + tile_w] += 1.0
 
-        return canvas if any_tile_succeeded else None
+        if not any_tile_succeeded:
+            return None
 
-    def _run_decoder(
+        covered = weight > 0
+        avg_prob = np.zeros((h, w), dtype=np.float32)
+        avg_prob[covered] = prob_sum[covered] / weight[covered]
+
+        mask_uint8 = (avg_prob > 0.0).astype(np.uint8) * 255
+        return _remove_small_regions(mask_uint8, despeckle_min_area)
+
+    def _run_decoder_prob(
         self,
         encoder_outputs: dict[str, np.ndarray],
         point_coords: np.ndarray,
         point_labels: np.ndarray,
         orig_size: tuple[int, int],
     ) -> np.ndarray:
+        """
+        デコーダを実行し、二値化する前の連続値（signed logit相当、
+        boolモデルの場合は前景=+1.0/背景=-1.0に正規化した値）を、
+        元画像サイズへ線形補間でリサイズして返す。
+
+        `_run_decoder`（従来通り閾値判定済みのuint8マスクを返す）と、
+        タイル分割時に閾値判定前の値のまま重なり領域を平均化したい
+        `predict_from_box_tiled`/`predict_from_points_tiled` の両方から
+        共通で使われる。
+        """
         orig_h, orig_w = orig_size
 
         decoder_inputs: dict[str, np.ndarray] = {}
@@ -314,7 +397,6 @@ class Sam2OnnxInference:
         while raw_mask.ndim > 2:
             raw_mask = raw_mask[0]
 
-        is_bool = raw_mask.dtype == np.bool_
         # ★重要: 閾値判定(二値化)を行う前に、連続値(確率/logit)のまま
         # リサイズする。SAM2デコーダの生出力は元画像より低い解像度で
         # あることが多く、先に二値化してからニアレストネイバーで拡大すると、
@@ -322,15 +404,29 @@ class Sam2OnnxInference:
         # そのまま拡大されてしまう（実際に報告されたまだら模様の原因）。
         # 連続値のまま線形補間でリサイズしてから閾値判定することで、
         # 境界が滑らかになりノイズが解消される。
-        prob = raw_mask.astype(np.float32)
+        if raw_mask.dtype == np.bool_:
+            # bool出力は 前景=+1.0/背景=-1.0 に正規化し、以降どのモデル
+            # バリアントでも閾値0.0で統一的に扱えるようにする（タイル分割時の
+            # 平均化でも、boolモデルとlogitモデルで挙動が揃うようにするため）。
+            prob = np.where(raw_mask, 1.0, -1.0).astype(np.float32)
+        else:
+            prob = raw_mask.astype(np.float32)
 
         if prob.shape != (orig_h, orig_w):
             prob = cv2.resize(prob, (orig_w, orig_h), interpolation=cv2.INTER_LINEAR)
 
-        threshold = 0.5 if is_bool else 0.0
-        mask_uint8 = (prob > threshold).astype(np.uint8) * 255
+        return prob
 
-        return mask_uint8
+    def _run_decoder(
+        self,
+        encoder_outputs: dict[str, np.ndarray],
+        point_coords: np.ndarray,
+        point_labels: np.ndarray,
+        orig_size: tuple[int, int],
+    ) -> np.ndarray:
+        """従来通り、閾値判定済みのuint8マスクを返す（単発推論用）。"""
+        prob = self._run_decoder_prob(encoder_outputs, point_coords, point_labels, orig_size)
+        return (prob > 0.0).astype(np.uint8) * 255
 
     @staticmethod
     def _match_encoder_output(encoder_outputs: dict[str, np.ndarray], keyword: str) -> np.ndarray:
@@ -338,3 +434,44 @@ class Sam2OnnxInference:
             if keyword in name.lower():
                 return value
         return list(encoder_outputs.values())[-1]
+
+
+def _remove_small_regions(mask_uint8: np.ndarray, min_area: int) -> np.ndarray:
+    """
+    タイル分割の合成結果に残る小さな孤立領域（前景側のノイズ状の小片、
+    および背景側の小さな穴）を除去する後処理。
+
+    重なり領域を連続値のまま平均化する方式は、あるタイルの誤検出を
+    隣接タイルとの平均で打ち消せる一方、境界が曖昧な領域（指の間の
+    くびれ等、確信度が0付近で揺れやすい箇所）では、平均後の値が
+    ちょうど閾値をまたいで反転し、逆に小さな断片が増えることがある。
+    これを、閾値判定後の連結成分解析で最終的にクリーンアップする。
+
+    Args:
+        mask_uint8: 0-255 uint8マスク
+        min_area: これ未満の面積（画素数）の孤立領域は除去（背景側の穴は
+            埋め、前景側の小片は消す）
+
+    Returns:
+        クリーンアップ後の0-255 uint8マスク
+    """
+    if min_area <= 0:
+        return mask_uint8
+
+    binary = (mask_uint8 > 0).astype(np.uint8)
+
+    # 前景側の小さな孤立領域を除去
+    n_fg, labels_fg, stats_fg, _ = cv2.connectedComponentsWithStats(binary, connectivity=8)
+    cleaned = np.zeros_like(binary)
+    for i in range(1, n_fg):
+        if stats_fg[i, cv2.CC_STAT_AREA] >= min_area:
+            cleaned[labels_fg == i] = 1
+
+    # 背景側の小さな穴（前景に囲まれた小領域）を埋める
+    inverted = 1 - cleaned
+    n_bg, labels_bg, stats_bg, _ = cv2.connectedComponentsWithStats(inverted, connectivity=8)
+    for i in range(1, n_bg):
+        if stats_bg[i, cv2.CC_STAT_AREA] < min_area:
+            cleaned[labels_bg == i] = 1
+
+    return (cleaned * 255).astype(np.uint8)

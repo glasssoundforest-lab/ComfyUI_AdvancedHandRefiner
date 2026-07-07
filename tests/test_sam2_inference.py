@@ -19,7 +19,7 @@ import cv2
 import numpy as np
 import pytest
 
-from utils.sam2_inference import Sam2OnnxInference, _tile_starts
+from utils.sam2_inference import Sam2OnnxInference, _remove_small_regions, _tile_starts
 
 
 class _FakeDecoderSession:
@@ -365,8 +365,8 @@ class TestPredictFromBoxTiled:
         # 右下(box/タイルと全く関係ない領域)は前景になっていないはず
         assert mask[-1, -1] == 0
 
-    def test_overlap_region_uses_logical_or_between_tiles(self):
-        """重なり領域は前景優先(論理和)で統合され、値が破損しないことを確認"""
+    def test_overlap_region_produces_valid_binary_mask(self):
+        """重なり領域を平均化しても値が破損せず、最終的に二値マスクになることを確認"""
         obj, _decoder_session, encoder_session = self._setup_tiled_instance()
         image = np.zeros((1000, 600, 3), dtype=np.uint8)
         box = (0.0, 0.0, 600.0, 1000.0)  # 縦方向全体を覆う(複数タイルにまたがる)
@@ -376,6 +376,65 @@ class TestPredictFromBoxTiled:
         assert mask is not None
         assert encoder_session.call_count > 1
         assert set(np.unique(mask)).issubset({0, 255})
+
+    def test_false_positive_from_one_tile_is_suppressed_by_confident_neighbor(self):
+        """
+        ★回帰テスト: 実写データで報告された「タイル境界のチェッカーボード状
+        ノイズ（あるタイルの誤検出が最終結果にそのまま残る）」問題への対応。
+
+        重なり領域において、片方のタイルが弱い誤検出(わずかに閾値を超える
+        程度の低confidence)を出し、もう片方のタイルが強い確信度で背景と
+        判定している場合、平均化により誤検出側が打ち消され、最終的に
+        背景と判定されることを確認する。
+        （修正前の論理和(OR)方式では、弱い誤検出であっても前景として
+        残ってしまっていた）
+        """
+        decoder_names = ["point_coords", "point_labels", "image_embed"]
+        encoder_outputs = {"image_embed": np.zeros((1, 3))}
+
+        # 1回目の呼び出し(左タイル)は弱い誤検出(+0.1、閾値0をわずかに超える程度)、
+        # 2回目の呼び出し(重なる右タイル)は強い確信度で背景(-5.0)を返す
+        # フェイクデコーダを、呼び出し回数に応じて切り替える。
+        call_state = {"n": 0}
+        responses = [
+            np.full((1, 64, 64), 0.1, dtype=np.float32),
+            np.full((1, 64, 64), -5.0, dtype=np.float32),
+        ]
+
+        class _SequencedFakeDecoderSession:
+            def run(self, output_names, input_feed):
+                idx = min(call_state["n"], len(responses) - 1)
+                call_state["n"] += 1
+                return [responses[idx]]
+
+        obj = Sam2OnnxInference.__new__(Sam2OnnxInference)
+        obj._decoder_session = _SequencedFakeDecoderSession()
+        obj._decoder_input_names = decoder_names
+        encoder_session = _FakeEncoderSession(encoder_outputs)
+        obj._encoder_session = encoder_session
+        obj._encoder_input_name = "image"
+        obj._encoder_output_names = list(encoder_outputs.keys())
+
+        # 横長画像で、2タイル(左右)が重なるように設定
+        image = np.zeros((400, 700, 3), dtype=np.uint8)
+        box = (0.0, 0.0, 700.0, 400.0)  # 画像全体を覆う
+
+        mask = obj.predict_from_box_tiled(image, box, tile_size=512, overlap=200)
+
+        assert mask is not None
+        # 実際のタイル配置(_tile_starts)に基づいて重なり領域を算出する。
+        # image幅700, tile_size=512, overlap=200 の場合:
+        #   タイル1: x=[0, 512), タイル2: x=[188, 700) となり、
+        #   重なりは x=[188, 512)
+        tile2_start, _tile2_width = _tile_starts(700, 512, 200)[1]
+        overlap_region = mask[:, tile2_start:512]
+        assert overlap_region.size > 0
+        # 重なり領域では (0.1 + (-5.0)) / 2 = -2.45 < 0 となり、
+        # 背景と正しく判定されるはず(誤検出が打ち消される)
+        assert np.all(overlap_region == 0), (
+            "重なり領域で誤検出が抑制されず前景として残ってしまっている"
+            "（論理和方式の欠陥が再発している可能性がある）"
+        )
 
 
 class TestPredictFromPointsTiled:
@@ -417,3 +476,32 @@ class TestPredictFromPointsTiled:
         mask = obj.predict_from_points_tiled(image, [(10.0, 10.0)], tile_size=512)
         assert mask is not None
         assert encoder_session.call_count == 1
+
+
+class TestRemoveSmallRegions:
+    def test_min_area_zero_or_less_returns_mask_unchanged(self):
+        mask = np.zeros((10, 10), dtype=np.uint8)
+        mask[3:5, 3:5] = 255  # 4px の小さい前景
+        result = _remove_small_regions(mask, min_area=0)
+        np.testing.assert_array_equal(result, mask)
+
+    def test_small_foreground_speckle_is_removed(self):
+        mask = np.zeros((20, 20), dtype=np.uint8)
+        mask[5:15, 5:15] = 255  # 100px の大きな前景
+        mask[1, 1] = 255  # 1pxの孤立した前景ノイズ
+        result = _remove_small_regions(mask, min_area=10)
+        assert result[1, 1] == 0  # 小さいノイズは除去される
+        assert result[10, 10] == 255  # 大きな前景は維持される
+
+    def test_small_background_hole_is_filled(self):
+        mask = np.full((20, 20), 255, dtype=np.uint8)
+        mask[10, 10] = 0  # 前景に囲まれた1pxの穴
+        result = _remove_small_regions(mask, min_area=10)
+        assert result[10, 10] == 255  # 小さい穴は埋められる
+
+    def test_large_regions_are_preserved(self):
+        """min_area以上の領域は前景・背景どちらも維持されることを確認"""
+        mask = np.zeros((30, 30), dtype=np.uint8)
+        mask[5:25, 5:15] = 255  # 200pxの大きな前景ブロック
+        result = _remove_small_regions(mask, min_area=10)
+        np.testing.assert_array_equal(result, mask)
