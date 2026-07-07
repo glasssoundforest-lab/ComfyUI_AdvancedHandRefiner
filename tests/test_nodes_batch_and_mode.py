@@ -10,6 +10,7 @@ import numpy as np
 import pytest
 
 import nodes
+from utils.detection_types import BoundingBox, DetectionResult, HandDetection
 
 
 class TestDetectionModePipelineSelection:
@@ -157,9 +158,10 @@ class TestOrientationOptimizerBatchSupport:
         # 実際にバッチ(手が検出できないので各画像サイズがそのままcontent)を
         # 作るには、同一バッチテンソル内で全画像が同じH,Wである必要がある
         # というComfyUIの制約上、直接は再現できない。ここでは
-        # _optimize_single を直接呼び出して、パディングロジック自体を検証する。
+        # _crop_for_hand を直接呼び出して、パディングロジック自体を検証する。
         batch_image = nodes.torch.from_numpy(np.zeros((2, 80, 60, 3), dtype=np.float32))
-        cropped1, remap1 = optimizer._optimize_single(batch_image, 0, 0, 0.5, 0, "full")
+        img_rgb = nodes._tensor_to_numpy_rgb(batch_image, 0)
+        cropped1, remap1 = optimizer._crop_for_hand(img_rgb, None, 0, 0)
         assert cropped1.shape[:2] == (80, 60)
         assert remap1["content_size"] == (60, 80)
 
@@ -390,3 +392,118 @@ class TestDetectHandsMemoizationCache:
             optimizer.optimize_orientation(image_tensor, padding=16, hand_index=1)
 
         assert call_count["n"] == 1
+
+
+class TestProcessAllHandsInSingleImage:
+    """
+    ★機能追加: process_all_hands=Trueで、1枚の画像内の複数の手を
+    1回のノード実行でまとめてバッチ処理できることを検証する。
+    """
+
+    def test_process_all_hands_false_keeps_single_hand_behavior(self):
+        """デフォルト(process_all_hands=False)では従来通り1つの手のみ処理される"""
+        image_np = np.zeros((1, 64, 64, 3), dtype=np.float32)
+        image_tensor = nodes.torch.from_numpy(image_np)
+
+        optimizer = nodes.AdvancedHandOrientationOptimizer()
+        cropped, remap_info = optimizer.optimize_orientation(
+            image_tensor, padding=16, process_all_hands=False
+        )
+
+        # 手なし画像なので単一dict(バッチ化されない)のまま返るはず
+        assert isinstance(remap_info, dict)
+        assert cropped.numpy().shape[0] == 1
+
+    def test_process_all_hands_true_with_multiple_hands_returns_batch(self):
+        """
+        process_all_hands=Trueの場合、検出された手の数だけ
+        cropped_imageがバッチ化され、remap_infoもその数だけのリストに
+        なることを確認する（フェイクの複数手検出結果を使う）。
+        """
+        image_np = np.zeros((1, 100, 100, 3), dtype=np.float32)
+        image_tensor = nodes.torch.from_numpy(image_np)
+
+        fake_hands = [
+            HandDetection(
+                bbox=BoundingBox(10, 10, 30, 30),
+                landmarks=[(20.0, 20.0)] * 21,
+                confidence=0.9,
+                source="fake",
+            ),
+            HandDetection(
+                bbox=BoundingBox(60, 60, 90, 90),
+                landmarks=[(75.0, 75.0)] * 21,
+                confidence=0.8,
+                source="fake",
+            ),
+        ]
+        fake_result = DetectionResult(hands=fake_hands)
+
+        optimizer = nodes.AdvancedHandOrientationOptimizer()
+        with patch.object(nodes, "_detect_hands", return_value=fake_result):
+            cropped, remap_info_list = optimizer.optimize_orientation(
+                image_tensor, padding=8, process_all_hands=True
+            )
+
+        assert isinstance(remap_info_list, list)
+        assert len(remap_info_list) == 2
+        assert cropped.numpy().shape[0] == 2
+        # 2つの手のcrop_boxが異なる(別々の領域を切り出している)ことを確認
+        assert remap_info_list[0]["crop_box"] != remap_info_list[1]["crop_box"]
+
+    def test_process_all_hands_true_with_no_hands_falls_back_to_original(self):
+        """手が検出されない場合、process_all_hands=Trueでも1件のフォールバック結果を返す"""
+        image_np = np.zeros((1, 64, 64, 3), dtype=np.float32)
+        image_tensor = nodes.torch.from_numpy(image_np)
+
+        optimizer = nodes.AdvancedHandOrientationOptimizer()
+        cropped, remap_info = optimizer.optimize_orientation(
+            image_tensor, padding=16, process_all_hands=True
+        )
+
+        assert isinstance(remap_info, dict)  # 1件のみなので単一dict
+        assert cropped.numpy().shape[0] == 1
+
+    def test_seamless_stitcher_broadcasts_single_original_image_across_all_hands(self):
+        """
+        process_all_hands由来のバッチ(remap_infoがリスト、original_imageは
+        単一画像)を、SeamlessStitcherが正しく処理できることを確認する
+        （original_imageは全ての手で使い回される＝ブロードキャスト）。
+        """
+        h, w = 100, 100
+        original_image = nodes.torch.from_numpy(np.zeros((1, h, w, 3), dtype=np.float32))
+
+        fake_hands = [
+            HandDetection(
+                bbox=BoundingBox(10, 10, 30, 30),
+                landmarks=[(20.0, 20.0)] * 21,
+                confidence=0.9,
+                source="fake",
+            ),
+            HandDetection(
+                bbox=BoundingBox(60, 60, 90, 90),
+                landmarks=[(75.0, 75.0)] * 21,
+                confidence=0.8,
+                source="fake",
+            ),
+        ]
+        fake_result = DetectionResult(hands=fake_hands)
+
+        optimizer = nodes.AdvancedHandOrientationOptimizer()
+        with patch.object(nodes, "_detect_hands", return_value=fake_result):
+            cropped, remap_info_list = optimizer.optimize_orientation(
+                original_image, padding=8, process_all_hands=True
+            )
+
+        mask_tensor = nodes.torch.from_numpy(
+            np.zeros((cropped.shape[0], cropped.shape[1], cropped.shape[2]), dtype=np.float32)
+        )
+
+        stitcher = nodes.AdvancedHandSeamlessStitcher()
+        (final,) = stitcher.seamless_stitch(
+            original_image, cropped, mask_tensor, remap_info_list, color_match_strength=0.8
+        )
+
+        # 手なしマスクなので各手ともフォールバックで元画像相当になるが、
+        # 2つの手それぞれに対応する2件分のバッチとして出力されるはず
+        assert final.numpy().shape == (2, h, w, 3)

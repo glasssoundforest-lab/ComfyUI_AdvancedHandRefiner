@@ -214,6 +214,7 @@ class AdvancedHandOrientationOptimizer:
                     {"default": 0, "min": 0, "max": 19, "step": 1},
                 ),
                 "detection_mode": (DETECTION_MODES, {"default": "full"}),
+                "process_all_hands": ("BOOLEAN", {"default": False}),
             },
         }
 
@@ -229,31 +230,59 @@ class AdvancedHandOrientationOptimizer:
         min_detection_confidence: float = 0.5,
         hand_index: int = 0,
         detection_mode: str = "full",
+        process_all_hands: bool = False,
     ):
+        """
+        ★`process_all_hands`について: Trueにすると、`hand_index`は無視され、
+        画像内で検出された**全ての手**を1回のノード実行でまとめて処理する
+        （画像1枚につき手がN個あれば、N件分の`cropped_image`をバッチとして
+        出力する）。これは既存の「複数入力画像→共通キャンバスへパディング
+        してバッチにまとめる」仕組みをそのまま応用したもので、
+        「1枚の画像の中の複数の手」を「複数の画像」と同じように扱う。
+
+        従来は手ごとにノードチェーンを複製し`hand_index`を変える必要が
+        あったが、この方式ではノード1系統だけで全ての手を処理できる
+        （後段の`AdvancedHandMaskRefiner`/`AdvancedHandSeamlessStitcher`も
+        バッチ処理に対応済みのため、そのまま繋いでよい）。
+        """
         batch_size = image.shape[0]
 
         crops: list[np.ndarray] = []
         remap_infos: list[RemapInfo] = []
         for i in range(batch_size):
-            cropped, remap_info = self._optimize_single(
-                image, i, padding, min_detection_confidence, hand_index, detection_mode
-            )
-            crops.append(cropped)
-            remap_infos.append(remap_info)
+            img_rgb = _tensor_to_numpy_rgb(image, i)
+            result = _detect_hands(img_rgb, min_detection_confidence, detection_mode)
 
-        if batch_size == 1:
-            # 単一画像の場合はパディング不要。remap_infoも単一dictのまま返す
-            # （従来の戻り値の型・挙動を完全に維持する）。
+            if process_all_hands:
+                selected_list = list(result.hands) if not result.is_empty else [None]
+                if len(selected_list) > 1:
+                    logger.info(
+                        "HandOrientationOptimizer: image_index=%d で%d個の手を検出。"
+                        "process_all_hands=Trueのため、まとめてバッチ出力します。",
+                        i,
+                        len(selected_list),
+                    )
+            else:
+                selected_list = [_select_hand(result, hand_index)]
+
+            for selected in selected_list:
+                cropped, remap_info = self._crop_for_hand(img_rgb, selected, padding, i)
+                crops.append(cropped)
+                remap_infos.append(remap_info)
+
+        if len(crops) == 1:
+            # 単一画像・単一の手の場合はパディング不要。remap_infoも単一dict
+            # のまま返す（従来の戻り値の型・挙動を完全に維持する）。
             return (_numpy_rgb_to_tensor(crops[0]), remap_infos[0])
 
-        # 複数画像の場合、検出した手ごとにクロップサイズが異なりうるため、
-        # 全画像の最大サイズに合わせて左上寄せでゼロパディングしてから
+        # 複数（画像×手）の場合、検出した手ごとにクロップサイズが異なりうる
+        # ため、全体の最大サイズに合わせて左上寄せでゼロパディングしてから
         # 1つのバッチテンソルにまとめる。remap_info側にはパディング前の
         # 実サイズ(content_size)を記録しておき、Stitcher側で除去できるようにする。
         canvas_h = max(c.shape[0] for c in crops)
         canvas_w = max(c.shape[1] for c in crops)
 
-        padded_batch = np.zeros((batch_size, canvas_h, canvas_w, 3), dtype=np.float32)
+        padded_batch = np.zeros((len(crops), canvas_h, canvas_w, 3), dtype=np.float32)
         for i, cropped in enumerate(crops):
             ch, cw = cropped.shape[:2]
             padded_batch[i, :ch, :cw, :] = cropped.astype(np.float32) / 255.0
@@ -262,21 +291,19 @@ class AdvancedHandOrientationOptimizer:
         cropped_tensor = torch.from_numpy(padded_batch)
         return (cropped_tensor, remap_infos)
 
-    def _optimize_single(
+    def _crop_for_hand(
         self,
-        image: torch.Tensor,
-        image_index: int,
+        img_rgb: np.ndarray,
+        selected,
         padding: int,
-        min_detection_confidence: float,
-        hand_index: int,
-        detection_mode: str,
+        image_index: int,
     ) -> tuple[np.ndarray, RemapInfo]:
-        """バッチ中の1枚分の向き最適化処理（optimize_orientationから呼ばれる内部ヘルパー）"""
-        img_rgb = _tensor_to_numpy_rgb(image, image_index)
+        """
+        既に選択済みの1つの手（`selected`、Noneの場合は「手なし」を表す）に
+        ついて、向き最適化・クロップを行う（検出処理自体はこの関数の外で
+        1回だけ行う想定）。
+        """
         orig_h, orig_w = img_rgb.shape[:2]
-
-        result = _detect_hands(img_rgb, min_detection_confidence, detection_mode)
-        selected = _select_hand(result, hand_index)
 
         if selected is None or selected.landmarks is None:
             logger.warning(
@@ -294,7 +321,8 @@ class AdvancedHandOrientationOptimizer:
             }
             return img_rgb, remap_info
 
-        # 最も信頼度の高い手、またはhand_indexで指定された手
+        # 選択された手（デフォルトでは信頼度が最も高い手、hand_indexで
+        # 指定された手、あるいはprocess_all_hands時はそのうちの1つ）
         points_px = selected.landmarks
 
         angle = compute_rotation_angle(points_px)

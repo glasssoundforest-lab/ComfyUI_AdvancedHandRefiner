@@ -46,9 +46,27 @@ pip install -r requirements.txt
 
 ### 複数の手を処理したい場合
 
-写真に複数の手が写っている場合、`hand_index`を変えたノードチェーンを
-手の数だけ複製することで、それぞれの手を個別に処理できます（1回目は
-`hand_index=0`、2回目は`hand_index=1`、…）。
+`process_all_hands`（`AdvancedHandOrientationOptimizer`のパラメータ）を
+`True`にすると、**ノードを複製せずに1系統だけで**、画像内で検出された
+全ての手をまとめてバッチ処理できます（既存の「複数画像バッチ処理」の
+仕組みをそのまま応用しています）。
+
+```
+[元画像] → [OrientationOptimizer(process_all_hands=True)] → cropped_image(バッチ), remap_info(リスト)
+                                                                    ↓
+                                    [何らかのInpaintノード] → [MaskRefiner] → [Stitcher] → [最終画像]
+```
+
+`AdvancedHandMaskRefiner`・`AdvancedHandSeamlessStitcher`はどちらも
+バッチ処理に対応済みのため、そのまま繋ぐだけで全ての手が処理されます
+（`Stitcher`の`original_image`には元の1枚の画像をそのまま渡せば、
+検出された手の数だけ自動的に使い回されます）。
+
+`process_all_hands=False`（デフォルト）の場合は従来通り`hand_index`で
+指定した1つの手のみを処理します。手ごとにパラメータ（`hand_index`）を
+分けて個別にワークフローを組みたい場合は、以下のようにノードチェーンを
+手の数だけ複製することもできます（1回目は`hand_index=0`、2回目は
+`hand_index=1`、…）。
 
 ```
 [元画像] ──┬─→ [OrientationOptimizer(hand_index=0)] → ... → [Stitcher] ──┐
@@ -93,6 +111,7 @@ inpaintノードに渡す前段として使うことを想定しています。
 | `min_detection_confidence` | FLOAT | 0.5（0.1〜1.0） | 検出パイプライン全体の最低信頼度しきい値 |
 | `hand_index` | INT | 0（0〜19） | 複数の手が検出された場合に処理対象とする手のインデックス（0=最も信頼度が高い手）。範囲外の値は警告の上、最後の手にクランプされる |
 | `detection_mode` | 選択式 | `full` | 検出パイプラインの実行モード。`full`=YOLO+MediaPipe+SAM2、`yolo_mediapipe`=SAM2を省略、`mediapipe_only`=MediaPipeのみ（最速）|
+| `process_all_hands` | BOOLEAN | `False` | `True`にすると`hand_index`を無視し、検出された全ての手をバッチとしてまとめて処理する（ノードを複製せずに複数の手を扱える）|
 
 **出力**: `cropped_image`（回転・クロップ後の画像）, `remap_info`（`SeamlessStitcher`に渡す逆変換情報）
 
