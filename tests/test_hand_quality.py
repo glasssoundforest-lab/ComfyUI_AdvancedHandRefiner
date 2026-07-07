@@ -12,6 +12,7 @@ import numpy as np
 import pytest
 
 from utils.hand_quality import (
+    assess_hand_quality,
     estimate_finger_count,
     estimate_finger_count_radial,
     estimate_finger_count_skeleton,
@@ -215,3 +216,85 @@ class TestEstimateFingerCountSkeleton:
         """
         mask = generate_synthetic_hand_mask(num_fingers=5, fused_pairs=[pair], fusion_ratio=0.85)
         assert estimate_finger_count_skeleton(mask) != 4
+
+
+class TestAssessHandQualityEnsemble:
+    """
+    ★Phase6の集大成: 凸包ベース・骨格化ベースの2手法を組み合わせた
+    統合判定`assess_hand_quality()`の検証。
+
+    設計方針: 単一の「真の指本数」を無理に一本化せず、それぞれの手法の
+    得意分野に基づいた個別の疑いフラグ(欠損/癒着の疑い、余分な指の疑い)
+    を別々に立てる。これまで検証した全ての既知パターン(正常・欠損・
+    癒着・際どい余分指・広い間隔での過剰)を通して、`is_abnormal`
+    (異常の有無の二値判定)が完全に正しく機能することを確認する。
+    """
+
+    def _extra_finger_mask(self, gap_deg: float) -> np.ndarray:
+        base_angle_deg = -90.0
+        spread_angle_deg = 110.0
+        step = spread_angle_deg / 4
+        normal_angles = [base_angle_deg - spread_angle_deg / 2 + i * step for i in range(5)]
+        extra_angle = normal_angles[2] + gap_deg
+        angles = normal_angles[:3] + [extra_angle] + normal_angles[3:]
+        return generate_synthetic_hand_mask(custom_finger_angles=angles)
+
+    def test_normal_hand_is_not_flagged_as_abnormal(self):
+        mask = generate_synthetic_hand_mask()
+        result = assess_hand_quality(mask)
+        assert result["is_abnormal"] is False
+        assert result["suspected_deficiency"] is False
+        assert result["suspected_extra"] is False
+
+    @pytest.mark.parametrize("missing_index", [0, 1, 2, 3, 4])
+    def test_missing_finger_is_flagged_as_deficiency_only(self, missing_index):
+        mask = generate_synthetic_hand_mask(num_fingers=5, missing_fingers=[missing_index])
+        result = assess_hand_quality(mask)
+        assert result["is_abnormal"] is True
+        assert result["suspected_deficiency"] is True
+        assert result["suspected_extra"] is False
+
+    @pytest.mark.parametrize("pair", [(0, 1), (1, 2), (2, 3), (3, 4)])
+    def test_fusion_is_flagged_as_abnormal_with_deficiency_signal(self, pair):
+        """
+        癒着ケースは、凸包ベースが正しく欠損側のシグナルを出すため
+        suspected_deficiency=Trueとなる。骨格化ベースの弱点により
+        suspected_extraも同時にTrueになってしまう(完全にクリーンな
+        診断ではないが)、is_abnormal自体は正しくTrueになる。
+        """
+        mask = generate_synthetic_hand_mask(num_fingers=5, fused_pairs=[pair], fusion_ratio=0.85)
+        result = assess_hand_quality(mask)
+        assert result["is_abnormal"] is True
+        assert result["suspected_deficiency"] is True
+
+    @pytest.mark.parametrize("gap_deg", [13.75, 15, 18, 21, 24])
+    def test_extra_finger_with_detectable_gap_is_flagged_as_extra(self, gap_deg):
+        mask = self._extra_finger_mask(gap_deg)
+        result = assess_hand_quality(mask)
+        assert result["is_abnormal"] is True
+        assert result["suspected_extra"] is True
+
+    def test_widely_respread_extra_fingers_are_flagged_as_extra(self):
+        mask = generate_synthetic_hand_mask(num_fingers=6, spread_angle_deg=140)
+        result = assess_hand_quality(mask)
+        assert result["is_abnormal"] is True
+        assert result["suspected_extra"] is True
+
+    def test_result_dict_has_expected_keys(self):
+        mask = generate_synthetic_hand_mask()
+        result = assess_hand_quality(mask)
+        assert set(result.keys()) == {
+            "hull_count",
+            "skeleton_count",
+            "is_abnormal",
+            "suspected_deficiency",
+            "suspected_extra",
+        }
+
+    def test_custom_expected_fingers_parameter_is_respected(self):
+        """expected_fingersを変えれば、正常判定の基準もそれに追従することを確認"""
+        mask_4 = generate_synthetic_hand_mask(num_fingers=4)
+        result_default = assess_hand_quality(mask_4, expected_fingers=5)
+        result_custom = assess_hand_quality(mask_4, expected_fingers=4)
+        assert result_default["is_abnormal"] is True  # 5本期待に対し4本 -> 異常
+        assert result_custom["is_abnormal"] is False  # 4本期待に対し4本 -> 正常

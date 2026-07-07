@@ -293,3 +293,59 @@ def estimate_finger_count_radial(
             count += 1
 
     return count
+
+
+def assess_hand_quality(mask: np.ndarray, expected_fingers: int = 5) -> dict:
+    """
+    複数の指本数推定手法を組み合わせた、手の品質の統合判定。
+
+    ★設計方針（重要）: `estimate_finger_count()`（凸包の凹みベース）と
+    `estimate_finger_count_skeleton()`（骨格化ベース）は、それぞれ
+    異なる得意・不得意を持つことが実測で確認されている：
+
+    - 凸包ベースは「指の欠損」「強い癒着」の検出に強いが、既存の指の
+      すぐ隣に挿入された「際どい間隔の余分な指」の検出には弱い
+      （むしろ本数が減って見えることさえある）
+    - 骨格化ベースは「際どい間隔の余分な指」の検出に強い（一定以上の
+      間隔があれば）が、「癒着」の検出には弱い（骨格分岐がノイズと
+      なり、癒着による本数減少を検出できない）
+
+    単一の「真の指本数」を無理に一本化しようとすると、どちらか一方の
+    手法の弱点にそのまま引きずられてしまう。そのため、この関数は
+    2つの推定値をそのまま両方報告した上で、それぞれの得意分野に
+    基づいた個別の疑いフラグ（欠損/癒着の疑い、余分な指の疑い）を
+    別々に立てる設計とした。
+
+    Args:
+        mask: 0-255 uint8マスク（1つの手の領域のみを含む想定）
+        expected_fingers: 本来あるべき指の本数（通常5）
+
+    Returns:
+        以下のキーを持つ辞書:
+        - hull_count: 凸包の凹みベースの推定本数
+        - skeleton_count: 骨格化ベースの推定本数
+        - is_abnormal: どちらかの手法が期待本数と異なる値を報告した場合True
+        - suspected_deficiency: 凸包ベースの推定が期待本数を下回る場合True
+          （指の欠損、または強い癒着の疑い）
+        - suspected_extra: 骨格化ベースの推定が期待本数を上回る場合True
+          （余分な指の疑い）
+    """
+    hull_count = estimate_finger_count(mask)
+    skeleton_count = estimate_finger_count_skeleton(mask)
+
+    suspected_deficiency = hull_count < expected_fingers
+    suspected_extra = skeleton_count > expected_fingers
+    is_abnormal = (
+        suspected_deficiency
+        or suspected_extra
+        or hull_count > expected_fingers
+        or skeleton_count < expected_fingers
+    )
+
+    return {
+        "hull_count": hull_count,
+        "skeleton_count": skeleton_count,
+        "is_abnormal": is_abnormal,
+        "suspected_deficiency": suspected_deficiency,
+        "suspected_extra": suspected_extra,
+    }
