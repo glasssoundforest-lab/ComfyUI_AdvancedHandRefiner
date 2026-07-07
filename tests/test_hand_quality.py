@@ -13,7 +13,9 @@ import numpy as np
 import pytest
 
 from utils.hand_quality import (
+    FINGER_JOINT_INDICES,
     assess_hand_quality,
+    assess_landmark_plausibility,
     estimate_finger_count,
     estimate_finger_count_radial,
     estimate_finger_count_skeleton,
@@ -382,3 +384,94 @@ class TestAssessHandQualityWithLandmarks:
         mask = generate_synthetic_hand_mask()
         result = assess_hand_quality(mask, landmarks=[(1.0, 1.0), (2.0, 2.0)])
         assert result["hull_count"] == estimate_finger_count(mask)
+
+
+def _make_landmark_hand(
+    finger_overrides: dict[str, list[tuple[float, float]]] | None = None,
+) -> list[tuple[float, float]]:
+    """
+    テスト用の、解剖学的に妥当な21点ランドマークを生成するヘルパー。
+    finger_overridesで特定の指の関節点を上書きできる。
+    """
+    landmarks: list[tuple[float, float] | None] = [None] * 21
+    landmarks[0] = (0.0, 0.0)  # 手首
+
+    finger_dirs = {
+        "thumb": (-30.0, -20.0),
+        "index": (-15.0, -100.0),
+        "middle": (0.0, -110.0),
+        "ring": (15.0, -105.0),
+        "pinky": (28.0, -90.0),
+    }
+    overrides = finger_overrides or {}
+
+    for name, indices in FINGER_JOINT_INDICES.items():
+        if name in overrides:
+            pts = overrides[name]
+        else:
+            dx, dy = finger_dirs[name]
+            pts = [(dx * (k + 1) / len(indices), dy * (k + 1) / len(indices)) for k in range(len(indices))]
+        for idx, pt in zip(indices, pts):
+            landmarks[idx] = pt
+
+    return landmarks  # type: ignore[return-value]
+
+
+class TestAssessLandmarkPlausibility:
+    """
+    ★Phase6の残課題への対応: マスクベースの手法（凸包・骨格化）は
+    指を握り込んだ/重なったポーズに対して精度が大きく落ちることが
+    実データで確認されている。この関数はマスクの見た目に一切依存
+    せず、MediaPipeが検出した21点の関節位置の相対関係だけを見るため、
+    握り込んだポーズでも判定を試みられる。実際のユーザー提供イラスト
+    （指を握り込んだポーズ）に適用したところ、マスクベースの手法が
+    的外れな値（本数2等）を返す一方、こちらは正しく「異常なし」と
+    判定できることを確認済み。
+    """
+
+    def test_normal_hand_is_not_flagged(self):
+        landmarks = _make_landmark_hand()
+        result = assess_landmark_plausibility(landmarks)
+        assert result["is_abnormal"] is False
+        assert result["suspicious_fingers"] == []
+
+    def test_collapsed_finger_joints_are_detected(self):
+        """
+        関節点が手首付近に潰れてしまっている指（=実質的に指が欠損して
+        いる、あるいはランドマークが崩れている状態）を検出できることを
+        確認する。
+        """
+        landmarks = _make_landmark_hand(
+            finger_overrides={"middle": [(1.0, -1.0), (1.2, -1.1), (1.3, -1.2), (1.4, -1.3)]}
+        )
+        result = assess_landmark_plausibility(landmarks)
+        assert result["is_abnormal"] is True
+        assert "middle" in result["suspicious_fingers"]
+
+    def test_elongated_finger_segment_is_detected(self):
+        """指の中の1関節だけが異常に長く伸びているケースを検出できることを確認する"""
+        landmarks = _make_landmark_hand(
+            finger_overrides={"ring": [(3.75, -26.25), (7.5, -52.5), (11.25, -78.75), (60.0, -420.0)]}
+        )
+        result = assess_landmark_plausibility(landmarks)
+        assert result["is_abnormal"] is True
+        assert "ring" in result["suspicious_fingers"]
+
+    def test_all_fingers_collapsed_flags_all(self):
+        landmarks = [(0.1 * i, -0.1 * i) for i in range(21)]
+        result = assess_landmark_plausibility(landmarks)
+        assert result["is_abnormal"] is True
+        assert set(result["suspicious_fingers"]) == set(FINGER_JOINT_INDICES.keys())
+
+    def test_degenerate_wrist_and_mcp_same_point(self):
+        """手首と中指付け根が同一点の場合、判定不能として安全にFalseを返す"""
+        landmarks = _make_landmark_hand()
+        landmarks[9] = landmarks[0]
+        result = assess_landmark_plausibility(landmarks)
+        assert result["degenerate"] is True
+        assert result["is_abnormal"] is False
+
+    def test_short_landmarks_list_is_handled_safely(self):
+        result = assess_landmark_plausibility([(1.0, 1.0), (2.0, 2.0)])
+        assert result["degenerate"] is True
+        assert result["is_abnormal"] is False

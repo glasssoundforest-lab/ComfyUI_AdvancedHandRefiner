@@ -439,3 +439,127 @@ def assess_hand_quality(
         "suspected_deficiency": suspected_deficiency,
         "suspected_extra": suspected_extra,
     }
+
+
+#: MediaPipeの標準的な21点ランドマークのインデックス構成。
+#: 各指を構成する関節点（付け根→...→指先）の順。
+FINGER_JOINT_INDICES: dict[str, list[int]] = {
+    "thumb": [1, 2, 3, 4],
+    "index": [5, 6, 7, 8],
+    "middle": [9, 10, 11, 12],
+    "ring": [13, 14, 15, 16],
+    "pinky": [17, 18, 19, 20],
+}
+
+
+def _segment_lengths(
+    landmarks: list[tuple[float, float]], joint_indices: list[int]
+) -> list[float]:
+    """指定した関節点列に沿った、隣接関節間の距離（骨のセグメント長）のリストを返す"""
+    pts = [landmarks[i] for i in joint_indices]
+    return [
+        math.hypot(pts[i + 1][0] - pts[i][0], pts[i + 1][1] - pts[i][1])
+        for i in range(len(pts) - 1)
+    ]
+
+
+def assess_landmark_plausibility(
+    landmarks: list[tuple[float, float]],
+    min_segment_ratio: float = 0.12,
+    max_segment_ratio: float = 3.0,
+    min_total_length_ratio: float = 0.4,
+) -> dict:
+    """
+    MediaPipeの21点ランドマークから、各指を構成する関節間セグメント
+    （骨）の長さが解剖学的に妥当な範囲にあるかを判定する。
+
+    ★背景（マスクベースの手法との相補性）: `estimate_finger_count()`等の
+    SAM2マスクの見た目（輪郭形状）に基づく手法は、指を握り込んだ・
+    重なったポーズ（2Dのシルエットだけでは指同士が視覚的に分離せず、
+    輪郭ベースの解析が原理的に苦手とする形状）に対して精度が大きく
+    落ちることが実測で確認されている。
+
+    この関数は、マスクの見た目には一切依存せず、MediaPipeが既に検出
+    している21点の関節位置**同士の相対的な位置関係**だけを見るため、
+    指が握り込まれていても（関節点自体は依然として21点出力される
+    ため）判定を試みることができる。ただし、MediaPipe自体が崩れた手を
+    「一番近い正常な手」に無理やり当てはめてしまっている場合は、
+    ランドマークの位置自体が不正確になり、この判定も巻き込まれて
+    不正確になる可能性がある点には注意が必要（完全にマスクベースの
+    手法の弱点を代替するものではなく、あくまで相補的な追加のシグナル）。
+
+    判定基準は2種類:
+    1. 指内セグメント長の比率チェック: 同一指内の隣接関節間の距離
+       同士の比率が`min_segment_ratio`〜`max_segment_ratio`の範囲を
+       外れる指を「不自然」とみなす（関節点同士が異常に近い/離れている
+       状態を検出する）
+    2. **指全体の長さの絶対チェック（追加）**: 指の付け根から指先までの
+       距離が、手の基準スケール（手首〜中指付け根の距離）に対して
+       `min_total_length_ratio`未満しかない指を「不自然」とみなす。
+       これは、指内のセグメント比率チェックだけでは、関節点が全体的に
+       手首付近に潰れてしまっている（=指が実質的に欠損しているのに、
+       各セグメント自体は互いに近い長さのため比率チェックをすり抜けて
+       しまう）ケースを見逃すことが実測で確認されたため追加した。
+
+    Args:
+        landmarks: MediaPipeの21点ランドマーク（[(x,y), ...]）
+        min_segment_ratio: 同一指内のセグメント長の最小許容比率
+            （最短セグメント/最長セグメントがこれ未満なら不自然とみなす）
+        max_segment_ratio: 同一指内のセグメント長の最大許容比率
+            （逆数の意味。最長/最短がこれを超えたら不自然とみなす）
+        min_total_length_ratio: 指の付け根〜指先の距離が、手の基準
+            スケールに対してこの比率未満なら「潰れている（実質的な
+            欠損）」とみなす
+
+    Returns:
+        以下のキーを持つ辞書:
+        - is_abnormal: いずれかの指が不自然と判定された場合True
+        - suspicious_fingers: 不自然と判定された指名のリスト
+          （"thumb","index","middle","ring","pinky"の部分集合）
+        - degenerate: 手の基準スケールがほぼ0で判定不能だった場合True
+    """
+    if len(landmarks) < 21:
+        return {"is_abnormal": False, "suspicious_fingers": [], "degenerate": True}
+
+    wrist = landmarks[0]
+    middle_mcp = landmarks[9]
+    hand_scale = math.hypot(middle_mcp[0] - wrist[0], middle_mcp[1] - wrist[1])
+
+    if hand_scale < 1e-6:
+        return {"is_abnormal": False, "suspicious_fingers": [], "degenerate": True}
+
+    suspicious_fingers: list[str] = []
+    for finger_name, indices in FINGER_JOINT_INDICES.items():
+        lengths = _segment_lengths(landmarks, indices)
+        normalized = [length / hand_scale for length in lengths]
+
+        # 指全体(付け根〜指先)の長さが、手のスケールに対して極端に
+        # 短くないか(=指が実質的に手首付近へ潰れていないか)を先に確認する
+        base_pt = landmarks[indices[0]]
+        tip_pt = landmarks[indices[-1]]
+        total_length = math.hypot(tip_pt[0] - base_pt[0], tip_pt[1] - base_pt[1])
+        if (total_length / hand_scale) < min_total_length_ratio:
+            suspicious_fingers.append(finger_name)
+            continue
+
+        # ほぼ0のセグメント(関節点同士が潰れている)は比率計算がゼロ除算に
+        # なるため、まずそれ自体を「不自然」として先に判定する
+        if any(length < min_segment_ratio * 0.3 for length in normalized):
+            suspicious_fingers.append(finger_name)
+            continue
+
+        max_len = max(normalized)
+        min_len = min(normalized)
+        if min_len <= 0:
+            suspicious_fingers.append(finger_name)
+            continue
+
+        ratio = max_len / min_len
+        if ratio > max_segment_ratio or (min_len / max_len) < min_segment_ratio:
+            suspicious_fingers.append(finger_name)
+
+    return {
+        "is_abnormal": len(suspicious_fingers) > 0,
+        "suspicious_fingers": suspicious_fingers,
+        "degenerate": False,
+    }
