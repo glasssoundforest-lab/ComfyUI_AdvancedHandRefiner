@@ -507,3 +507,87 @@ class TestProcessAllHandsInSingleImage:
         # 手なしマスクなので各手ともフォールバックで元画像相当になるが、
         # 2つの手それぞれに対応する2件分のバッチとして出力されるはず
         assert final.numpy().shape == (2, h, w, 3)
+
+
+class TestDefensiveFallbackPaths:
+    """
+    ★全コードベース総点検の一環（2026-07-07）: pyflakes/カバレッジ測定で
+    洗い出した、これまで直接テストされていなかった防御的なフォールバック
+    分岐（クロップ範囲が不正・元画像サイズの不一致等）を個別に検証する。
+    """
+
+    def test_orientation_optimizer_falls_back_when_crop_range_is_degenerate(self):
+        """
+        ランドマークが極端に密集している等でクロップ範囲が退化（幅または
+        高さが0以下）した場合、クラッシュせず回転後画像全体にフォール
+        バックすることを確認する。
+        """
+        optimizer = nodes.AdvancedHandOrientationOptimizer()
+        img_rgb = np.zeros((100, 100, 3), dtype=np.uint8)
+
+        # 全てのランドマークが同一点(paddingを掛けても幅0になる)という
+        # 極端なケースをpaddingで再現するのは難しいため、paddingを
+        # 直接負の大きな値にして退化させる
+        landmarks = [(50.0, 50.0)] * 21
+        selected = HandDetection(
+            bbox=BoundingBox(45, 45, 55, 55), landmarks=landmarks, source="fake"
+        )
+
+        cropped, remap_info = optimizer._crop_for_hand(
+            img_rgb, selected, padding=-1000, image_index=0
+        )
+
+        # クラッシュせず、何らかの有効な画像とremap_infoが返ることを確認
+        assert cropped.shape[0] > 0 and cropped.shape[1] > 0
+        assert remap_info["crop_box"][2] > remap_info["crop_box"][0]
+
+    def test_stitcher_falls_back_when_original_size_mismatches_remap_info(self):
+        """
+        remap_infoに記録されたoriginal_sizeと、実際に渡されたoriginal_image
+        のサイズが食い違う場合（ワークフロー上で元画像を差し替えた等）、
+        クラッシュせず元画像をそのまま返すことを確認する。
+        """
+        stitcher = nodes.AdvancedHandSeamlessStitcher()
+
+        original_image = nodes.torch.from_numpy(
+            np.zeros((1, 100, 100, 3), dtype=np.float32)
+        )
+        inpainted_image = nodes.torch.from_numpy(
+            np.zeros((1, 50, 50, 3), dtype=np.float32)
+        )
+        mask = nodes.torch.from_numpy(np.zeros((1, 50, 50), dtype=np.float32))
+
+        remap_info = {
+            "angle": 0.0,
+            "center": (25.0, 25.0),
+            "crop_box": (0, 0, 50, 50),
+            "original_size": (999, 999),  # 実際のoriginal_image(100x100)とは食い違う
+            "rotated_size": (100, 100),
+            "content_size": (50, 50),
+        }
+
+        (result,) = stitcher.seamless_stitch(
+            original_image, inpainted_image, mask, remap_info, color_match_strength=0.5
+        )
+
+        # 元画像(100x100)がそのまま返っているはず
+        assert result.numpy().shape == (1, 100, 100, 3)
+        assert np.allclose(result.numpy(), original_image.numpy())
+
+    def test_mask_refiner_returns_coarse_mask_when_no_hand_detected(self):
+        """MaskRefinerで手が検出できなかった場合、入力の粗いマスクをそのまま返すことを確認する"""
+        refiner = nodes.AdvancedHandMaskRefiner()
+        image = nodes.torch.from_numpy(np.zeros((1, 64, 64, 3), dtype=np.float32))
+        input_mask = np.random.randint(0, 256, (64, 64), dtype=np.uint8)
+        mask_tensor = nodes.torch.from_numpy(
+            (input_mask.astype(np.float32) / 255.0)[None, ...]
+        )
+
+        with patch.object(nodes, "_detect_hands", return_value=DetectionResult(hands=[])):
+            (refined,) = refiner.refine_hand_mask(
+                image, mask_tensor, wrist_blur=15, finger_sharpness=1.0
+            )
+
+        # 入力マスクがほぼそのまま返っているはず(0-1正規化の丸め誤差のみ許容)
+        refined_np = (refined.numpy()[0] * 255).astype(np.uint8)
+        assert np.abs(refined_np.astype(int) - input_mask.astype(int)).max() <= 1
