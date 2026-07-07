@@ -862,3 +862,357 @@ class AdvancedHandQualityChecker:
             f"[image_index={image_index}, hand={hand_index}] {status}{detail_str} "
             f"[hull={quality['mask_hull_count']}, skeleton={quality['mask_skeleton_count']}]"
         )
+
+
+class AdvancedHandAutoFixer:
+    """
+    Phase 7: 検出→クロップ→インペイント→品質チェック→(必要なら)
+    リトライ、を1つのノードで自動的に繰り返す「detailer」型ノード。
+
+    将来目標「不完全な手を見つけ、描画し直す」を実現する中核ノード。
+    内部でComfyUI本体のサンプリング機構（KSampler相当）を呼び出すため、
+    他のノード（画像処理のみで完結）とは性質が異なり、`model`,
+    `positive`, `negative`, `vae` の入力が必要になる。
+
+    処理の流れ（手ごとに、最大`max_retries+1`回まで試行）:
+    1. 手を検出し、向きを正規化してクロップする
+       （`AdvancedHandOrientationOptimizer`と同じロジックを再利用）
+    2. クロップ領域に対してインペイントを実行する（`VAEEncodeForInpaint`
+       → `KSampler`相当 → `VAEDecode`という、ComfyUI本体の標準的な
+       「Detailer」系ノードと同じ構成）
+    3. インペイント結果を元画像へシームレスに貼り戻す
+       （`AdvancedHandSeamlessStitcher`と同じロジックを再利用）
+    4. 貼り戻し後の画像に対して再度手を検出し、
+       `AdvancedHandQualityChecker`と同じ品質判定を行う
+    5. 異常が無ければ確定、異常が残っていればシード値を変えて2へ戻る
+       （`max_retries`回まで）
+
+    ★重要な注意（テスト範囲の限界）: このノードが内部で呼び出す
+    ComfyUI本体のサンプリング機構（`common_ksampler`,
+    `VAEEncodeForInpaint`, `VAEDecode`）は、開発環境に実際の拡散
+    モデル・GPUが無いため、実機（本物のモデル・VAEを使ったComfyUI
+    環境）でのエンドツーエンドの動作確認ができていない。検出→クロップ
+    →品質判定→リトライという制御フロー自体はモックを使った単体テストで
+    厳密に検証済みだが、実際のサンプリング統合部分はユーザー環境での
+    検証をお願いしたい。
+    """
+
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "image": ("IMAGE",),
+                "model": ("MODEL",),
+                "positive": ("CONDITIONING",),
+                "negative": ("CONDITIONING",),
+                "vae": ("VAE",),
+                "seed": ("INT", {"default": 0, "min": 0, "max": 0xFFFFFFFFFFFFFFFF}),
+                "steps": ("INT", {"default": 20, "min": 1, "max": 150}),
+                "cfg": ("FLOAT", {"default": 7.0, "min": 0.0, "max": 30.0, "step": 0.1}),
+                "sampler_name": ("STRING", {"default": "euler"}),
+                "scheduler": ("STRING", {"default": "normal"}),
+                "denoise": ("FLOAT", {"default": 0.6, "min": 0.0, "max": 1.0, "step": 0.01}),
+                "max_retries": ("INT", {"default": 3, "min": 0, "max": 10}),
+            },
+            "optional": {
+                "padding": ("INT", {"default": 32, "min": 0, "max": 256, "step": 8}),
+                "min_detection_confidence": (
+                    "FLOAT",
+                    {"default": 0.5, "min": 0.1, "max": 1.0, "step": 0.05},
+                ),
+                "hand_index": ("INT", {"default": 0, "min": 0, "max": 19, "step": 1}),
+                "detection_mode": (DETECTION_MODES, {"default": "full"}),
+                "process_all_hands": ("BOOLEAN", {"default": False}),
+                "expected_fingers": ("INT", {"default": 5, "min": 1, "max": 10, "step": 1}),
+                "mask_grow_pixels": ("INT", {"default": 6, "min": 0, "max": 64, "step": 1}),
+                "color_match_strength": (
+                    "FLOAT",
+                    {"default": 0.5, "min": 0.0, "max": 1.0, "step": 0.05},
+                ),
+            },
+        }
+
+    RETURN_TYPES = ("IMAGE", "STRING")
+    RETURN_NAMES = ("image", "fix_report")
+    FUNCTION = "auto_fix"
+    CATEGORY = "HandRefiner"
+
+    def auto_fix(
+        self,
+        image: torch.Tensor,
+        model,
+        positive,
+        negative,
+        vae,
+        seed: int,
+        steps: int,
+        cfg: float,
+        sampler_name: str,
+        scheduler: str,
+        denoise: float,
+        max_retries: int,
+        padding: int = 32,
+        min_detection_confidence: float = 0.5,
+        hand_index: int = 0,
+        detection_mode: str = "full",
+        process_all_hands: bool = False,
+        expected_fingers: int = 5,
+        mask_grow_pixels: int = 6,
+        color_match_strength: float = 0.5,
+    ):
+        batch_size = image.shape[0]
+        optimizer = AdvancedHandOrientationOptimizer()
+        stitcher = AdvancedHandSeamlessStitcher()
+
+        output_images: list[np.ndarray] = []
+        report_lines: list[str] = []
+
+        for i in range(batch_size):
+            current_rgb = _tensor_to_numpy_rgb(image, i)
+            img_rgb_for_detection = _tensor_to_numpy_rgb(image, i)  # 検出は常に元画像に対して行う
+            result = _detect_hands(img_rgb_for_detection, min_detection_confidence, detection_mode)
+
+            if result.is_empty:
+                report_lines.append(f"[image_index={i}] 手が検出できませんでした。処理をスキップしました。")
+                output_images.append(current_rgb)
+                continue
+
+            selected_list = list(result.hands) if process_all_hands else [_select_hand(result, hand_index)]
+
+            for hand_idx, selected in enumerate(selected_list):
+                if selected is None:
+                    continue
+
+                current_rgb, hand_report = self._fix_one_hand(
+                    optimizer,
+                    stitcher,
+                    current_rgb,
+                    selected,
+                    image_index=i,
+                    hand_index=hand_idx,
+                    model=model,
+                    positive=positive,
+                    negative=negative,
+                    vae=vae,
+                    base_seed=seed,
+                    steps=steps,
+                    cfg=cfg,
+                    sampler_name=sampler_name,
+                    scheduler=scheduler,
+                    denoise=denoise,
+                    max_retries=max_retries,
+                    padding=padding,
+                    min_detection_confidence=min_detection_confidence,
+                    detection_mode=detection_mode,
+                    expected_fingers=expected_fingers,
+                    mask_grow_pixels=mask_grow_pixels,
+                    color_match_strength=color_match_strength,
+                )
+                report_lines.append(hand_report)
+
+            output_images.append(current_rgb)
+
+        # 全画像が同一サイズであることを前提に単純にスタックする
+        # （入力バッチが元々同一サイズであるため、この前提は成立する）
+        batch = np.stack([img.astype(np.float32) / 255.0 for img in output_images], axis=0)
+        output_tensor = torch.from_numpy(batch)
+        report_text = "\n".join(report_lines) if report_lines else "処理対象の手がありませんでした。"
+        return (output_tensor, report_text)
+
+    def _fix_one_hand(
+        self,
+        optimizer: "AdvancedHandOrientationOptimizer",
+        stitcher: "AdvancedHandSeamlessStitcher",
+        base_image_rgb: np.ndarray,
+        initial_selected,
+        image_index: int,
+        hand_index: int,
+        model,
+        positive,
+        negative,
+        vae,
+        base_seed: int,
+        steps: int,
+        cfg: float,
+        sampler_name: str,
+        scheduler: str,
+        denoise: float,
+        max_retries: int,
+        padding: int,
+        min_detection_confidence: float,
+        detection_mode: str,
+        expected_fingers: int,
+        mask_grow_pixels: int,
+        color_match_strength: float,
+    ) -> tuple[np.ndarray, str]:
+        """1つの手について、リトライループ全体を実行する内部ヘルパー"""
+        current_rgb = base_image_rgb
+        selected = initial_selected
+        attempts_used = 0
+        final_status = "unknown"
+
+        for attempt in range(max_retries + 1):
+            attempts_used = attempt + 1
+
+            if selected is None:
+                final_status = "手が取得できず中断"
+                break
+
+            cropped_rgb, remap_info = optimizer._crop_for_hand(
+                current_rgb, selected, padding, image_index
+            )
+
+            # ★重要: `selected.mask`は元画像（クロップ前）の座標系のマスク
+            # であり、これから貼り戻し処理で扱う「クロップ後の画像」の
+            # 座標系とは異なる。そのままインペイント・貼り戻しに使うと
+            # 座標系の不整合でマスクが的外れな位置になってしまう
+            # （実際にこのバグにより「合成対象マスクがほぼ空」という
+            # 警告が発生することをテストで確認した）。そのため、クロップ
+            # 後の画像に対して改めて検出をやり直し、クロップ座標系の
+            # マスクを取得する（`AdvancedHandMaskRefiner`が自身の入力
+            #画像に対して独自に検出をやり直すのと同じ設計）。
+            crop_detect_result = _detect_hands(
+                cropped_rgb, min_detection_confidence, detection_mode
+            )
+            crop_selected = (
+                _select_hand(crop_detect_result, 0) if not crop_detect_result.is_empty else None
+            )
+
+            if crop_selected is None or crop_selected.mask is None:
+                final_status = "クロップ後の画像で手を再検出できず中断"
+                break
+
+            coarse_mask = crop_selected.mask
+
+            try:
+                inpainted_rgb = self._run_inpaint_sampling(
+                    model,
+                    positive,
+                    negative,
+                    vae,
+                    cropped_rgb,
+                    coarse_mask,
+                    seed=base_seed + attempt,
+                    steps=steps,
+                    cfg=cfg,
+                    sampler_name=sampler_name,
+                    scheduler=scheduler,
+                    denoise=denoise,
+                    grow_mask_by=mask_grow_pixels,
+                )
+            except Exception as e:
+                logger.warning(
+                    "HandAutoFixer: インペイントに失敗しました"
+                    "(image_index=%d, hand=%d, attempt=%d) (%s)",
+                    image_index,
+                    hand_index,
+                    attempt,
+                    e,
+                )
+                final_status = f"インペイント失敗({e})"
+                break
+
+            inpainted_tensor = _numpy_rgb_to_tensor(inpainted_rgb)
+            original_tensor = _numpy_rgb_to_tensor(current_rgb)
+            mask_tensor = _numpy_mask_to_tensor(coarse_mask)
+
+            new_rgb = stitcher._stitch_single(
+                original_tensor,
+                inpainted_tensor,
+                mask_tensor,
+                remap_info,
+                color_match_strength,
+                orig_index=0,
+                inpaint_index=0,
+                mask_index=0,
+            )
+
+            # 貼り戻し後の画像で再検出し、品質を判定する
+            recheck_result = _detect_hands(new_rgb, min_detection_confidence, detection_mode)
+            recheck_selected = _select_hand(recheck_result, 0) if not recheck_result.is_empty else None
+
+            if recheck_selected is not None and recheck_selected.mask is not None:
+                quality = assess_hand_overall_quality(
+                    recheck_selected.mask,
+                    recheck_selected.landmarks,
+                    expected_fingers=expected_fingers,
+                )
+                is_abnormal = quality["is_abnormal"]
+            else:
+                # 再検出できなかった場合は判定不能として、これ以上リトライ
+                # しても改善する見込みが薄いため、その時点の結果を採用する
+                is_abnormal = False
+                quality = None
+
+            current_rgb = new_rgb
+            selected = recheck_selected
+
+            if not is_abnormal:
+                final_status = f"{attempts_used}回目で問題なしと判定"
+                break
+            elif attempt == max_retries:
+                final_status = f"最大試行回数({max_retries + 1}回)に到達、なお異常の疑いあり"
+            else:
+                final_status = "リトライ中"
+
+        return current_rgb, (
+            f"[image_index={image_index}, hand={hand_index}] "
+            f"試行回数={attempts_used}, 結果={final_status}"
+        )
+
+    def _run_inpaint_sampling(
+        self,
+        model,
+        positive,
+        negative,
+        vae,
+        image_crop_rgb: np.ndarray,
+        coarse_mask: np.ndarray,
+        seed: int,
+        steps: int,
+        cfg: float,
+        sampler_name: str,
+        scheduler: str,
+        denoise: float,
+        grow_mask_by: int,
+    ) -> np.ndarray:
+        """
+        ComfyUI本体の標準的なインペイント機構（`VAEEncodeForInpaint`→
+        `common_ksampler`→`VAEDecode`）を使って、クロップ画像に対して
+        1回分のインペイントを実行する。
+
+        ★ComfyUI本体の`nodes`モジュールを遅延import している理由:
+        本体の`nodes.py`はComfyUI起動時にトップレベルモジュール`nodes`
+        として登録されるが、本プラグイン自身のファイルも同じ
+        `nodes.py`という名前であるため、モジュールレベルで
+        `import nodes`とすると、pytest等でこのファイル自体が
+        トップレベルモジュール`nodes`として読み込まれる場合に自己
+        importとなり混乱を招く。関数内での遅延importにすることで、
+        実際にこのメソッドが呼ばれるまで（＝本物のComfyUI環境で
+        実行されるまで）このimportを遅らせている。
+        """
+        import nodes as comfy_nodes  # ComfyUI本体のnodes.py（遅延import）
+
+        image_tensor = _numpy_rgb_to_tensor(image_crop_rgb)
+        mask_tensor = _numpy_mask_to_tensor(coarse_mask)
+
+        vae_encode_inpaint = comfy_nodes.VAEEncodeForInpaint()
+        (latent,) = vae_encode_inpaint.encode(vae, image_tensor, mask_tensor, grow_mask_by)
+
+        (sampled_latent,) = comfy_nodes.common_ksampler(
+            model,
+            seed,
+            steps,
+            cfg,
+            sampler_name,
+            scheduler,
+            positive,
+            negative,
+            latent,
+            denoise=denoise,
+        )
+
+        vae_decode = comfy_nodes.VAEDecode()
+        (decoded_image,) = vae_decode.decode(vae, sampled_latent)
+
+        return _tensor_to_numpy_rgb(decoded_image, 0)

@@ -1,4 +1,5 @@
 from .nodes import (
+    AdvancedHandAutoFixer,
     AdvancedHandMaskRefiner,
     AdvancedHandOrientationOptimizer,
     AdvancedHandQualityChecker,
@@ -10,6 +11,7 @@ NODE_CLASS_MAPPINGS = {
     "AdvancedHandMaskRefiner": AdvancedHandMaskRefiner,
     "AdvancedHandSeamlessStitcher": AdvancedHandSeamlessStitcher,
     "AdvancedHandQualityChecker": AdvancedHandQualityChecker,
+    "AdvancedHandAutoFixer": AdvancedHandAutoFixer,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
@@ -17,6 +19,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "AdvancedHandMaskRefiner": "✨ Advanced Anatomical Mask Refiner",
     "AdvancedHandSeamlessStitcher": "🪡 Seamless Stitch & Color Matcher",
     "AdvancedHandQualityChecker": "🔍 Advanced Hand Quality Checker",
+    "AdvancedHandAutoFixer": "🔁 Advanced Hand Auto Fixer",
 }
 
 __all__ = ['NODE_CLASS_MAPPINGS', 'NODE_DISPLAY_NAME_MAPPINGS']
