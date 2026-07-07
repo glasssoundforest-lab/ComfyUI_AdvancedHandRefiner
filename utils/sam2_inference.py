@@ -90,12 +90,33 @@ class Sam2OnnxInference:
 
     def _encode_image(
         self, image_rgb: np.ndarray
-    ) -> tuple[dict[str, np.ndarray], float, tuple[int, int]]:
+    ) -> tuple[dict[str, np.ndarray], tuple[float, float], tuple[int, int]]:
         """
         画像をエンコーダの入力解像度にリサイズしてエンコードする。
 
+        ★重大バグ修正（2026-07-07）: このリサイズは`cv2.resize(image,
+        (1024, 1024))`という、縦横比を無視して正方形へ直接引き伸ばす
+        （アスペクト比を保たない）方式である。以前の実装は、この事実に
+        反して`scale = 1024 / max(orig_h, orig_w)`という**縦横共通の
+        単一スケール値**を計算し、bbox/pointの座標をx・y問わず同じ値で
+        スケーリングしていた。これはアスペクト比を保つレターボックス
+        方式（YOLO側の前処理はこちらで正しい）の計算式であり、実際に
+        行っている正方形への直接引き伸ばしとは整合していなかった。
+
+        非正方形の画像（手のクロップは正方形になることの方が稀）では、
+        例えば500x1000の画像の中心点(500,250)は、正方形へのリサイズ後は
+        必ず中心(512,512)になるはずだが、旧実装の単一スケールでは
+        (512,256)と計算されてしまい、特に短い方の辺の座標が大きく
+        ズレるという不具合があった。これによりSAM2へ渡すbbox/point
+        プロンプトの座標が不正確になり、セグメンテーション精度に
+        悪影響を与えていた可能性がある。
+
+        修正として、x方向・y方向それぞれ独立したスケール値
+        `(scale_x, scale_y)`を返すようにし、呼び出し側もx座標には
+        scale_x、y座標にはscale_yを使うよう統一した。
+
         Returns:
-            (エンコーダ出力の辞書{出力名: ndarray}, スケール比, 元画像サイズ(H,W))
+            (エンコーダ出力の辞書{出力名: ndarray}, (x方向スケール比, y方向スケール比), 元画像サイズ(H,W))
         """
         orig_h, orig_w = image_rgb.shape[:2]
         resized = cv2.resize(
@@ -108,8 +129,9 @@ class Sam2OnnxInference:
         outputs = self._encoder_session.run(None, {self._encoder_input_name: blob})
         output_dict = dict(zip(self._encoder_output_names, outputs))
 
-        scale = _ENCODER_INPUT_SIZE / max(orig_h, orig_w)
-        return output_dict, scale, (orig_h, orig_w)
+        scale_x = _ENCODER_INPUT_SIZE / orig_w
+        scale_y = _ENCODER_INPUT_SIZE / orig_h
+        return output_dict, (scale_x, scale_y), (orig_h, orig_w)
 
     def predict_from_box(
         self,
@@ -150,13 +172,13 @@ class Sam2OnnxInference:
     ) -> np.ndarray:
         """predict_from_boxの内部実装。二値化前の連続値(signed logit相当)を返す。
         タイル分割時に、閾値判定前の値のまま重なり領域を平均化するために使う。"""
-        encoder_outputs, scale, (orig_h, orig_w) = self._encode_image(image_rgb)
+        encoder_outputs, (scale_x, scale_y), (orig_h, orig_w) = self._encode_image(image_rgb)
 
         x1, y1, x2, y2 = box
-        coords = [[x1 * scale, y1 * scale], [x2 * scale, y2 * scale]]
+        coords = [[x1 * scale_x, y1 * scale_y], [x2 * scale_x, y2 * scale_y]]
         labels = [2, 3]
         if points:
-            coords.extend([[px * scale, py * scale] for px, py in points])
+            coords.extend([[px * scale_x, py * scale_y] for px, py in points])
             labels.extend([1] * len(points))
 
         point_coords = np.array([coords], dtype=np.float32)
@@ -372,7 +394,7 @@ class Sam2OnnxInference:
             try:
                 # ★エンコードはタイルごとに1回だけ実行し、以降の
                 # 2種類のデコードで使い回す。
-                encoder_outputs, scale, orig_size = self._encode_image(tile_img)
+                encoder_outputs, (scale_x, scale_y), orig_size = self._encode_image(tile_img)
             except Exception as e:
                 logger.warning(
                     "Sam2HandDetector: タイル(x=%d,y=%d)のエンコードに失敗しました (%s)",
@@ -382,14 +404,14 @@ class Sam2OnnxInference:
                 )
                 return (ty, tile_h, tx, tile_w, None, None)
 
-            box_coords = [[lx1 * scale, ly1 * scale], [lx2 * scale, ly2 * scale]]
+            box_coords = [[lx1 * scale_x, ly1 * scale_y], [lx2 * scale_x, ly2 * scale_y]]
 
             tile_prob_with = None
             try:
                 coords = list(box_coords)
                 labels = [2, 3]
                 if lp:
-                    coords.extend([[px * scale, py * scale] for px, py in lp])
+                    coords.extend([[px * scale_x, py * scale_y] for px, py in lp])
                     labels.extend([1] * len(lp))
                 point_coords = np.array([coords], dtype=np.float32)
                 point_labels = np.array([labels], dtype=np.float32)
@@ -496,9 +518,9 @@ class Sam2OnnxInference:
         points: list[tuple[float, float]],
     ) -> np.ndarray:
         """predict_from_pointsの内部実装。二値化前の連続値を返す。"""
-        encoder_outputs, scale, (orig_h, orig_w) = self._encode_image(image_rgb)
+        encoder_outputs, (scale_x, scale_y), (orig_h, orig_w) = self._encode_image(image_rgb)
 
-        scaled_points = [[px * scale, py * scale] for px, py in points]
+        scaled_points = [[px * scale_x, py * scale_y] for px, py in points]
         point_coords = np.array([scaled_points], dtype=np.float32)
         point_labels = np.array([[1] * len(points)], dtype=np.float32)
 

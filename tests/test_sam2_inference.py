@@ -241,20 +241,59 @@ class TestPredictFromBoxAndPoints:
         encoder_outputs = {"image_embed": np.zeros((1, 3))}
         return _make_instance(decoder_names, raw_mask, encoder_outputs)
 
+    def test_encoder_scale_matches_actual_non_aspect_preserving_resize(self):
+        """
+        ★重大バグの回帰テスト（2026-07-07）: `_encode_image()`は
+        `cv2.resize(image, (1024, 1024))`という、縦横比を無視して
+        正方形へ直接引き伸ばす方式でリサイズしている。そのため、
+        非正方形の画像では、画像自身の中心点は必ずエンコード後の
+        1024x1024空間の中心(512, 512)に一致するはずである
+        （縦横比保持のレターボックスではないため、常に中心は中心のまま）。
+
+        以前の実装は`scale = 1024/max(orig_h, orig_w)`という縦横共通の
+        単一スケール値を使っていたため、非正方形画像では短い方の辺の
+        座標が大きくズレていた（500x1000画像の中心(500,250)が
+        (512,256)と計算され、本来の(512,512)と大きく食い違っていた）。
+        """
+        obj, decoder_session, _encoder_session = self._setup_full_instance()
+
+        orig_h, orig_w = 500, 1000  # 非正方形(横長)画像
+        image = np.zeros((orig_h, orig_w, 3), dtype=np.uint8)
+        center = (orig_w / 2.0, orig_h / 2.0)
+
+        # 画像の中心点1点だけをbboxの両隅として渡す(退化したbox)ことで、
+        # point_coordsに中心点がどう変換されたかを直接確認する。
+        obj.predict_from_box(image, box=(center[0], center[1], center[0], center[1]))
+
+        fed = decoder_session.last_input_feed
+        np.testing.assert_allclose(
+            fed["point_coords"][0, 0],
+            [512.0, 512.0],
+            atol=1e-3,
+            err_msg=(
+                "非正方形画像の中心点が、エンコード後の1024x1024空間の"
+                "中心(512,512)に一致しない。x/y方向のスケール計算が"
+                "実際のリサイズ方式(縦横比を無視した正方形への引き伸ばし)"
+                "と整合していない可能性がある。"
+            ),
+        )
+
     def test_predict_from_box_scales_coords_and_sets_box_labels(self):
         obj, decoder_session, _encoder_session = self._setup_full_instance()
 
-        # 500x1000画像 -> scale = 1024/max(500,1000) = 1.024
+        # 500x1000画像(非正方形) -> x方向 scale_x=1024/1000=1.024,
+        # y方向 scale_y=1024/500=2.048 (縦横で異なるスケールになる)
         image = np.zeros((500, 1000, 3), dtype=np.uint8)
         mask = obj.predict_from_box(image, box=(100.0, 50.0, 300.0, 200.0))
 
         assert mask is not None
         fed = decoder_session.last_input_feed
-        expected_scale = 1024 / 1000
+        scale_x = 1024 / 1000
+        scale_y = 1024 / 500
         np.testing.assert_allclose(
             fed["point_coords"],
-            np.array([[[100.0 * expected_scale, 50.0 * expected_scale],
-                       [300.0 * expected_scale, 200.0 * expected_scale]]], dtype=np.float32),
+            np.array([[[100.0 * scale_x, 50.0 * scale_y],
+                       [300.0 * scale_x, 200.0 * scale_y]]], dtype=np.float32),
             rtol=1e-5,
         )
         np.testing.assert_array_equal(fed["point_labels"], np.array([[2, 3]], dtype=np.float32))
