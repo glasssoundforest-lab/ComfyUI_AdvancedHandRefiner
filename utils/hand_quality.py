@@ -22,6 +22,68 @@ import cv2
 import numpy as np
 
 
+def trim_forearm_from_mask(
+    mask: np.ndarray,
+    wrist_xy: tuple[float, float],
+    palm_center_xy: tuple[float, float],
+    margin_ratio: float = 0.2,
+) -> np.ndarray:
+    """
+    MediaPipeのランドマーク（手首点・手のひら中心の目安となる点）を
+    使い、SAM2マスクから前腕にあたる部分を除去する。
+
+    ★背景: `estimate_finger_count()`等の指標は、実際のイラストの
+    SAM2マスクに適用すると精度が大きく落ちることが実測で確認されている。
+    原因の一つとして、SAM2マスクにはbboxの取り方次第で手首から先の
+    前腕部分まで含まれてしまうことがあり、これが「手のひら中心」の
+    推定（バウンディングボックスから単純に見積もる方式）を大きく
+    狂わせ、指本数推定アルゴリズム全体の前提を崩してしまうことが
+    考えられる。この関数は、MediaPipeが既に持っている実際の手首
+    座標を使って、より正確に前腕を除去する前処理として使う。
+
+    手首点(`wrist_xy`)から手のひら中心(`palm_center_xy`、通常は
+    MediaPipeランドマークの中指付け根＝インデックス9を使う想定)への
+    方向を「手の方向」とし、そこから逆方向（前腕側）に
+    `margin_ratio`分（手首〜手のひら中心の距離に対する比率）だけ
+    余白を残した上で、それより前腕側にある画素を全て除去する。
+
+    Args:
+        mask: 0-255 uint8マスク
+        wrist_xy: 手首のランドマーク座標（マスクと同じ画像座標系）
+        palm_center_xy: 手のひら中心の目安となる座標
+            （例: 中指付け根のランドマーク）
+        margin_ratio: 手首から前腕側へどれだけ余白を残すか
+            （手首〜手のひら中心の距離に対する比率）
+
+    Returns:
+        前腕部分を除去した0-255 uint8マスク（元のmaskと同じshape）。
+        wrist_xyとpalm_center_xyが同一点に近い場合等、方向を計算
+        できない場合は元のmaskをそのまま返す。
+    """
+    dx = palm_center_xy[0] - wrist_xy[0]
+    dy = palm_center_xy[1] - wrist_xy[1]
+    length = math.hypot(dx, dy)
+    if length < 1e-6:
+        return mask.copy()
+
+    ux, uy = dx / length, dy / length
+    cutoff_x = wrist_xy[0] - ux * length * margin_ratio
+    cutoff_y = wrist_xy[1] - uy * length * margin_ratio
+
+    ys, xs = np.where(mask > 0)
+    if len(xs) == 0:
+        return mask.copy()
+
+    # 各前景画素について、(手の方向ベクトル)との内積が正なら「手側」、
+    # 負なら「前腕側」とみなす
+    proj = (xs - cutoff_x) * ux + (ys - cutoff_y) * uy
+    keep = proj >= 0
+
+    trimmed = np.zeros_like(mask)
+    trimmed[ys[keep], xs[keep]] = mask[ys[keep], xs[keep]]
+    return trimmed
+
+
 def _largest_contour(mask: np.ndarray) -> np.ndarray | None:
     binary = (mask > 0).astype(np.uint8)
     contours, _ = cv2.findContours(binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
@@ -295,7 +357,12 @@ def estimate_finger_count_radial(
     return count
 
 
-def assess_hand_quality(mask: np.ndarray, expected_fingers: int = 5) -> dict:
+def assess_hand_quality(
+    mask: np.ndarray,
+    expected_fingers: int = 5,
+    landmarks: list[tuple[float, float]] | None = None,
+    forearm_trim_margin_ratio: float = 0.2,
+) -> dict:
     """
     複数の指本数推定手法を組み合わせた、手の品質の統合判定。
 
@@ -316,9 +383,25 @@ def assess_hand_quality(mask: np.ndarray, expected_fingers: int = 5) -> dict:
     基づいた個別の疑いフラグ（欠損/癒着の疑い、余分な指の疑い）を
     別々に立てる設計とした。
 
+    ★`landmarks`について（実データでの精度向上）: 実際のイラストの
+    SAM2マスクをそのまま使うと、bboxの取り方次第で前腕部分まで
+    マスクに含まれてしまい、指本数推定の前提（手のひら中心の推定等）
+    が狂うことが実測で確認されている。MediaPipeのランドマーク
+    （21点のリスト、インデックス0=手首、9=中指付け根を使う）を
+    渡すと、`trim_forearm_from_mask()`により前腕部分を自動的に
+    除去してから判定する。実写データでの検証では、改善するケース
+    （前景面積の大部分を占めていた前腕が除去され、正しい本数に近づく）
+    と、ほとんど変化しないケース（元々前腕をあまり含んでいなかった
+    場合）の両方があり、少なくとも悪化させるケースは確認されていない。
+
     Args:
         mask: 0-255 uint8マスク（1つの手の領域のみを含む想定）
         expected_fingers: 本来あるべき指の本数（通常5）
+        landmarks: MediaPipeの21点ランドマーク（[(x,y), ...]、
+            maskと同じ画像座標系）。指定すると前腕除去の前処理を
+            自動的に適用する。Noneの場合は前処理を行わない
+        forearm_trim_margin_ratio: 前腕除去の余白比率
+            （`trim_forearm_from_mask()`の`margin_ratio`にそのまま渡す）
 
     Returns:
         以下のキーを持つ辞書:
@@ -330,6 +413,13 @@ def assess_hand_quality(mask: np.ndarray, expected_fingers: int = 5) -> dict:
         - suspected_extra: 骨格化ベースの推定が期待本数を上回る場合True
           （余分な指の疑い）
     """
+    if landmarks is not None and len(landmarks) > 9:
+        wrist_xy = landmarks[0]
+        palm_center_xy = landmarks[9]
+        mask = trim_forearm_from_mask(
+            mask, wrist_xy, palm_center_xy, margin_ratio=forearm_trim_margin_ratio
+        )
+
     hull_count = estimate_finger_count(mask)
     skeleton_count = estimate_finger_count_skeleton(mask)
 

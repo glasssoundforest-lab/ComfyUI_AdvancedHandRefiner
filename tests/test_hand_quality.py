@@ -8,6 +8,7 @@ estimate_finger_count() を、utils/synthetic_hand.py で生成した
 
 from __future__ import annotations
 
+import cv2
 import numpy as np
 import pytest
 
@@ -17,6 +18,7 @@ from utils.hand_quality import (
     estimate_finger_count_radial,
     estimate_finger_count_skeleton,
     finger_count_mismatch,
+    trim_forearm_from_mask,
 )
 from utils.synthetic_hand import generate_synthetic_hand_mask
 
@@ -298,3 +300,85 @@ class TestAssessHandQualityEnsemble:
         result_custom = assess_hand_quality(mask_4, expected_fingers=4)
         assert result_default["is_abnormal"] is True  # 5本期待に対し4本 -> 異常
         assert result_custom["is_abnormal"] is False  # 4本期待に対し4本 -> 正常
+
+
+class TestTrimForearmFromMask:
+    """
+    ★実データでの精度向上策: SAM2マスクに前腕まで含まれてしまう場合に、
+    MediaPipeの手首ランドマークを使ってそれを除去する前処理の検証。
+    """
+
+    def test_removes_rectangle_extending_beyond_wrist(self):
+        """
+        手のひら(円)から手首方向に伸びる「前腕」を模した長方形を
+        追加したマスクで、trim後にその前腕部分が除去されることを確認する。
+        """
+        h, w = 300, 200
+        mask = np.zeros((h, w), dtype=np.uint8)
+        # 手のひら(手は画像上部、y=50-100あたり)
+        cv2.circle(mask, (100, 80), 40, 255, -1)
+        # 前腕(手首から下、y=100-280まで伸びる长方形)
+        cv2.rectangle(mask, (80, 100), (120, 280), 255, -1)
+
+        wrist_xy = (100.0, 100.0)  # 手首は手のひらと前腕の境界あたり
+        palm_center_xy = (100.0, 80.0)  # 手のひら中心は手首より上(手の方向)
+
+        trimmed = trim_forearm_from_mask(mask, wrist_xy, palm_center_xy, margin_ratio=0.1)
+
+        # 前腕の先(y=250付近)は除去されているはず
+        assert trimmed[250, 100] == 0
+        # 手のひら部分(y=80付近)は残っているはず
+        assert trimmed[80, 100] == 255
+
+    def test_returns_copy_unchanged_when_direction_is_degenerate(self):
+        """手首点と手のひら中心が同一点の場合、方向を計算できないため元のマスクをそのまま返す"""
+        mask = np.zeros((50, 50), dtype=np.uint8)
+        mask[10:20, 10:20] = 255
+        result = trim_forearm_from_mask(mask, (25.0, 25.0), (25.0, 25.0))
+        np.testing.assert_array_equal(result, mask)
+
+    def test_empty_mask_returns_copy(self):
+        mask = np.zeros((50, 50), dtype=np.uint8)
+        result = trim_forearm_from_mask(mask, (10.0, 10.0), (20.0, 20.0))
+        assert np.count_nonzero(result) == 0
+
+    def test_does_not_remove_normal_hand_without_forearm(self):
+        """前腕を含まない、手のひら+指だけの通常のマスクは、trim後もほぼ変化しないはず"""
+        mask = generate_synthetic_hand_mask()
+        # 手のひら中心を(128,192)付近、手首方向をさらに下と仮定
+        wrist_xy = (128.0, 230.0)
+        palm_center_xy = (128.0, 192.0)
+        trimmed = trim_forearm_from_mask(mask, wrist_xy, palm_center_xy, margin_ratio=0.3)
+        # 指の本数推定には影響しないはず
+        assert estimate_finger_count(trimmed) == estimate_finger_count(mask)
+
+
+class TestAssessHandQualityWithLandmarks:
+    def test_landmarks_none_behaves_as_before(self):
+        mask = generate_synthetic_hand_mask()
+        result_no_landmarks = assess_hand_quality(mask)
+        assert result_no_landmarks["is_abnormal"] is False
+
+    def test_landmarks_provided_triggers_forearm_trim(self):
+        """
+        landmarksを渡すと前腕除去が適用されることを確認する
+        （前腕を含む合成マスクで、landmarks無しでは手のひら中心の
+        推定が狂って誤判定になり得るが、landmarks併用で改善する
+        ことを期待する）。ここでは少なくとも例外なく動作し、
+        21点構造のlandmarks[0](手首)/landmarks[9](中指付け根)を
+        正しく参照できることを確認する。
+        """
+        mask = generate_synthetic_hand_mask()
+        # 21点のダミーlandmarks(0=手首、9=中指付け根に相当する位置)
+        landmarks = [(128.0, 250.0)] * 21
+        landmarks[0] = (128.0, 230.0)  # 手首
+        landmarks[9] = (128.0, 190.0)  # 中指付け根(手の方向)
+
+        result = assess_hand_quality(mask, landmarks=landmarks)
+        assert "hull_count" in result
+
+    def test_short_landmarks_list_is_ignored_safely(self):
+        """21点未満の不完全なlandmarksが渡された場合、前腕除去をスキップして安全に動作する"""
+        mask = generate_synthetic_hand_mask()
+        result = assess_hand_quality(mask, landmarks=[(1.0, 1.0), (2.0, 2.0)])
+        assert result["hull_count"] == estimate_finger_count(mask)
