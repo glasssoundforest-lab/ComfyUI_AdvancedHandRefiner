@@ -563,3 +563,86 @@ def assess_landmark_plausibility(
         "suspicious_fingers": suspicious_fingers,
         "degenerate": False,
     }
+
+
+def assess_hand_overall_quality(
+    mask: np.ndarray,
+    landmarks: list[tuple[float, float]] | None,
+    expected_fingers: int = 5,
+) -> dict:
+    """
+    マスクベースの判定（`assess_hand_quality()`、凸包+骨格化）と
+    ランドマークベースの判定（`assess_landmark_plausibility()`、
+    関節妥当性）を組み合わせた、最終的な統合品質判定。
+
+    ★組み合わせの設計方針（実データでの検証結果に基づく）:
+
+    1. **「欠損/癒着の疑い」はランドマークベースを優先する。**
+       実データでの検証により、マスクベースの手法（凸包・骨格化）は
+       指を握り込んだ/曲げたポーズに対して原理的に精度が落ち、正常な
+       手でも「欠損」と誤判定しやすいことが確認されている。一方
+       ランドマークベースの判定は、マスクの見た目に依存せず関節位置の
+       相対関係だけを見るため、同じ握り込んだポーズでも正しく
+       「異常なし」と判定できることが実データで確認されている。
+       そのため、ランドマークが判定可能（`degenerate=False`）な場合は
+       ランドマークベースの判定を採用し、判定不能な場合のみマスク
+       ベースの欠損判定にフォールバックする。
+
+    2. **「余分な指の疑い」はマスクベースのみで判定する。**
+       MediaPipeは常に21点固定（親指4+他4指×4=21）という、解剖学的に
+       正常な人間の手の構造を前提にしか出力できないため、そもそも
+       「6本目の指が存在する」という状態自体を表現できない。そのため
+       余分な指の検出は、ランドマークに依存しないマスクベースの
+       手法（凸包・骨格化）に頼らざるを得ない。
+
+    ★既知の限界: 上記2.の設計上、指を握り込んだ/曲げたポーズでは、
+    マスクベースの骨格化手法自体が誤って「余分な指がある」ように
+    見えてしまう（骨格分岐のノイズ）ケースが実データで確認されており、
+    これは現時点でも未解決の限界として残る（ランドマーク側で
+    「余分な指」を代替検知する手段がMediaPipeの構造上存在しないため）。
+
+    Args:
+        mask: 0-255 uint8マスク
+        landmarks: MediaPipeの21点ランドマーク（[(x,y), ...]）。
+            Noneの場合はマスクベースの判定のみで行う
+        expected_fingers: 本来あるべき指の本数（通常5）
+
+    Returns:
+        以下のキーを持つ辞書:
+        - is_abnormal: 総合的な異常判定
+        - suspected_deficiency: 欠損/癒着の疑い（ランドマーク優先、
+          判定不能時はマスクベースにフォールバック）
+        - suspected_extra: 余分な指の疑い（マスクベースのみ）
+        - suspicious_fingers: ランドマークベースで不自然と判定された
+          指名のリスト（判定不能時は空リスト）
+        - deficiency_source: どちらの判定が採用されたか
+          （"landmark" または "mask_fallback"）
+        - mask_hull_count / mask_skeleton_count: マスクベースの
+          参考情報（凸包・骨格化それぞれの推定本数）
+    """
+    mask_result = assess_hand_quality(mask, expected_fingers=expected_fingers, landmarks=landmarks)
+
+    if landmarks is not None:
+        landmark_result = assess_landmark_plausibility(landmarks)
+    else:
+        landmark_result = {"is_abnormal": False, "suspicious_fingers": [], "degenerate": True}
+
+    if landmark_result["degenerate"]:
+        suspected_deficiency = mask_result["suspected_deficiency"]
+        deficiency_source = "mask_fallback"
+    else:
+        suspected_deficiency = landmark_result["is_abnormal"]
+        deficiency_source = "landmark"
+
+    suspected_extra = mask_result["suspected_extra"]
+    is_abnormal = suspected_deficiency or suspected_extra
+
+    return {
+        "is_abnormal": is_abnormal,
+        "suspected_deficiency": suspected_deficiency,
+        "suspected_extra": suspected_extra,
+        "suspicious_fingers": landmark_result["suspicious_fingers"],
+        "deficiency_source": deficiency_source,
+        "mask_hull_count": mask_result["hull_count"],
+        "mask_skeleton_count": mask_result["skeleton_count"],
+    }

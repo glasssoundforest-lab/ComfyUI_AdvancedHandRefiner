@@ -8,12 +8,15 @@ estimate_finger_count() を、utils/synthetic_hand.py で生成した
 
 from __future__ import annotations
 
+from unittest.mock import patch
+
 import cv2
 import numpy as np
 import pytest
 
 from utils.hand_quality import (
     FINGER_JOINT_INDICES,
+    assess_hand_overall_quality,
     assess_hand_quality,
     assess_landmark_plausibility,
     estimate_finger_count,
@@ -474,4 +477,152 @@ class TestAssessLandmarkPlausibility:
     def test_short_landmarks_list_is_handled_safely(self):
         result = assess_landmark_plausibility([(1.0, 1.0), (2.0, 2.0)])
         assert result["degenerate"] is True
+        assert result["is_abnormal"] is False
+
+
+class TestAssessHandOverallQuality:
+    """
+    ★Phase6の集大成: マスクベース(凸包+骨格化)とランドマークベース
+    (関節妥当性)を組み合わせた最終的な統合判定`assess_hand_overall_quality()`
+    の検証。
+
+    設計方針:
+    - 「欠損/癒着の疑い」はランドマークベースを優先する(判定可能な場合)。
+      実データで、マスクベースが曲がったポーズを誤って欠損と判定する
+      一方、ランドマークベースは正しく「異常なし」と判定できることが
+      確認されているため。
+    - 「余分な指の疑い」はマスクベースのみで判定する(MediaPipeは常に
+      21点固定のため、余分な指という状態自体を表現できない)。
+
+    コンポーネント関数をモック化し、組み合わせロジック自体を厳密に
+    検証する。
+    """
+
+    def _mask_result(self, hull=5, skeleton=5, deficiency=False, extra=False):
+        return {
+            "hull_count": hull,
+            "skeleton_count": skeleton,
+            "is_abnormal": deficiency or extra,
+            "suspected_deficiency": deficiency,
+            "suspected_extra": extra,
+        }
+
+    def _landmark_result(self, is_abnormal=False, suspicious=None, degenerate=False):
+        return {
+            "is_abnormal": is_abnormal,
+            "suspicious_fingers": suspicious or [],
+            "degenerate": degenerate,
+        }
+
+    def test_normal_hand_both_agree_not_abnormal(self):
+        with patch(
+            "utils.hand_quality.assess_hand_quality", return_value=self._mask_result()
+        ), patch(
+            "utils.hand_quality.assess_landmark_plausibility",
+            return_value=self._landmark_result(),
+        ):
+            result = assess_hand_overall_quality(np.zeros((10, 10), dtype=np.uint8), [(0.0, 0.0)] * 21)
+
+        assert result["is_abnormal"] is False
+        assert result["suspected_deficiency"] is False
+        assert result["suspected_extra"] is False
+        assert result["deficiency_source"] == "landmark"
+
+    def test_landmark_overrides_mask_false_positive_deficiency(self):
+        """
+        ★中核的な検証: マスクベースが誤って欠損(hull<5)と判定しても、
+        ランドマークベースが正常(is_abnormal=False)と判定していれば、
+        最終的な欠損疑いはFalseになる(実際の曲がったポーズの実データで
+        確認された挙動そのもの)。
+        """
+        with patch(
+            "utils.hand_quality.assess_hand_quality",
+            return_value=self._mask_result(hull=2, skeleton=6, deficiency=True, extra=True),
+        ), patch(
+            "utils.hand_quality.assess_landmark_plausibility",
+            return_value=self._landmark_result(is_abnormal=False),
+        ):
+            result = assess_hand_overall_quality(np.zeros((10, 10), dtype=np.uint8), [(0.0, 0.0)] * 21)
+
+        assert result["suspected_deficiency"] is False
+        assert result["deficiency_source"] == "landmark"
+        # 余分指の疑いはマスクベースのみで判定するため、Trueのまま残る(既知の限界)
+        assert result["suspected_extra"] is True
+        assert result["is_abnormal"] is True  # 余分指疑いにより全体としては異常判定のまま
+
+    def test_landmark_confirms_genuine_deficiency(self):
+        with patch(
+            "utils.hand_quality.assess_hand_quality",
+            return_value=self._mask_result(hull=4, skeleton=4, deficiency=True, extra=False),
+        ), patch(
+            "utils.hand_quality.assess_landmark_plausibility",
+            return_value=self._landmark_result(is_abnormal=True, suspicious=["middle"]),
+        ):
+            result = assess_hand_overall_quality(np.zeros((10, 10), dtype=np.uint8), [(0.0, 0.0)] * 21)
+
+        assert result["is_abnormal"] is True
+        assert result["suspected_deficiency"] is True
+        assert result["deficiency_source"] == "landmark"
+        assert result["suspicious_fingers"] == ["middle"]
+
+    def test_falls_back_to_mask_when_landmarks_degenerate(self):
+        """ランドマークが判定不能(degenerate)な場合、マスクベースの欠損判定にフォールバックする"""
+        with patch(
+            "utils.hand_quality.assess_hand_quality",
+            return_value=self._mask_result(hull=4, skeleton=4, deficiency=True, extra=False),
+        ), patch(
+            "utils.hand_quality.assess_landmark_plausibility",
+            return_value=self._landmark_result(is_abnormal=False, degenerate=True),
+        ):
+            result = assess_hand_overall_quality(np.zeros((10, 10), dtype=np.uint8), [(0.0, 0.0)] * 21)
+
+        assert result["suspected_deficiency"] is True
+        assert result["deficiency_source"] == "mask_fallback"
+
+    def test_landmarks_none_uses_mask_fallback(self):
+        with patch(
+            "utils.hand_quality.assess_hand_quality",
+            return_value=self._mask_result(hull=4, skeleton=6, deficiency=True, extra=True),
+        ):
+            result = assess_hand_overall_quality(np.zeros((10, 10), dtype=np.uint8), None)
+
+        assert result["deficiency_source"] == "mask_fallback"
+        assert result["suspected_deficiency"] is True
+        assert result["suspected_extra"] is True
+
+    def test_extra_finger_is_always_mask_based_regardless_of_landmark(self):
+        """余分な指の疑いは、ランドマークの判定内容によらず常にマスクベースの値をそのまま使う"""
+        with patch(
+            "utils.hand_quality.assess_hand_quality",
+            return_value=self._mask_result(hull=5, skeleton=6, deficiency=False, extra=True),
+        ), patch(
+            "utils.hand_quality.assess_landmark_plausibility",
+            return_value=self._landmark_result(is_abnormal=True, suspicious=["thumb"]),
+        ):
+            result = assess_hand_overall_quality(np.zeros((10, 10), dtype=np.uint8), [(0.0, 0.0)] * 21)
+
+        assert result["suspected_extra"] is True
+
+    def test_result_contains_reference_mask_counts(self):
+        with patch(
+            "utils.hand_quality.assess_hand_quality",
+            return_value=self._mask_result(hull=3, skeleton=7),
+        ), patch(
+            "utils.hand_quality.assess_landmark_plausibility",
+            return_value=self._landmark_result(),
+        ):
+            result = assess_hand_overall_quality(np.zeros((10, 10), dtype=np.uint8), [(0.0, 0.0)] * 21)
+
+        assert result["mask_hull_count"] == 3
+        assert result["mask_skeleton_count"] == 7
+
+    def test_end_to_end_with_real_synthetic_normal_hand(self):
+        """
+        モックを使わない、実際のsynthetic_hand生成器+本物の
+        assess_hand_overall_qualityによるエンドツーエンドの
+        健全性チェック(正常な手は最終的にis_abnormal=Falseになるはず)。
+        """
+        mask = generate_synthetic_hand_mask()
+        landmarks = _make_landmark_hand()
+        result = assess_hand_overall_quality(mask, landmarks)
         assert result["is_abnormal"] is False
