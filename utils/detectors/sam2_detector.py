@@ -154,12 +154,22 @@ class Sam2HandDetector(HandDetector):
     ) -> np.ndarray | None:
         """
         1つの手について、優先順位に従ってプロンプトを構築し
-        セグメンテーションを実行する（精度優先: bbox > landmarks）。
+        セグメンテーションを実行する。
+
+        bbox・landmarksの両方が揃っている場合は、両方を同時にSAM2へ
+        渡す（bboxだけでは手がかりが乏しいタイル分割時の各タイルにおいて、
+        landmarksの具体的な点情報が指の折り重なり等の複雑な形状の
+        判断材料になる。実写データで、bbox単体だと不安定だった領域が
+        landmarks併用で改善することを確認済み）。
         """
         if prior_hand.bbox is not None:
             box = prior_hand.bbox.to_int_tuple()
             mask = inference.predict_from_box_tiled(
-                image_rgb, box, tile_size=tile_size, overlap=tile_overlap
+                image_rgb,
+                box,
+                points=prior_hand.landmarks,
+                tile_size=tile_size,
+                overlap=tile_overlap,
             )
             if mask is not None:
                 return mask

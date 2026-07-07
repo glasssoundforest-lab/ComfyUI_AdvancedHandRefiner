@@ -104,20 +104,28 @@ class Sam2OnnxInference:
         self,
         image_rgb: np.ndarray,
         box: tuple[float, float, float, float],
+        points: list[tuple[float, float]] | None = None,
     ) -> np.ndarray | None:
         """
-        バウンディングボックスをプロンプトとしてセグメンテーションマスクを得る。
+        バウンディングボックス（＋任意で追加の前景ポイント）をプロンプトと
+        してセグメンテーションマスクを得る。
+
+        `points`を渡すと、bboxの2隅に加えてそれらの点も前景プロンプトとして
+        同時にSAM2へ渡す。bboxだけでは手がかりが乏しい領域（指の折り重なり等）
+        でも、MediaPipeのランドマーク等の具体的な点情報を追加することで
+        より正確なセグメンテーションが期待できる。
 
         Args:
             image_rgb: RGB uint8 ndarray（H, W, 3）
             box: (x1, y1, x2, y2) 元画像のピクセル座標系
+            points: 追加の前景ポイント（元画像のピクセル座標系）。省略時はbboxのみ
 
         Returns:
             (H, W) の0-255 uint8マスク（元画像と同じサイズ）。
             推論に失敗した場合は None。
         """
         try:
-            prob = self._predict_prob_from_box(image_rgb, box)
+            prob = self._predict_prob_from_box(image_rgb, box, points)
             return (prob > 0.0).astype(np.uint8) * 255
         except Exception as e:
             logger.warning("Sam2HandDetector: bboxプロンプトでの推論に失敗しました (%s)", e)
@@ -127,16 +135,21 @@ class Sam2OnnxInference:
         self,
         image_rgb: np.ndarray,
         box: tuple[float, float, float, float],
+        points: list[tuple[float, float]] | None = None,
     ) -> np.ndarray:
         """predict_from_boxの内部実装。二値化前の連続値(signed logit相当)を返す。
         タイル分割時に、閾値判定前の値のまま重なり領域を平均化するために使う。"""
         encoder_outputs, scale, (orig_h, orig_w) = self._encode_image(image_rgb)
 
         x1, y1, x2, y2 = box
-        point_coords = np.array(
-            [[[x1 * scale, y1 * scale], [x2 * scale, y2 * scale]]], dtype=np.float32
-        )
-        point_labels = np.array([[2, 3]], dtype=np.float32)
+        coords = [[x1 * scale, y1 * scale], [x2 * scale, y2 * scale]]
+        labels = [2, 3]
+        if points:
+            coords.extend([[px * scale, py * scale] for px, py in points])
+            labels.extend([1] * len(points))
+
+        point_coords = np.array([coords], dtype=np.float32)
+        point_labels = np.array([labels], dtype=np.float32)
 
         return self._run_decoder_prob(encoder_outputs, point_coords, point_labels, (orig_h, orig_w))
 
@@ -144,6 +157,7 @@ class Sam2OnnxInference:
         self,
         image_rgb: np.ndarray,
         box: tuple[float, float, float, float],
+        points: list[tuple[float, float]] | None = None,
         tile_size: int = _TILE_SIZE_DEFAULT,
         overlap: int = _TILE_OVERLAP_DEFAULT,
         despeckle_min_area: int = _DESPECKLE_MIN_AREA_DEFAULT,
@@ -177,9 +191,18 @@ class Sam2OnnxInference:
         小さな孤立領域（前景側の小片・背景側の穴）を除去する後処理を
         addする。
 
+        ★`points`について: bboxがタイル全体に近いサイズになる場合、
+        「タイルの大部分がだいたい前景」という程度の弱い手がかりしか
+        与えられず、指の折り重なり等の複雑な形状ではタイル単体の
+        セグメンテーションが不安定になることが実写データで確認された。
+        MediaPipeのランドマーク等、具体的な前景点を`points`として渡すと、
+        各タイルにその中に含まれる点だけが追加の前景プロンプトとして
+        渡され、より確実な手がかりになる。
+
         Args:
             image_rgb: RGB uint8 ndarray（H, W, 3）
             box: (x1, y1, x2, y2) 元画像のピクセル座標系
+            points: 追加の前景ポイント（元画像のピクセル座標系）。省略時はbboxのみ
             tile_size: タイル1枚の一辺のサイズ（ピクセル）。画像の縦横どちらも
                 これ以下であればタイル分割せず`predict_from_box`と同じ1回の
                 推論で済ませる
@@ -194,7 +217,7 @@ class Sam2OnnxInference:
         h, w = image_rgb.shape[:2]
 
         if h <= tile_size and w <= tile_size:
-            return self.predict_from_box(image_rgb, box)
+            return self.predict_from_box(image_rgb, box, points)
 
         x1, y1, x2, y2 = box
         prob_sum = np.zeros((h, w), dtype=np.float32)
@@ -213,10 +236,18 @@ class Sam2OnnxInference:
                 if local_x2 <= local_x1 or local_y2 <= local_y1:
                     continue
 
+                local_points = None
+                if points:
+                    local_points = [
+                        (px - tx, py - ty)
+                        for px, py in points
+                        if tx <= px < tx + tile_w and ty <= py < ty + tile_h
+                    ] or None
+
                 tile_img = image_rgb[ty : ty + tile_h, tx : tx + tile_w]
                 try:
                     tile_prob = self._predict_prob_from_box(
-                        tile_img, (local_x1, local_y1, local_x2, local_y2)
+                        tile_img, (local_x1, local_y1, local_x2, local_y2), local_points
                     )
                 except Exception as e:
                     logger.warning(

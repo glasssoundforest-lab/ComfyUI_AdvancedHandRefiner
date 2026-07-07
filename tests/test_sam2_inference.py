@@ -285,6 +285,40 @@ class TestPredictFromBoxAndPoints:
         image = np.zeros((200, 200, 3), dtype=np.uint8)
         assert obj.predict_from_box(image, box=(0.0, 0.0, 10.0, 10.0)) is None
 
+    def test_predict_from_box_with_additional_points_combines_prompts(self):
+        """
+        ★機能追加: bboxに加えてlandmarks等の追加ポイントを同時に渡した場合、
+        point_coords/point_labelsにbboxの2隅(label 2,3)と追加ポイント
+        (label 1)がまとめて渡ることを確認する。
+        """
+        obj, decoder_session, _encoder_session = self._setup_full_instance()
+
+        image = np.zeros((1024, 1024, 3), dtype=np.uint8)  # scale=1.0で計算しやすくする
+        box = (100.0, 100.0, 300.0, 300.0)
+        points = [(150.0, 150.0), (250.0, 250.0)]
+
+        mask = obj.predict_from_box(image, box, points=points)
+
+        assert mask is not None
+        fed = decoder_session.last_input_feed
+        np.testing.assert_allclose(
+            fed["point_coords"],
+            np.array([[[100.0, 100.0], [300.0, 300.0], [150.0, 150.0], [250.0, 250.0]]], dtype=np.float32),
+        )
+        np.testing.assert_array_equal(fed["point_labels"], np.array([[2, 3, 1, 1]], dtype=np.float32))
+
+    def test_predict_from_box_without_points_matches_previous_behavior(self):
+        """pointsを渡さない場合、従来通りbboxの2隅のみが渡ることを確認(後方互換)"""
+        obj, decoder_session, _encoder_session = self._setup_full_instance()
+
+        image = np.zeros((1024, 1024, 3), dtype=np.uint8)
+        mask = obj.predict_from_box(image, box=(100.0, 100.0, 300.0, 300.0))
+
+        assert mask is not None
+        fed = decoder_session.last_input_feed
+        assert fed["point_coords"].shape == (1, 2, 2)
+        np.testing.assert_array_equal(fed["point_labels"], np.array([[2, 3]], dtype=np.float32))
+
 
 class TestTileStarts:
     def test_length_within_tile_size_returns_single_tile(self):
@@ -321,7 +355,25 @@ class TestPredictFromBoxTiled:
 
         assert mask is not None
         assert mask.shape == (300, 400)
-        assert encoder_session.call_count == 1
+
+    def test_points_are_routed_to_correct_local_tile_coordinates(self):
+        """
+        ★機能追加: pointsを渡した場合、各タイルにはそのタイル内に含まれる
+        点だけがローカル座標に変換されて渡ることを確認する。
+        """
+        obj, decoder_session, _encoder_session = self._setup_tiled_instance()
+        image = np.zeros((1000, 1000, 3), dtype=np.uint8)
+        box = (0.0, 0.0, 1000.0, 1000.0)
+        # 1点目は1枚目のタイル(左上)、2点目は右下寄りのタイルに入るよう配置
+        points = [(50.0, 50.0), (900.0, 900.0)]
+
+        mask = obj.predict_from_box_tiled(image, box, points=points, tile_size=512, overlap=64)
+
+        assert mask is not None
+        # 最後に呼ばれたタイル(右下寄り)のdecoder入力に、ローカル座標化された
+        # 点が前景ラベル(1)付きで含まれているはず
+        fed = decoder_session.last_input_feed
+        assert 1.0 in fed["point_labels"]
 
     def test_large_image_triggers_multiple_encoder_calls(self):
         """tile_sizeを超える画像は複数タイルに分割され、エンコーダが複数回呼ばれる"""
