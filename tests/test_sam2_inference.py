@@ -505,3 +505,36 @@ class TestRemoveSmallRegions:
         mask[5:25, 5:15] = 255  # 200pxの大きな前景ブロック
         result = _remove_small_regions(mask, min_area=10)
         np.testing.assert_array_equal(result, mask)
+
+    def test_fingertip_barely_separated_from_main_blob_is_preserved(self):
+        """
+        ★回帰テスト: 実写データで報告された「指先が検出できなくなる」問題。
+
+        タイル境界の影響で本体(手のひら)からわずか1px程度離れて
+        しまった小さな領域(指先を模したもの)は、それ単体では面積が
+        小さくノイズと区別がつかないが、本体のすぐ近くにあるため
+        クロージング処理で再接続され、誤って除去されないことを確認する。
+        """
+        mask = np.zeros((30, 30), dtype=np.uint8)
+        mask[5:15, 5:15] = 255  # 本体(100px、手のひらを模す)
+        mask[16:19, 8:11] = 255  # 指先を模した小さな領域(9px、本体から1px離れている)
+
+        result = _remove_small_regions(mask, min_area=10, bridge_kernel_size=5)
+
+        # 指先部分が生き残っていることを確認
+        assert result[17, 9] == 255, "本体近くの小さな領域(指先)が誤って除去されてしまった"
+
+    def test_isolated_speckle_far_from_main_blob_is_still_removed(self):
+        """
+        本体から明確に離れた場所にある孤立ノイズは、クロージングでも
+        繋がらず、従来通り除去されることを確認する
+        （クロージング追加によって、ノイズ除去の効果自体は損なわれないことの確認）。
+        """
+        mask = np.zeros((40, 40), dtype=np.uint8)
+        mask[5:15, 5:15] = 255  # 本体(100px)
+        mask[30:33, 30:33] = 255  # 本体から遠く離れた孤立ノイズ(9px)
+
+        result = _remove_small_regions(mask, min_area=10, bridge_kernel_size=5)
+
+        assert result[31, 31] == 0, "本体から遠いノイズが除去されずに残ってしまった"
+        assert result[10, 10] == 255  # 本体は維持される

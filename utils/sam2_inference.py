@@ -436,7 +436,9 @@ class Sam2OnnxInference:
         return list(encoder_outputs.values())[-1]
 
 
-def _remove_small_regions(mask_uint8: np.ndarray, min_area: int) -> np.ndarray:
+def _remove_small_regions(
+    mask_uint8: np.ndarray, min_area: int, bridge_kernel_size: int = 5
+) -> np.ndarray:
     """
     タイル分割の合成結果に残る小さな孤立領域（前景側のノイズ状の小片、
     および背景側の小さな穴）を除去する後処理。
@@ -447,10 +449,22 @@ def _remove_small_regions(mask_uint8: np.ndarray, min_area: int) -> np.ndarray:
     ちょうど閾値をまたいで反転し、逆に小さな断片が増えることがある。
     これを、閾値判定後の連結成分解析で最終的にクリーンアップする。
 
+    ★注意: 単純に「面積が小さい領域を問答無用で除去」すると、指先のように
+    元々細く小さい正しい検出結果まで、本体（手のひら）からタイル境界の
+    影響でわずかに切り離されてしまった場合に、誤ってノイズとして除去して
+    しまう問題があった（実写データで指先の欠落として実際に確認された）。
+    そのため、面積フィルタをかける前に、`bridge_kernel_size`程度の
+    小さな隙間を埋めるモルフォロジー・クロージング（膨張→収縮）を先に
+    適用する。これにより、本体からわずかに（数画素）切り離されただけの
+    指先等は本体と再接続されて生き残る一方、本体から明確に離れた場所に
+    ある孤立ノイズはクロージングでも繋がらず、従来通り除去される。
+
     Args:
         mask_uint8: 0-255 uint8マスク
         min_area: これ未満の面積（画素数）の孤立領域は除去（背景側の穴は
             埋め、前景側の小片は消す）
+        bridge_kernel_size: 隙間を埋めるクロージング処理のカーネルサイズ
+            （ピクセル）。1以下を指定すると無効化できる
 
     Returns:
         クリーンアップ後の0-255 uint8マスク
@@ -459,6 +473,12 @@ def _remove_small_regions(mask_uint8: np.ndarray, min_area: int) -> np.ndarray:
         return mask_uint8
 
     binary = (mask_uint8 > 0).astype(np.uint8)
+
+    if bridge_kernel_size > 1:
+        kernel = cv2.getStructuringElement(
+            cv2.MORPH_ELLIPSE, (bridge_kernel_size, bridge_kernel_size)
+        )
+        binary = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel)
 
     # 前景側の小さな孤立領域を除去
     n_fg, labels_fg, stats_fg, _ = cv2.connectedComponentsWithStats(binary, connectivity=8)
