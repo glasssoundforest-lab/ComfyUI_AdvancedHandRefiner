@@ -1,3 +1,4 @@
+import hashlib
 import logging
 import os
 
@@ -84,6 +85,21 @@ def _get_detector_pipeline(detection_mode: str) -> DetectorPipeline:
     return _pipeline_cache[detection_mode]
 
 
+#: _detect_hands() の検出結果メモ化キャッシュ。
+#: 同一画像・同一パラメータでの再検出を避けるためのもの。
+#: キー: (画像内容のハッシュ, shape, 各種パラメータ)、値: DetectionResult
+_detection_cache: dict[tuple, DetectionResult] = {}
+#: キャッシュに保持する最大件数。超過した場合は最も古いエントリから
+#: 削除する（単純なFIFO。ワークフロー内で同時に扱う画像は通常数枚程度
+#: のため、大きな値にする必要はない）。
+_DETECTION_CACHE_MAX_SIZE = 8
+
+
+def _image_content_hash(image_rgb: np.ndarray) -> str:
+    """画像内容のハッシュ値を計算する（キャッシュキーの一部として使用）"""
+    return hashlib.sha1(image_rgb.tobytes()).hexdigest()
+
+
 def _detect_hands(
     image_rgb: np.ndarray,
     min_detection_confidence: float,
@@ -91,14 +107,50 @@ def _detect_hands(
     sam2_tile_size: int = 512,
     sam2_tile_overlap: int = 64,
 ) -> DetectionResult:
-    """統一検出パイプラインを実行するヘルパー"""
+    """
+    統一検出パイプラインを実行するヘルパー。
+
+    ★パフォーマンス最適化: 複数の手を処理するために
+    `AdvancedHandOrientationOptimizer`/`AdvancedHandMaskRefiner`を
+    `hand_index`を変えて複製したノードチェーンで使う場合、同じ画像に
+    対して同じ検出パイプライン（YOLO+MediaPipe+SAM2）が
+    `hand_index`の数だけ重複して実行されてしまう（検出処理自体は
+    `hand_index`に依存しないため、本来は1回で済むはずの計算）。
+
+    これを避けるため、画像内容（ハッシュ）と検出パラメータの組み合わせを
+    キーとしたプロセス内キャッシュを設け、同一画像・同一パラメータでの
+    再検出を省略する。画像がわずかでも異なれば（別の画像、あるいは
+    前段のノードで加工された結果等）ハッシュ値が変わるため、誤って
+    古い結果を使い回すことはない。
+    """
+    cache_key = (
+        _image_content_hash(image_rgb),
+        image_rgb.shape,
+        round(min_detection_confidence, 6),
+        detection_mode,
+        sam2_tile_size,
+        sam2_tile_overlap,
+    )
+
+    cached = _detection_cache.get(cache_key)
+    if cached is not None:
+        return cached
+
     pipeline = _get_detector_pipeline(detection_mode)
-    return pipeline.run(
+    result = pipeline.run(
         image_rgb,
         min_hand_detection_confidence=min_detection_confidence,
         sam2_tile_size=sam2_tile_size,
         sam2_tile_overlap=sam2_tile_overlap,
     )
+
+    if len(_detection_cache) >= _DETECTION_CACHE_MAX_SIZE:
+        # dictは挿入順序を保持するため、最初のキー(最も古いエントリ)を削除する
+        oldest_key = next(iter(_detection_cache))
+        del _detection_cache[oldest_key]
+
+    _detection_cache[cache_key] = result
+    return result
 
 
 def _select_hand(result: DetectionResult, hand_index: int):
