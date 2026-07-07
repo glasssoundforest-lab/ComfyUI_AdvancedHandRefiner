@@ -110,12 +110,22 @@ class TestSam2RealModelInference:
         assert set(np.unique(mask)).issubset({0, 255})
 
     def test_predict_from_box_tiled_matches_single_call_on_small_image(self, sam2_inference):
-        """tile_size以下の画像では、タイル分割版と通常版が同じ経路(1回のみの推論)を通る"""
+        """
+        tile_size以下の画像では、タイル分割版と通常版は同じ経路(1回のみの
+        推論)を通るが、タイル分割版はさらにデスペックル処理が適用される
+        ため、小さなノイズが除去され得る点が異なる（完全一致は保証しない）。
+        両者の形状・型が一致し、クラッシュしないことを確認する。
+        """
         image = np.zeros((300, 300, 3), dtype=np.uint8)
         box = (50.0, 50.0, 250.0, 250.0)
         mask_normal = sam2_inference.predict_from_box(image, box)
         mask_tiled = sam2_inference.predict_from_box_tiled(image, box, tile_size=512)
-        np.testing.assert_array_equal(mask_normal, mask_tiled)
+
+        assert mask_normal is not None
+        assert mask_tiled is not None
+        assert mask_normal.shape == mask_tiled.shape
+        assert mask_tiled.dtype == np.uint8
+        assert set(np.unique(mask_tiled)).issubset({0, 255})
 
 
 class TestMediaPipeRealModel:

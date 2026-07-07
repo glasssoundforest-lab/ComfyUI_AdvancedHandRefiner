@@ -356,6 +356,38 @@ class TestPredictFromBoxTiled:
         assert mask is not None
         assert mask.shape == (300, 400)
 
+    def test_despeckle_is_applied_even_when_tiling_is_not_triggered(self):
+        """
+        ★回帰テスト: 画像がtile_size以下でタイル分割が発動しない場合でも、
+        despeckle_min_areaによるクリーンアップが適用されることを確認する。
+        タイル分割用に追加したノイズ除去処理が、タイル分割の分岐にしか
+        組み込まれておらず、小さい画像（イラスト調の小さなクロップ等）では
+        一切効いていなかった実写データでの報告を受けての修正。
+        """
+        decoder_names = ["point_coords", "point_labels", "image_embed"]
+        h, w = 80, 80
+        raw_mask = np.full((1, h, w), -3.0, dtype=np.float32)  # 全体背景
+        raw_mask[0, 20:60, 20:60] = 3.0  # 大きな前景ブロック(1600px)
+        raw_mask[0, 5, 5] = 3.0  # 本体から離れた孤立1pxノイズ
+        encoder_outputs = {"image_embed": np.zeros((1, 3))}
+        obj, _decoder_session, _encoder_session = _make_instance(
+            decoder_names, raw_mask, encoder_outputs
+        )
+
+        mask = obj.predict_from_box_tiled(
+            np.zeros((h, w, 3), dtype=np.uint8),
+            box=(20.0, 20.0, 60.0, 60.0),
+            tile_size=512,  # h,w(80)がtile_size以下なのでタイル分割は発動しない
+            despeckle_min_area=10,
+        )
+
+        assert mask is not None
+        assert mask[5, 5] == 0, (
+            "タイル分割が発動しない場合でも、孤立ノイズはデスペックル処理で"
+            "除去されるべき"
+        )
+        assert mask[40, 40] == 255  # 本体は維持される
+
     def test_points_are_routed_to_correct_local_tile_coordinates(self):
         """
         ★機能追加: pointsを渡した場合、各タイルにはそのタイル内に含まれる

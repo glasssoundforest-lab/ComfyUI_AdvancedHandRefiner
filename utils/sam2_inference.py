@@ -217,7 +217,10 @@ class Sam2OnnxInference:
         h, w = image_rgb.shape[:2]
 
         if h <= tile_size and w <= tile_size:
-            return self.predict_from_box(image_rgb, box, points)
+            mask = self.predict_from_box(image_rgb, box, points)
+            if mask is None or despeckle_min_area <= 0:
+                return mask
+            return _remove_small_regions(mask, despeckle_min_area)
 
         x1, y1, x2, y2 = box
         prob_sum = np.zeros((h, w), dtype=np.float32)
@@ -333,7 +336,10 @@ class Sam2OnnxInference:
         h, w = image_rgb.shape[:2]
 
         if h <= tile_size and w <= tile_size:
-            return self.predict_from_points(image_rgb, points)
+            mask = self.predict_from_points(image_rgb, points)
+            if mask is None or despeckle_min_area <= 0:
+                return mask
+            return _remove_small_regions(mask, despeckle_min_area)
 
         prob_sum = np.zeros((h, w), dtype=np.float32)
         weight = np.zeros((h, w), dtype=np.float32)
