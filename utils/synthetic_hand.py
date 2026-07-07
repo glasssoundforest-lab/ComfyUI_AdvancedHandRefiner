@@ -33,6 +33,7 @@ def generate_synthetic_hand_mask(
     spread_angle_deg: float = 110.0,
     base_angle_deg: float = -90.0,
     length_jitter: list[float] | None = None,
+    custom_finger_angles: list[float] | None = None,
 ) -> np.ndarray:
     """
     手のひら（円）+ 指（カプセル形状）から成る、パラメータ制御可能な
@@ -60,6 +61,13 @@ def generate_synthetic_hand_mask(
         base_angle_deg: 指全体の中心方向（度、画像座標系で-90=真上）
         length_jitter: 指ごとの長さの微調整（本物らしいばらつきを
             与えたい場合に使う。指定しなければ全指同じ長さ）
+        custom_finger_angles: 指定した場合、`spread_angle_deg`による
+            自動等間隔配置を無視し、この角度リスト（度）の位置に
+            指を配置する。**AI生成画像で多い「既存の指のすぐ隣に、
+            わずかな隙間で余分な指が生えている」パターンを再現する
+            ために使う**（例: 通常5本の等間隔角度に、1本だけ隣の指との
+            間隔が数度しかない位置を追加する等）。`num_fingers`は
+            このリストの長さに合わせて自動調整される
 
     Returns:
         (H, W) の0-255 uint8マスク
@@ -69,12 +77,17 @@ def generate_synthetic_hand_mask(
     missing = set(missing_fingers or [])
     fused_pairs = fused_pairs or []
 
+    if custom_finger_angles is not None:
+        num_fingers = len(custom_finger_angles)
+
     cx, cy = w / 2.0, h * 0.75  # 手のひら中心(画像下寄り)
 
     # 手のひら
     cv2.circle(mask, (int(cx), int(cy)), int(palm_radius), 255, -1)
 
-    if num_fingers <= 1:
+    if custom_finger_angles is not None:
+        angles = list(custom_finger_angles)
+    elif num_fingers <= 1:
         angles = [base_angle_deg]
     else:
         start = base_angle_deg - spread_angle_deg / 2.0

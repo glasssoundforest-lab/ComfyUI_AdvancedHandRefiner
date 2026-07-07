@@ -11,7 +11,11 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
-from utils.hand_quality import estimate_finger_count, finger_count_mismatch
+from utils.hand_quality import (
+    estimate_finger_count,
+    estimate_finger_count_radial,
+    finger_count_mismatch,
+)
 from utils.synthetic_hand import generate_synthetic_hand_mask
 
 
@@ -81,3 +85,59 @@ class TestFingerCountMismatch:
     def test_extra_fingers_returns_positive_mismatch(self):
         mask = generate_synthetic_hand_mask(num_fingers=7, spread_angle_deg=140)
         assert finger_count_mismatch(mask, expected_fingers=5) == 2
+
+
+class TestExtraFingerInsertedAmongExistingOnes:
+    """
+    ★重要な既知の限界（2026-07-07、ユーザー指摘を受けた追加検証）:
+    AI生成画像で典型的な「既存の指のすぐ隣に、わずかな隙間で余分な指が
+    生えている」パターン（指全体を広く均等に6本へ再配置するのではなく、
+    既存の5本の間に1本だけ割り込ませる、より現実的なパターン）を検証した。
+
+    結論: `estimate_finger_count()`（凸包の凹みベース）・
+    `estimate_finger_count_radial()`（放射状プロファイルベース）の
+    どちらも、この現実的な「際どい間隔での余分指」を正しく検出できない
+    ことを実測で確認した。これらのテストは「正しく検出できる」ことを
+    検証するものではなく、**現時点での実際の（不完全な）挙動を固定し、
+    将来のアルゴリズム改善の効果を測定できるようにする**ためのもの。
+    """
+
+    def _make_extra_finger_mask(self, gap_deg: float) -> np.ndarray:
+        base_angle_deg = -90.0
+        spread_angle_deg = 110.0
+        step = spread_angle_deg / 4
+        normal_angles = [base_angle_deg - spread_angle_deg / 2 + i * step for i in range(5)]
+        extra_angle = normal_angles[2] + gap_deg
+        angles = normal_angles[:3] + [extra_angle] + normal_angles[3:]
+        return generate_synthetic_hand_mask(custom_finger_angles=angles)
+
+    @pytest.mark.parametrize("gap_deg", [3, 6, 9, 12, 13.75, 15, 18, 21, 24])
+    def test_convex_hull_method_does_not_reliably_detect_tight_extra_finger(self, gap_deg):
+        """
+        正解は6本だが、凸包ベースの手法はどの隙間でも6本と推定できない
+        （4本または5本になる）。しきい値の調整だけでは解決しないことも
+        別途確認済み（感度を上げると今度は過剰カウント(7〜8本)になる）。
+        """
+        mask = self._make_extra_finger_mask(gap_deg)
+        estimated = estimate_finger_count(mask)
+        assert estimated != 6  # 現状の(不完全な)挙動を固定する
+        assert estimated in (4, 5)
+
+    def test_normal_five_finger_hand_is_still_detected_correctly_by_both_methods(self):
+        """比較対象として、余分指が無い正常な5本指では両手法とも
+        正しく5本と推定できることを確認する（機能自体は壊れていない）"""
+        mask = generate_synthetic_hand_mask()
+        assert estimate_finger_count(mask) == 5
+        assert estimate_finger_count_radial(mask) == 5
+
+    def test_widely_respread_extra_finger_is_detected_correctly(self):
+        """
+        対照実験: 6本指**全体**を広く均等に再配置した場合（既存の指の
+        間に割り込ませるのではなく、手全体を6本分に広げ直した場合）は、
+        凸包ベースの手法で正しく6本と検出できる（既存テストで確認済みの
+        「指3〜7本の正常なケース」を再掲）。つまり問題は「指の本数を
+        数えること」自体ではなく、「間隔が狭い場合に個々の指を分離
+        できないこと」に起因する。
+        """
+        mask = generate_synthetic_hand_mask(num_fingers=6, spread_angle_deg=140)
+        assert estimate_finger_count(mask) == 6
