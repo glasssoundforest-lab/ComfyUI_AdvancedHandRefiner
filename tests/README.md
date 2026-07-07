@@ -42,6 +42,9 @@ pytest
 | `test_nodes_batch_and_mode.py` | `nodes.py`(バッチ処理、`detection_mode`実行モード選択) |
 | `test_mask_refine.py` | `utils/mask_refine.py`(`soften_wrist_boundary`の最適化前後の数値的同一性、境界値) |
 | `test_lazy_model_download.py` | `utils/detectors/{yolo,sam2}_detector.py`(`is_available()`の初回自動取得ロジック) |
+| `test_mediapipe_detector.py` | `utils/detectors/mediapipe_detector.py`(生の検出結果→共通型への変換ロジック) |
+| `test_yolo_detector.py` | `utils/detectors/yolo_detector.py`(生の検出結果→共通型への変換ロジック) |
+| `test_sam2_detector.py` | `utils/detectors/sam2_detector.py`(bbox+landmarks併用時の安全策、ランドマーク信頼領域) |
 | `test_comfyui_style_import.py` | ★重要: ComfyUI本体の実際の読み込み処理を再現し、プラグイン全体が正しくimportできるかを検証（相対/絶対importの不整合を検出する回帰テスト） |
 | `test_integration_real_models.py` | **Phase 2**: 実際のSAM2 ONNXモデル・MediaPipeモデルを使った統合テスト（実モデルファイルが無い/mediapipe未インストールの環境では自動スキップ） |
 
