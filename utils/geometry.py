@@ -66,6 +66,17 @@ def compute_rotation_angle(landmarks: list[tuple[float, float]]) -> float:
     Returns:
         回転角度（度）。cv2.getRotationMatrix2D にそのまま渡せる符号。
     """
+    # ★重大な見落としの修正（2026-07-07、コードベース総点検で発見）:
+    # landmarksが空リスト、あるいはMIDDLE_FINGER_MCP_IDX(9)に届かない
+    # ほど短いリストの場合、下の`landmarks[WRIST_IDX]`等が未処理の
+    # IndexErrorでクラッシュしてしまうことが実際に確認された
+    # （`selected.landmarks is None`のチェックだけでは、Noneではない
+    # 空リスト等をすり抜けてしまう）。方向が定まらない以上、回転しない
+    # (角度0)ことが最も安全なフォールバックであるため、他の退化ケース
+    # （手首と中指付け根が同一点）と同じ方針でガードする。
+    if len(landmarks) <= max(WRIST_IDX, MIDDLE_FINGER_MCP_IDX):
+        return 0.0
+
     wrist = landmarks[WRIST_IDX]
     middle_mcp = landmarks[MIDDLE_FINGER_MCP_IDX]
 

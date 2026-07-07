@@ -179,3 +179,32 @@ class TestParameterBoundaryValues:
         assert result.dtype == np.uint8
         # 完全に消えたり全面前景になったりしていないことの簡易チェック
         assert 0 < int(np.count_nonzero(result > 127)) < h * w
+
+
+class TestDefensiveGuardsForShortLandmarks:
+    """
+    ★重大な見落としの回帰テスト（2026-07-07、コードベース総点検で発見）:
+    landmarks_pxが空リスト等、必要なインデックスに届かないほど短い
+    場合、以前はsharpen_finger_contours/soften_wrist_boundaryの両方が
+    未処理のIndexErrorでクラッシュしていた。呼び出し元(nodes.py)の
+    `selected.landmarks is None`チェックだけではNoneではない空リスト
+    等をすり抜けてしまうため、関数自身での防御が重要である。
+    """
+
+    def test_sharpen_finger_contours_with_empty_landmarks_returns_input_unchanged(self):
+        mask = np.zeros((50, 50), dtype=np.uint8)
+        mask[20:30, 20:30] = 255
+        result = sharpen_finger_contours(mask, [], finger_sharpness=1.0)
+        np.testing.assert_array_equal(result, mask)
+
+    def test_sharpen_finger_contours_with_short_landmarks_returns_input_unchanged(self):
+        mask = np.zeros((50, 50), dtype=np.uint8)
+        mask[20:30, 20:30] = 255
+        result = sharpen_finger_contours(mask, [(0.0, 0.0)] * 10, finger_sharpness=1.0)
+        np.testing.assert_array_equal(result, mask)
+
+    def test_soften_wrist_boundary_with_empty_landmarks_returns_input_unchanged(self):
+        mask = np.zeros((50, 50), dtype=np.uint8)
+        mask[20:30, 20:30] = 255
+        result = soften_wrist_boundary(mask, [], wrist_blur=15)
+        np.testing.assert_array_equal(result, mask)

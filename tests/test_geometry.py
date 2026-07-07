@@ -228,3 +228,24 @@ class TestInverseTransformRoundTrip:
         recovered = geometry.inverse_transform_point(rotated_point, remap_info)
         assert recovered[0] == pytest.approx(point[0], abs=1e-3)
         assert recovered[1] == pytest.approx(point[1], abs=1e-3)
+
+
+class TestComputeRotationAngleDefensiveGuards:
+    """
+    ★重大な見落としの回帰テスト（2026-07-07、コードベース総点検で発見）:
+    landmarksが空リスト、あるいは必要なインデックスに届かないほど
+    短いリストの場合、以前は未処理のIndexErrorでクラッシュしていた。
+    呼び出し元(nodes.py)の`selected.landmarks is None`チェックだけでは
+    Noneではない空リスト等をすり抜けてしまうため、関数自身での防御が
+    重要である。
+    """
+
+    def test_empty_landmarks_returns_zero_instead_of_crashing(self):
+        assert geometry.compute_rotation_angle([]) == 0.0
+
+    def test_single_point_returns_zero_instead_of_crashing(self):
+        assert geometry.compute_rotation_angle([(10.0, 20.0)]) == 0.0
+
+    def test_landmarks_shorter_than_required_index_returns_zero(self):
+        # MIDDLE_FINGER_MCP_IDX(9)に届かない5点のみ
+        assert geometry.compute_rotation_angle([(0.0, 0.0)] * 5) == 0.0

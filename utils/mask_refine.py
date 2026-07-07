@@ -64,6 +64,17 @@ def sharpen_finger_contours(
     if finger_sharpness <= 0.0:
         return coarse_mask
 
+    # ★重大な見落としの修正（2026-07-07、コードベース総点検で発見）:
+    # landmarks_pxが空リスト等、FINGER_CHAINSが必要とする最大インデックス
+    # (20、小指の先端)に届かないほど短い場合、下の`landmarks_px[...]`が
+    # 未処理のIndexErrorでクラッシュしてしまうことが実際に確認された。
+    # 呼び出し元(nodes.py)の`selected.landmarks is None`チェックだけでは
+    # Noneではない空リスト等をすり抜けてしまうため、ここでも防御する。
+    # 補正できない以上、粗いマスクをそのまま返すのが最も安全なフォール
+    # バックである。
+    if len(landmarks_px) < 21:
+        return coarse_mask
+
     # 指の太さは、手のスケール（手首〜中指付け根の距離）から推定する。
     # 経験的に、指の太さは手首〜中指MCP距離のおよそ0.35倍程度になることが多い。
     wrist = np.array(landmarks_px[WRIST_IDX])
@@ -123,6 +134,14 @@ def soften_wrist_boundary(
         補正後マスク（0-255, uint8, 同shape）
     """
     if wrist_blur <= 1:
+        return mask
+
+    # ★重大な見落としの修正（2026-07-07、コードベース総点検で発見）:
+    # landmarks_pxが空リストの場合、下の`landmarks_px[WRIST_IDX]`が
+    # 未処理のIndexErrorでクラッシュしてしまうことが実際に確認された。
+    # 補正できない以上、元maskをそのまま返すのが最も安全なフォール
+    # バックである。
+    if len(landmarks_px) <= WRIST_IDX:
         return mask
 
     ksize = wrist_blur if wrist_blur % 2 == 1 else wrist_blur + 1
