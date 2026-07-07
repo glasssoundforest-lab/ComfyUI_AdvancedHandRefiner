@@ -1190,11 +1190,34 @@ class AdvancedHandAutoFixer:
         importとなり混乱を招く。関数内での遅延importにすることで、
         実際にこのメソッドが呼ばれるまで（＝本物のComfyUI環境で
         実行されるまで）このimportを遅らせている。
+        ★8の倍数へのパディングについて: `image_crop_rgb`のサイズ
+        （`compute_padded_bbox`で計算された、ランドマークの外接矩形+
+        paddingの結果）は、8の倍数になる保証が無い。多くの拡散モデルの
+        VAEは内部で8倍のダウンサンプリング/アップサンプリングを行う
+        ため、入力サイズが8の倍数でないと、エンコード・デコードで
+        誤差や不整合が生じる可能性がある。そのため、実際にエンコード
+        する前に画像・マスクを8の倍数のサイズまで右・下方向にパディング
+        し、デコード後に元のサイズへ切り戻す。
         """
         import nodes as comfy_nodes  # ComfyUI本体のnodes.py（遅延import）
 
-        image_tensor = _numpy_rgb_to_tensor(image_crop_rgb)
-        mask_tensor = _numpy_mask_to_tensor(coarse_mask)
+        orig_h, orig_w = image_crop_rgb.shape[:2]
+        pad_h = (8 - orig_h % 8) % 8
+        pad_w = (8 - orig_w % 8) % 8
+
+        if pad_h > 0 or pad_w > 0:
+            padded_image = cv2.copyMakeBorder(
+                image_crop_rgb, 0, pad_h, 0, pad_w, cv2.BORDER_REPLICATE
+            )
+            padded_mask = cv2.copyMakeBorder(
+                coarse_mask, 0, pad_h, 0, pad_w, cv2.BORDER_CONSTANT, value=0
+            )
+        else:
+            padded_image = image_crop_rgb
+            padded_mask = coarse_mask
+
+        image_tensor = _numpy_rgb_to_tensor(padded_image)
+        mask_tensor = _numpy_mask_to_tensor(padded_mask)
 
         vae_encode_inpaint = comfy_nodes.VAEEncodeForInpaint()
         (latent,) = vae_encode_inpaint.encode(vae, image_tensor, mask_tensor, grow_mask_by)
@@ -1215,4 +1238,7 @@ class AdvancedHandAutoFixer:
         vae_decode = comfy_nodes.VAEDecode()
         (decoded_image,) = vae_decode.decode(vae, sampled_latent)
 
-        return _tensor_to_numpy_rgb(decoded_image, 0)
+        decoded_rgb = _tensor_to_numpy_rgb(decoded_image, 0)
+        if pad_h > 0 or pad_w > 0:
+            decoded_rgb = decoded_rgb[:orig_h, :orig_w]
+        return decoded_rgb

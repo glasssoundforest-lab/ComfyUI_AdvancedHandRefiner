@@ -17,6 +17,8 @@ tests/test_nodes_auto_fixer.py — nodes.py の AdvancedHandAutoFixer（Phase 7�
 
 from __future__ import annotations
 
+import sys
+import types
 from unittest.mock import patch
 
 import numpy as np
@@ -279,3 +281,109 @@ class TestAdvancedHandAutoFixerControlFlow:
             )
         assert isinstance(image, nodes.torch.Tensor)
         assert isinstance(report, str)
+
+
+def _make_fake_comfy_nodes_module(captured: dict):
+    """
+    ComfyUI本体の `nodes` モジュール（VAEEncodeForInpaint/common_ksampler/
+    VAEDecode）を模したフェイクモジュールを作る。`_run_inpaint_sampling`が
+    内部で行う `import nodes as comfy_nodes` をこのフェイクに差し替えて、
+    8の倍数へのパディング処理自体を直接検証するために使う。
+    """
+    fake = types.ModuleType("nodes")
+
+    class FakeVAEEncodeForInpaint:
+        def encode(self, vae, pixels, mask, grow_mask_by):
+            captured["encode_pixels_shape"] = tuple(pixels.shape)
+            captured["encode_mask_shape"] = tuple(mask.shape)
+            return ({"samples": "fake_latent"},)
+
+    def fake_common_ksampler(
+        model, seed, steps, cfg, sampler_name, scheduler, positive, negative, latent, denoise=1.0
+    ):
+        captured["ksampler_called"] = True
+        return (latent,)
+
+    class FakeVAEDecode:
+        def decode(self, vae, samples):
+            _, h, w, _ = captured["encode_pixels_shape"]
+            img = np.zeros((1, h, w, 3), dtype=np.float32)
+            return (nodes.torch.from_numpy(img),)
+
+    fake.VAEEncodeForInpaint = FakeVAEEncodeForInpaint
+    fake.common_ksampler = fake_common_ksampler
+    fake.VAEDecode = FakeVAEDecode
+    return fake
+
+
+class TestRunInpaintSamplingPadding:
+    """
+    ★VAE互換性の改善(2026-07-07): compute_padded_bbox()で計算される
+    クロップサイズは8の倍数になる保証が無いが、多くの拡散モデルのVAEは
+    8倍のダウン/アップサンプリングを内部で行うため、入力サイズが8の倍数
+    でないと誤差や不整合が生じ得る。_run_inpaint_sampling()が実際に
+    8の倍数へパディングしてからエンコードし、デコード後に元のサイズへ
+    切り戻していることを、ComfyUI本体のnodesモジュールをフェイクに
+    差し替えて直接検証する。
+    """
+
+    def test_non_multiple_of_8_crop_is_padded_before_encoding(self):
+        fixer = nodes.AdvancedHandAutoFixer()
+        captured: dict = {}
+        fake_module = _make_fake_comfy_nodes_module(captured)
+
+        image_crop = np.zeros((37, 53, 3), dtype=np.uint8)  # 8の倍数でないサイズ
+        mask = np.zeros((37, 53), dtype=np.uint8)
+
+        with patch.dict(sys.modules, {"nodes": fake_module}):
+            result = fixer._run_inpaint_sampling(
+                model=None,
+                positive=None,
+                negative=None,
+                vae=None,
+                image_crop_rgb=image_crop,
+                coarse_mask=mask,
+                seed=0,
+                steps=1,
+                cfg=1.0,
+                sampler_name="euler",
+                scheduler="normal",
+                denoise=1.0,
+                grow_mask_by=6,
+            )
+
+        # エンコード時に渡された画像は8の倍数のサイズになっているはず
+        assert captured["encode_pixels_shape"][1] % 8 == 0
+        assert captured["encode_pixels_shape"][2] % 8 == 0
+        assert captured["encode_mask_shape"][1] % 8 == 0
+        assert captured["encode_mask_shape"][2] % 8 == 0
+        # 最終的な出力は元のクロップサイズに戻っているはず
+        assert result.shape[:2] == (37, 53)
+
+    def test_already_multiple_of_8_crop_is_not_padded(self):
+        fixer = nodes.AdvancedHandAutoFixer()
+        captured: dict = {}
+        fake_module = _make_fake_comfy_nodes_module(captured)
+
+        image_crop = np.zeros((64, 48, 3), dtype=np.uint8)  # 既に8の倍数
+        mask = np.zeros((64, 48), dtype=np.uint8)
+
+        with patch.dict(sys.modules, {"nodes": fake_module}):
+            result = fixer._run_inpaint_sampling(
+                model=None,
+                positive=None,
+                negative=None,
+                vae=None,
+                image_crop_rgb=image_crop,
+                coarse_mask=mask,
+                seed=0,
+                steps=1,
+                cfg=1.0,
+                sampler_name="euler",
+                scheduler="normal",
+                denoise=1.0,
+                grow_mask_by=6,
+            )
+
+        assert captured["encode_pixels_shape"][1:3] == (64, 48)
+        assert result.shape[:2] == (64, 48)
