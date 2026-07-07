@@ -80,6 +80,120 @@ def estimate_finger_count(
     return significant_defects + 1
 
 
+def _morphological_skeleton(binary: np.ndarray) -> np.ndarray:
+    """
+    標準的なcv2機能（erode/dilate/subtract）のみを使った、反復的な
+    モルフォロジー骨格化。`cv2.ximgproc`（opencv-contrib-pythonが別途
+    必要）や`skimage`（未依存のライブラリ）を使わずに実装することで、
+    ComfyUIが標準的に提供する`opencv-python`環境だけで動作するように
+    している。
+
+    Args:
+        binary: 0/1または0/255の2値画像（uint8）
+
+    Returns:
+        0/255の骨格化された2値画像
+    """
+    img = (binary > 0).astype(np.uint8) * 255
+    skeleton = np.zeros_like(img)
+    kernel = cv2.getStructuringElement(cv2.MORPH_CROSS, (3, 3))
+
+    # 画像が全て消えるまで「侵食→膨張で戻す→元との差分を骨格に加える」
+    # を繰り返す、標準的なモルフォロジー骨格化アルゴリズム。
+    for _ in range(max(img.shape) * 2):  # 安全のための上限回数
+        eroded = cv2.erode(img, kernel)
+        opened = cv2.dilate(eroded, kernel)
+        temp = cv2.subtract(img, opened)
+        skeleton = cv2.bitwise_or(skeleton, temp)
+        img = eroded
+        if cv2.countNonZero(img) == 0:
+            break
+
+    return skeleton
+
+
+def estimate_finger_count_skeleton(
+    mask: np.ndarray,
+    min_endpoint_distance_ratio: float = 0.35,
+    endpoint_merge_radius_ratio: float = 0.12,
+) -> int:
+    """
+    骨格化（モルフォロジー骨格）による指本数推定。凸包の凹みベース
+    （`estimate_finger_count`）・放射状プロファイルベース
+    （`estimate_finger_count_radial`）のどちらも、既存の指のすぐ隣に
+    わずかな隙間で挿入された余分な指を検出できないことが実測で
+    確認されたため、第三のアプローチとして試す。
+
+    骨格上で「隣接する骨格画素が1個以下」の点を端点（endpoint）として
+    検出する。各指の先端は独立した端点になるはずなので、手のひら重心
+    から十分離れた（`min_endpoint_distance_ratio`以上の）端点の数を
+    指の本数とみなす。近接する端点同士（同じ指の先端付近で複数の端点が
+    生じるノイズ）は`endpoint_merge_radius_ratio`以内であればまとめて
+    1本として数える。
+
+    Args:
+        mask: 0-255 uint8マスク
+        min_endpoint_distance_ratio: 手のひら重心からの距離が、
+            マスク全体のバウンディングボックス対角線に対してこの比率
+            未満の端点は、指先ではなく手のひら内部のノイズとみなして
+            除外する
+        endpoint_merge_radius_ratio: この比率（対角線に対する）以内に
+            ある端点同士は同一の指とみなして統合する
+
+    Returns:
+        推定される指の本数（0〜）
+    """
+    binary = (mask > 0).astype(np.uint8)
+    ys, xs = np.where(binary > 0)
+    if len(xs) == 0:
+        return 0
+
+    x0, y0, w0, h0 = cv2.boundingRect(np.column_stack([xs, ys]))
+    diag = float(np.hypot(w0, h0))
+    if diag <= 0:
+        return 0
+
+    # 手のひら重心の近似(手首側=バウンディングボックス下端寄り)
+    palm_cx = x0 + w0 / 2.0
+    palm_cy = y0 + h0 * 0.85
+
+    skeleton = _morphological_skeleton(binary * 255)
+    sk = (skeleton > 0).astype(np.uint8)
+
+    # 3x3近傍の骨格画素数(自分自身を除く)を数え、1個以下なら端点とする
+    neighbor_count = cv2.filter2D(sk, ddepth=cv2.CV_8U, kernel=np.ones((3, 3), np.uint8))
+    neighbor_count = neighbor_count - sk  # 自分自身の分を引く
+    endpoints_mask = (sk > 0) & (neighbor_count <= 1)
+    endpoint_ys, endpoint_xs = np.where(endpoints_mask)
+
+    if len(endpoint_xs) == 0:
+        return 0
+
+    # 手のひら重心から十分離れた端点だけを「指先候補」として残す
+    dists = np.hypot(endpoint_xs - palm_cx, endpoint_ys - palm_cy)
+    min_dist = min_endpoint_distance_ratio * diag
+    far_mask = dists >= min_dist
+    fx, fy = endpoint_xs[far_mask], endpoint_ys[far_mask]
+
+    if len(fx) == 0:
+        return 0
+
+    # 近接する端点同士をまとめて1本として数える(単純な貪欲クラスタリング)
+    merge_dist = endpoint_merge_radius_ratio * diag
+    points = list(zip(fx.tolist(), fy.tolist()))
+    clusters: list[tuple[float, float]] = []
+    for px, py in points:
+        matched = False
+        for i, (cx, cy) in enumerate(clusters):
+            if math.hypot(px - cx, py - cy) <= merge_dist:
+                matched = True
+                break
+        if not matched:
+            clusters.append((px, py))
+
+    return len(clusters)
+
+
 def finger_count_mismatch(mask: np.ndarray, expected_fingers: int = 5, **kwargs) -> int:
     """
     estimate_finger_count()の結果が、期待する本数（通常5）からどれだけ

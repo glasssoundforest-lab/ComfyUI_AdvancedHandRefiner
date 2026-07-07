@@ -14,6 +14,7 @@ import pytest
 from utils.hand_quality import (
     estimate_finger_count,
     estimate_finger_count_radial,
+    estimate_finger_count_skeleton,
     finger_count_mismatch,
 )
 from utils.synthetic_hand import generate_synthetic_hand_mask
@@ -141,3 +142,76 @@ class TestExtraFingerInsertedAmongExistingOnes:
         """
         mask = generate_synthetic_hand_mask(num_fingers=6, spread_angle_deg=140)
         assert estimate_finger_count(mask) == 6
+
+
+class TestEstimateFingerCountSkeleton:
+    """
+    ★Phase6: 骨格化（モルフォロジー骨格）ベースの第三の指本数推定手法。
+    凸包の凹みベース(`estimate_finger_count`)・放射状プロファイルベース
+    (`estimate_finger_count_radial`)のどちらも「既存の指のすぐ隣に
+    わずかな隙間で挿入された余分な指」を検出できなかったため、追加で
+    試した。
+
+    結論（重要）: 骨格化ベースの手法は、他の2手法が一度も検出できな
+    かった「際どい間隔の余分な指」を、一定以上の間隔（隣接指本来の
+    間隔の約半分以上）であれば検出できることを確認した。ただし
+    その代わりに、**癒着の検出については逆に不得意**（癒着部分の
+    骨格分岐がノイズとなり、どのパラメータでも正しく検出できない）
+    であることも判明した。
+
+    つまり3手法はそれぞれ異なる得意・不得意を持ち、**単一の万能な
+    指標は存在しない**。Phase 7で品質判定ロジックを実装する際は、
+    複数の手法を組み合わせる（アンサンブル）方針が必要になる。
+    """
+
+    def _make_extra_finger_mask(self, gap_deg: float) -> np.ndarray:
+        base_angle_deg = -90.0
+        spread_angle_deg = 110.0
+        step = spread_angle_deg / 4
+        normal_angles = [base_angle_deg - spread_angle_deg / 2 + i * step for i in range(5)]
+        extra_angle = normal_angles[2] + gap_deg
+        angles = normal_angles[:3] + [extra_angle] + normal_angles[3:]
+        return generate_synthetic_hand_mask(custom_finger_angles=angles)
+
+    @pytest.mark.parametrize("num_fingers", [3, 4, 5, 6])
+    def test_normal_finger_counts_are_estimated_accurately(self, num_fingers):
+        spread = 110.0 if num_fingers <= 5 else 140.0
+        mask = generate_synthetic_hand_mask(num_fingers=num_fingers, spread_angle_deg=spread)
+        assert estimate_finger_count_skeleton(mask) == num_fingers
+
+    @pytest.mark.parametrize("missing_index", [0, 1, 2, 3, 4])
+    def test_missing_finger_reduces_estimated_count_by_one(self, missing_index):
+        mask = generate_synthetic_hand_mask(num_fingers=5, missing_fingers=[missing_index])
+        assert estimate_finger_count_skeleton(mask) == 4
+
+    @pytest.mark.parametrize("gap_deg", [13.75, 15, 18, 21, 24])
+    def test_detects_extra_finger_when_gap_is_at_least_half_normal_spacing(self, gap_deg):
+        """
+        ★他の2手法では一度も検出できなかったケース: 隣接指本来の間隔
+        (27.5度)の約半分(13.75度)以上の隙間があれば、骨格化ベースの
+        手法は正しく6本と検出できる。
+        """
+        mask = self._make_extra_finger_mask(gap_deg)
+        assert estimate_finger_count_skeleton(mask) == 6
+
+    @pytest.mark.parametrize("gap_deg", [3, 6, 9, 12])
+    def test_still_fails_for_very_tight_extra_finger_gaps(self, gap_deg):
+        """
+        既知の限界: 隙間が非常に狭い(半分未満)場合は、骨格化ベースの
+        手法でもまだ6本と検出できない。現状の(不完全な)挙動を固定する。
+        """
+        mask = self._make_extra_finger_mask(gap_deg)
+        assert estimate_finger_count_skeleton(mask) != 6
+
+    @pytest.mark.parametrize("pair", [(0, 1), (1, 2), (2, 3), (3, 4)])
+    def test_known_limitation_fusion_detection_does_not_work_with_skeleton_method(self, pair):
+        """
+        ★重要な既知の限界: 骨格化ベースの手法は、癒着した指の
+        検出については、凸包ベースの手法(`estimate_finger_count`)とは
+        異なり正しく機能しない（癒着部分の骨格分岐がノイズとなり、
+        4本への減少を検出できない）。この現状の挙動を固定し、
+        「癒着検出には凸包ベース、際どい余分指の検出には骨格化ベース」
+        という使い分けが必要であることを示す回帰テストとする。
+        """
+        mask = generate_synthetic_hand_mask(num_fingers=5, fused_pairs=[pair], fusion_ratio=0.85)
+        assert estimate_finger_count_skeleton(mask) != 4
