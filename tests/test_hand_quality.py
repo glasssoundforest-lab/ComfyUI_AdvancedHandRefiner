@@ -224,6 +224,36 @@ class TestEstimateFingerCountSkeleton:
         mask = generate_synthetic_hand_mask(num_fingers=5, fused_pairs=[pair], fusion_ratio=0.85)
         assert estimate_finger_count_skeleton(mask) != 4
 
+    def test_denoise_preprocessing_reduces_overcounting_on_noisy_contours(self):
+        """
+        ★実データでの精度改善(2026-07-07): 実際のイラスト（指を握り込んだ
+        ポーズ）に適用すると、輪郭のギザギザ・小さな枝分かれが骨格化時に
+        ノイズとして現れ、指の本数を過大に推定してしまうことが確認された。
+        この検証では、正常な5本指マスクの輪郭に人工的なギザギザノイズを
+        加え、denoise_kernel_ratio(デフォルト有効)による前処理が、
+        前処理無しの場合と比べて過大カウントを緩和することを確認する。
+        """
+        mask = generate_synthetic_hand_mask()
+        noisy = mask.copy()
+        rng = np.random.default_rng(42)
+        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
+        contour_pts = contours[0].reshape(-1, 2)
+        for _ in range(40):
+            idx = rng.integers(0, len(contour_pts))
+            x, y = contour_pts[idx]
+            cv2.circle(noisy, (int(x), int(y)), 2, 255, -1)
+
+        est_without_denoise = estimate_finger_count_skeleton(noisy, denoise_kernel_ratio=0)
+        est_with_denoise = estimate_finger_count_skeleton(noisy)  # デフォルト値を使用
+
+        assert est_with_denoise < est_without_denoise
+
+    def test_denoise_kernel_ratio_zero_disables_preprocessing(self):
+        """denoise_kernel_ratio=0を指定すると、前処理を行わない従来の挙動になることを確認する"""
+        mask = generate_synthetic_hand_mask()
+        # 前処理無効時と、ノイズの無い綺麗なマスクでの通常結果は一致するはず
+        assert estimate_finger_count_skeleton(mask, denoise_kernel_ratio=0) == 5
+
 
 class TestAssessHandQualityEnsemble:
     """

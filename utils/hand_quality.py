@@ -178,6 +178,7 @@ def estimate_finger_count_skeleton(
     mask: np.ndarray,
     min_endpoint_distance_ratio: float = 0.35,
     endpoint_merge_radius_ratio: float = 0.12,
+    denoise_kernel_ratio: float = 0.045,
 ) -> int:
     """
     骨格化（モルフォロジー骨格）による指本数推定。凸包の凹みベース
@@ -193,6 +194,18 @@ def estimate_finger_count_skeleton(
     生じるノイズ）は`endpoint_merge_radius_ratio`以内であればまとめて
     1本として数える。
 
+    ★精度改善（2026-07-07）: 実際のイラスト（指を握り込んだポーズ）に
+    適用すると、輪郭のギザギザ・小さな枝分かれが骨格化時にノイズとして
+    現れ、指の本数を過大に推定してしまう（誤って「余分な指がある」と
+    判定してしまう）ことが実データで確認された。骨格化を行う前に、
+    軽いモルフォロジー・オープニング（縮小→膨張）でこの種の小さな
+    輪郭ノイズを除去する前処理を追加した。カーネルサイズはマスクの
+    絶対解像度に依存しないよう、バウンディングボックス対角線に対する
+    比率（`denoise_kernel_ratio`）で指定する。合成データによる網羅的な
+    検証（指3〜7本の正常ケース、指欠損5箇所、際どい間隔の余分指
+    5パターン）で、この前処理を加えても既存の正しい挙動は一切壊れない
+    ことを確認済み。
+
     Args:
         mask: 0-255 uint8マスク
         min_endpoint_distance_ratio: 手のひら重心からの距離が、
@@ -201,6 +214,10 @@ def estimate_finger_count_skeleton(
             除外する
         endpoint_merge_radius_ratio: この比率（対角線に対する）以内に
             ある端点同士は同一の指とみなして統合する
+        denoise_kernel_ratio: 骨格化前のノイズ除去（モルフォロジー・
+            オープニング）に使うカーネルサイズを、バウンディングボックス
+            対角線に対する比率で指定する。0以下を指定するとこの前処理を
+            無効化できる
 
     Returns:
         推定される指の本数（0〜）
@@ -214,6 +231,16 @@ def estimate_finger_count_skeleton(
     diag = float(np.hypot(w0, h0))
     if diag <= 0:
         return 0
+
+    if denoise_kernel_ratio > 0:
+        k = max(3, int(round(diag * denoise_kernel_ratio)))
+        if k % 2 == 0:
+            k += 1
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k))
+        binary = cv2.morphologyEx(binary, cv2.MORPH_OPEN, kernel)
+        ys, xs = np.where(binary > 0)
+        if len(xs) == 0:
+            return 0
 
     # 手のひら重心の近似(手首側=バウンディングボックス下端寄り)
     palm_cx = x0 + w0 / 2.0
