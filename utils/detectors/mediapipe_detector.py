@@ -64,6 +64,12 @@ class MediaPipeHandDetector(HandDetector):
 
         for i, raw_landmarks in enumerate(raw_result.hand_landmarks):
             landmarks_px = [(lm.x * w, lm.y * h) for lm in raw_landmarks]
+            # ★2026-07-09追加: MediaPipeはx,yに加えてz（奥行き、手首を原点と
+            # した相対深度でxと概ね同スケール）も出力するが、従来はここで
+            # 捨てられていた。手の向き（カメラに対する傾き）による指の
+            # 自然な短縮・オクルージョンと、実際の指の欠損/変形を区別する
+            # ために保持する（`assess_landmark_plausibility`で使用）。
+            landmarks_3d_px = [(lm.x * w, lm.y * h, lm.z * w) for lm in raw_landmarks]
 
             xs = [p[0] for p in landmarks_px]
             ys = [p[1] for p in landmarks_px]
@@ -80,6 +86,7 @@ class MediaPipeHandDetector(HandDetector):
                 HandDetection(
                     bbox=bbox,
                     landmarks=landmarks_px,
+                    landmarks_3d=landmarks_3d_px,
                     mask=None,
                     confidence=confidence,
                     source=self.name,

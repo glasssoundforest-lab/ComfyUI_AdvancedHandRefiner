@@ -63,6 +63,16 @@ class HandDetection:
     Attributes:
         bbox: バウンディングボックス（YOLO・MediaPipe両方から得られる）
         landmarks: 21点のランドマーク座標 [(x, y), ...]（MediaPipe由来）
+        landmarks_3d: 21点のランドマーク座標に奥行き(z)を加えたもの
+            [(x, y, z), ...]（MediaPipe由来。x/yは`landmarks`と同じ
+            ピクセル座標系、zはMediaPipeの規約に従い手首を原点として
+            xと概ね同スケールに正規化した相対深度で、カメラに近いほど
+            小さい値になる）。★2026-07-09追加: 手の向き（カメラに対する
+            傾き）によって指が自然に短く投影される（＝奥行き方向を向く）
+            ケースと、実際に指が欠損/変形しているケースを区別するために
+            導入した。取得できない検出器（YOLO等）や旧データでは None
+            のままになり、その場合は`landmarks`（2D）のみを使った
+            従来通りの判定にフォールバックする。
         mask: セグメンテーションマスク（H, W の0-255 uint8、SAM2由来）
         confidence: この検出結果の信頼度スコア（0.0-1.0）
         source: どの検出器がこの結果を生成したか（"mediapipe" 等、
@@ -72,6 +82,7 @@ class HandDetection:
 
     bbox: BoundingBox | None = None
     landmarks: list[tuple[float, float]] | None = None
+    landmarks_3d: list[tuple[float, float, float]] | None = None
     mask: object | None = None  # np.ndarray（型ヒントで numpy 依存を避けるため object）
     confidence: float = 0.0
     source: str = ""
@@ -89,6 +100,7 @@ class HandDetection:
         return HandDetection(
             bbox=self.bbox if self.bbox is not None else other.bbox,
             landmarks=self.landmarks if self.landmarks is not None else other.landmarks,
+            landmarks_3d=self.landmarks_3d if self.landmarks_3d is not None else other.landmarks_3d,
             mask=self.mask if self.mask is not None else other.mask,
             confidence=max(self.confidence, other.confidence),
             source=merged_source,

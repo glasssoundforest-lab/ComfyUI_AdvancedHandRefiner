@@ -512,6 +512,124 @@ class TestAssessLandmarkPlausibility:
         assert result["is_abnormal"] is False
 
 
+def _make_landmark_hand_3d(
+    finger_overrides_3d: dict[str, list[tuple[float, float, float]]] | None = None,
+) -> list[tuple[float, float, float]]:
+    """
+    `_make_landmark_hand()`の3D版。全指はデフォルトでz=0（画面に対して
+    正対）とし、`finger_overrides_3d`で特定の指のx,y,z座標を上書きできる。
+    """
+    landmarks_2d = _make_landmark_hand()
+    landmarks_3d: list[tuple[float, float, float] | None] = [
+        (x, y, 0.0) for x, y in landmarks_2d
+    ]
+    overrides = finger_overrides_3d or {}
+    for name, pts in overrides.items():
+        indices = FINGER_JOINT_INDICES[name]
+        for idx, pt in zip(indices, pts):
+            landmarks_3d[idx] = pt
+    return landmarks_3d  # type: ignore[return-value]
+
+
+class TestAssessLandmarkPlausibilityOrientationAware:
+    """
+    ★2026-07-09追加: ユーザーからの指摘「手の向きによっては2〜3本しか
+    見えない構図でも、異常な手として5本に描き直されてしまうのでは？」
+    への対応を検証する。`landmarks_3d`（z座標込み）を渡すことで、
+    「カメラに対して奥行き方向を向いているために2D投影が短く見える指」
+    と「実際に短い/欠損している指」を区別できることを確認する。
+    """
+
+    def test_2d_only_foreshortened_finger_is_falsely_flagged(self):
+        """
+        修正の効果を示す対照実験: landmarks_3d を渡さない（従来の2D限定）
+        場合、指がカメラ方向を向いていて2D投影が短くなっているだけの
+        正常な指も「欠損」と誤判定されてしまうことを確認する
+        （＝ユーザーが懸念した問題が実際に再現することの確認）。
+
+        ★注意: middle指の付け根(MCP, index9)は`hand_scale`（手首〜MCP間
+        距離）の基準にも使われるため、ここは正常な位置(0, -27.5)のまま
+        保ち、それより先の関節(PIP/DIP/TIP)だけを2D上で潰すことで、
+        「手全体のスケールは変えず、指の投影長だけが短い」状況を作る。
+        """
+        landmarks_2d = _make_landmark_hand()
+        foreshortened_middle_2d = [(0.0, -27.5), (0.5, -27.6), (0.6, -27.7), (0.7, -27.8)]
+        for idx, pt in zip(FINGER_JOINT_INDICES["middle"], foreshortened_middle_2d):
+            landmarks_2d[idx] = pt
+
+        result_2d_only = assess_landmark_plausibility(landmarks_2d)
+        assert result_2d_only["is_abnormal"] is True
+        assert "middle" in result_2d_only["suspicious_fingers"]
+        assert result_2d_only["used_3d"] is False
+
+    def test_3d_aware_check_does_not_flag_foreshortened_but_normal_finger(self):
+        """
+        上と全く同じ手（middle指がカメラ方向を向いている）に対し、
+        z座標込みのlandmarks_3dを渡すと、指の実際の3D長は正常なため
+        「欠損」と誤判定されなくなることを確認する。これがユーザーの
+        懸念に対する実際の修正効果である。
+        """
+        landmarks_2d = _make_landmark_hand()
+        # 2Dでは短く潰れて見えるが、z方向には正常な指の長さが保たれている
+        # （実際のMediaPipeが奥行きを向いた指に対して出力しそうな値を模す）
+        foreshortened_middle_2d = [(0.0, -27.5), (0.5, -27.6), (0.6, -27.7), (0.7, -27.8)]
+        foreshortened_middle_3d = [
+            (0.0, -27.5, 0.0),
+            (0.5, -27.6, -27.5),
+            (0.6, -27.7, -55.0),
+            (0.7, -27.8, -82.5),
+        ]
+        for idx, pt in zip(FINGER_JOINT_INDICES["middle"], foreshortened_middle_2d):
+            landmarks_2d[idx] = pt
+        landmarks_3d = _make_landmark_hand_3d(finger_overrides_3d={"middle": foreshortened_middle_3d})
+
+        result_3d = assess_landmark_plausibility(landmarks_2d, landmarks_3d=landmarks_3d)
+        assert result_3d["used_3d"] is True
+        assert "middle" not in result_3d["suspicious_fingers"]
+
+    def test_genuinely_collapsed_finger_is_still_flagged_with_3d(self):
+        """
+        3D対応にしても、指が実際に（3D的にも）手首付近に潰れている
+        （＝本当に欠損/変形している）ケースは、引き続き正しく
+        「異常」と判定できることを確認する（3D対応が判定を甘くしすぎて
+        いないかの確認）。MCP(index9)は正常位置のまま、そこから先を
+        x,y,zいずれの方向にもほぼ動かさないことで「本当に短い指」を模す。
+        """
+        genuinely_collapsed_3d = [
+            (0.0, -27.5, 0.0),
+            (0.1, -27.6, 0.1),
+            (0.2, -27.7, 0.2),
+            (0.3, -27.8, 0.3),
+        ]
+        landmarks_3d = _make_landmark_hand_3d(finger_overrides_3d={"middle": genuinely_collapsed_3d})
+        landmarks_2d = _make_landmark_hand()
+
+        result_3d = assess_landmark_plausibility(landmarks_2d, landmarks_3d=landmarks_3d)
+        assert result_3d["is_abnormal"] is True
+        assert "middle" in result_3d["suspicious_fingers"]
+
+    def test_normal_hand_with_3d_data_is_not_flagged(self):
+        landmarks_2d = _make_landmark_hand()
+        landmarks_3d = _make_landmark_hand_3d()
+        result = assess_landmark_plausibility(landmarks_2d, landmarks_3d=landmarks_3d)
+        assert result["is_abnormal"] is False
+        assert result["used_3d"] is True
+
+    def test_short_landmarks_3d_falls_back_to_2d_only(self):
+        """landmarks_3dが21点未満（不正/欠損データ）の場合は2D判定にフォールバックする"""
+        landmarks_2d = _make_landmark_hand()
+        result = assess_landmark_plausibility(landmarks_2d, landmarks_3d=[(0.0, 0.0, 0.0)] * 5)
+        assert result["used_3d"] is False
+        assert result["is_abnormal"] is False  # 通常の手なので2D判定でも異常なし
+
+    def test_none_landmarks_3d_preserves_legacy_2d_behavior(self):
+        """landmarks_3d を渡さない場合の挙動は既存の2D限定判定と完全に一致する（後方互換性）"""
+        landmarks_2d = _make_landmark_hand()
+        result_default = assess_landmark_plausibility(landmarks_2d)
+        result_explicit_none = assess_landmark_plausibility(landmarks_2d, landmarks_3d=None)
+        assert result_default == result_explicit_none
+
+
 class TestAssessHandOverallQuality:
     """
     ★Phase6の集大成: マスクベース(凸包+骨格化)とランドマークベース

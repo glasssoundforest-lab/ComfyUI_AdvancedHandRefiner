@@ -902,7 +902,10 @@ class AdvancedHandQualityChecker:
                     continue
 
                 quality = assess_hand_overall_quality(
-                    selected.mask, selected.landmarks, expected_fingers=expected_fingers
+                    selected.mask,
+                    selected.landmarks,
+                    expected_fingers=expected_fingers,
+                    landmarks_3d=selected.landmarks_3d,
                 )
                 if quality["is_abnormal"]:
                     any_abnormal = True
@@ -1233,6 +1236,7 @@ class AdvancedHandAutoFixer:
                     recheck_selected.mask,
                     recheck_selected.landmarks,
                     expected_fingers=expected_fingers,
+                    landmarks_3d=recheck_selected.landmarks_3d,
                 )
                 is_abnormal = quality["is_abnormal"]
             else:

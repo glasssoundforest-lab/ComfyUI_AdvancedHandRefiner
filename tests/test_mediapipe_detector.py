@@ -17,9 +17,9 @@ import pytest
 from utils.detectors.mediapipe_detector import MediaPipeHandDetector
 
 
-def _landmark(x: float, y: float) -> SimpleNamespace:
-    """正規化座標(0-1)のランドマーク点を模したオブジェクト"""
-    return SimpleNamespace(x=x, y=y, z=0.0)
+def _landmark(x: float, y: float, z: float = 0.0) -> SimpleNamespace:
+    """正規化座標(0-1)+奥行き(z)のランドマーク点を模したオブジェクト"""
+    return SimpleNamespace(x=x, y=y, z=z)
 
 
 def _handedness(score: float) -> list[SimpleNamespace]:
@@ -166,3 +166,52 @@ class TestMediaPipeHandDetectorDetect:
             result = MediaPipeHandDetector().detect(_dummy_image())
 
         assert result.best.source == "mediapipe"
+
+
+class TestMediaPipeHandDetectorLandmarks3D:
+    """
+    ★2026-07-09追加: 手の向きによる指の見た目上の短縮（オクルージョン）を
+    実際の欠損と区別するために、MediaPipeのz座標(奥行き)を捨てずに
+    landmarks_3dとして保持するようにした変更の検証。
+    """
+
+    def test_landmarks_3d_captures_z_coordinate_in_pixel_scale(self):
+        """
+        zはMediaPipeの規約通りxと概ね同スケール（画像幅倍）で
+        ピクセル単位に変換されて保持されることを確認する。
+        """
+        h, w = 100, 200
+        landmarks = [_landmark(0.5, 0.5, z=-0.25)]
+        raw_result = SimpleNamespace(
+            hand_landmarks=[landmarks], handedness=[_handedness(0.9)]
+        )
+        with patch(
+            "utils.detectors.mediapipe_detector.detect_hand_landmarks", return_value=raw_result
+        ):
+            result = MediaPipeHandDetector().detect(_dummy_image(h, w))
+
+        assert result.best.landmarks_3d == [(100.0, 50.0, -50.0)]  # z: -0.25 * w(200) = -50.0
+
+    def test_landmarks_3d_length_matches_landmarks_2d_length(self):
+        h, w = 100, 200
+        landmarks = [_landmark(0.1, 0.2, 0.01), _landmark(0.5, 0.1, -0.02), _landmark(0.3, 0.8, 0.0)]
+        raw_result = SimpleNamespace(
+            hand_landmarks=[landmarks], handedness=[_handedness(0.9)]
+        )
+        with patch(
+            "utils.detectors.mediapipe_detector.detect_hand_landmarks", return_value=raw_result
+        ):
+            result = MediaPipeHandDetector().detect(_dummy_image(h, w))
+
+        assert len(result.best.landmarks_3d) == len(result.best.landmarks) == 3
+        # x,yは landmarks（2D）と landmarks_3d の先頭2要素で一致する
+        for (x2, y2), (x3, y3, _z3) in zip(result.best.landmarks, result.best.landmarks_3d):
+            assert (x2, y2) == pytest.approx((x3, y3))
+
+    def test_landmarks_3d_is_none_when_no_hands_detected(self):
+        raw_result = SimpleNamespace(hand_landmarks=[], handedness=[])
+        with patch(
+            "utils.detectors.mediapipe_detector.detect_hand_landmarks", return_value=raw_result
+        ):
+            result = MediaPipeHandDetector().detect(_dummy_image())
+        assert result.is_empty

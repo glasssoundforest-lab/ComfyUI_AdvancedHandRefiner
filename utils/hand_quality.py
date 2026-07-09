@@ -514,11 +514,35 @@ def _segment_lengths(
     ]
 
 
+def _segment_lengths_3d(
+    landmarks_3d: list[tuple[float, float, float]], joint_indices: list[int]
+) -> list[float]:
+    """
+    奥行き(z)を含む3D距離版の`_segment_lengths`。
+
+    2D（画面投影後）の距離は、指がカメラに対して斜め/正面を向いている
+    だけで実際より短く見える（＝投影による自然な短縮）ため、これだけを
+    見ると「指が欠損している」と誤判定しうる。3D距離は手の向きに
+    依存しない（剛体である指の長さ自体は向きが変わっても一定という
+    前提に基づく）ため、より信頼できる指標になる。
+    """
+    pts = [landmarks_3d[i] for i in joint_indices]
+    return [
+        math.sqrt(
+            (pts[i + 1][0] - pts[i][0]) ** 2
+            + (pts[i + 1][1] - pts[i][1]) ** 2
+            + (pts[i + 1][2] - pts[i][2]) ** 2
+        )
+        for i in range(len(pts) - 1)
+    ]
+
+
 def assess_landmark_plausibility(
     landmarks: list[tuple[float, float]],
     min_segment_ratio: float = 0.12,
     max_segment_ratio: float = 3.0,
     min_total_length_ratio: float = 0.4,
+    landmarks_3d: list[tuple[float, float, float]] | None = None,
 ) -> dict:
     """
     MediaPipeの21点ランドマークから、各指を構成する関節間セグメント
@@ -538,6 +562,17 @@ def assess_landmark_plausibility(
     ランドマークの位置自体が不正確になり、この判定も巻き込まれて
     不正確になる可能性がある点には注意が必要（完全にマスクベースの
     手法の弱点を代替するものではなく、あくまで相補的な追加のシグナル）。
+
+    ★2026-07-09追加（向き依存の誤判定対策）: 手の向き（カメラに対する
+    傾き）によっては、2本や3本の指しか画面上に大きく見えない構図
+    （指が奥行き方向を向いている、握り込んでいる等）が解剖学的に
+    正常なケースがある。しかし従来はランドマークの2D投影座標のみを
+    見ていたため、こうした「向きによる自然な短縮」を「指の欠損」と
+    誤判定する可能性があった。`landmarks_3d`（MediaPipeのz座標込み
+    21点）を渡すと、指の長さ判定を2D投影ではなく3D距離（手の向きに
+    依存しない、より信頼できる指標）で行うよう切り替える。
+    `landmarks_3d`が未指定の場合は、従来通り2D距離のみで判定する
+    （後方互換）。
 
     判定基準は2種類:
     1. 指内セグメント長の比率チェック: 同一指内の隣接関節間の距離
@@ -561,6 +596,9 @@ def assess_landmark_plausibility(
         min_total_length_ratio: 指の付け根〜指先の距離が、手の基準
             スケールに対してこの比率未満なら「潰れている（実質的な
             欠損）」とみなす
+        landmarks_3d: MediaPipeの21点ランドマーク（z込み、
+            [(x,y,z), ...]）。指定すると2D投影ではなく3D距離で
+            長さ判定を行う（向きによる誤判定を抑制する）
 
     Returns:
         以下のキーを持つ辞書:
@@ -568,27 +606,50 @@ def assess_landmark_plausibility(
         - suspicious_fingers: 不自然と判定された指名のリスト
           （"thumb","index","middle","ring","pinky"の部分集合）
         - degenerate: 手の基準スケールがほぼ0で判定不能だった場合True
+        - used_3d: 3D距離での判定を実際に使用したかどうか
     """
     if len(landmarks) < 21:
-        return {"is_abnormal": False, "suspicious_fingers": [], "degenerate": True}
+        return {"is_abnormal": False, "suspicious_fingers": [], "degenerate": True, "used_3d": False}
 
-    wrist = landmarks[0]
-    middle_mcp = landmarks[9]
-    hand_scale = math.hypot(middle_mcp[0] - wrist[0], middle_mcp[1] - wrist[1])
+    use_3d = landmarks_3d is not None and len(landmarks_3d) >= 21
+
+    if use_3d:
+        wrist = landmarks_3d[0]
+        middle_mcp = landmarks_3d[9]
+        hand_scale = math.sqrt(
+            (middle_mcp[0] - wrist[0]) ** 2
+            + (middle_mcp[1] - wrist[1]) ** 2
+            + (middle_mcp[2] - wrist[2]) ** 2
+        )
+    else:
+        wrist = landmarks[0]
+        middle_mcp = landmarks[9]
+        hand_scale = math.hypot(middle_mcp[0] - wrist[0], middle_mcp[1] - wrist[1])
 
     if hand_scale < 1e-6:
-        return {"is_abnormal": False, "suspicious_fingers": [], "degenerate": True}
+        return {"is_abnormal": False, "suspicious_fingers": [], "degenerate": True, "used_3d": use_3d}
 
     suspicious_fingers: list[str] = []
     for finger_name, indices in FINGER_JOINT_INDICES.items():
-        lengths = _segment_lengths(landmarks, indices)
+        if use_3d:
+            lengths = _segment_lengths_3d(landmarks_3d, indices)
+            base_pt = landmarks_3d[indices[0]]
+            tip_pt = landmarks_3d[indices[-1]]
+            total_length = math.sqrt(
+                (tip_pt[0] - base_pt[0]) ** 2
+                + (tip_pt[1] - base_pt[1]) ** 2
+                + (tip_pt[2] - base_pt[2]) ** 2
+            )
+        else:
+            lengths = _segment_lengths(landmarks, indices)
+            base_pt = landmarks[indices[0]]
+            tip_pt = landmarks[indices[-1]]
+            total_length = math.hypot(tip_pt[0] - base_pt[0], tip_pt[1] - base_pt[1])
+
         normalized = [length / hand_scale for length in lengths]
 
         # 指全体(付け根〜指先)の長さが、手のスケールに対して極端に
         # 短くないか(=指が実質的に手首付近へ潰れていないか)を先に確認する
-        base_pt = landmarks[indices[0]]
-        tip_pt = landmarks[indices[-1]]
-        total_length = math.hypot(tip_pt[0] - base_pt[0], tip_pt[1] - base_pt[1])
         if (total_length / hand_scale) < min_total_length_ratio:
             suspicious_fingers.append(finger_name)
             continue
@@ -613,6 +674,7 @@ def assess_landmark_plausibility(
         "is_abnormal": len(suspicious_fingers) > 0,
         "suspicious_fingers": suspicious_fingers,
         "degenerate": False,
+        "used_3d": use_3d,
     }
 
 
@@ -620,6 +682,7 @@ def assess_hand_overall_quality(
     mask: np.ndarray,
     landmarks: list[tuple[float, float]] | None,
     expected_fingers: int = 5,
+    landmarks_3d: list[tuple[float, float, float]] | None = None,
 ) -> dict:
     """
     マスクベースの判定（`assess_hand_quality()`、凸包+骨格化）と
@@ -652,11 +715,26 @@ def assess_hand_overall_quality(
     これは現時点でも未解決の限界として残る（ランドマーク側で
     「余分な指」を代替検知する手段がMediaPipeの構造上存在しないため）。
 
+    ★2026-07-09追加（手の向きによる誤判定対策）: 手の向き（カメラに
+    対する傾き）次第では、2〜3本の指しか画面上にはっきり見えない構図
+    （指が奥行き方向を向いている等）が解剖学的に正常なケースがある。
+    `landmarks_3d`（MediaPipeのz座標込み21点）を渡すと、上記1.の
+    ランドマークベース判定がこの向きの影響を大幅に軽減できる
+    （`assess_landmark_plausibility`のdocstring参照）。未指定の場合は
+    従来通り2D投影のみで判定する（後方互換）。ただし、そもそも
+    2D画像・マスクに写っていない（＝完全にオクルージョンされた）指を
+    マスクベースで「見た目上検出する」ことは原理的に不可能なため、
+    上記2.の「余分な指」判定や、ランドマークが判定不能な場合の
+    マスクフォールバックには、この対策の効果は及ばない。
+
     Args:
         mask: 0-255 uint8マスク
         landmarks: MediaPipeの21点ランドマーク（[(x,y), ...]）。
             Noneの場合はマスクベースの判定のみで行う
         expected_fingers: 本来あるべき指の本数（通常5）
+        landmarks_3d: MediaPipeの21点ランドマーク（z込み、
+            [(x,y,z), ...]）。指定すると欠損判定の誤判定を向きに応じて
+            抑制する
 
     Returns:
         以下のキーを持つ辞書:
@@ -670,13 +748,19 @@ def assess_hand_overall_quality(
           （"landmark" または "mask_fallback"）
         - mask_hull_count / mask_skeleton_count: マスクベースの
           参考情報（凸包・骨格化それぞれの推定本数）
+        - used_3d: 欠損判定に3D距離を使用したかどうか
     """
     mask_result = assess_hand_quality(mask, expected_fingers=expected_fingers, landmarks=landmarks)
 
     if landmarks is not None:
-        landmark_result = assess_landmark_plausibility(landmarks)
+        landmark_result = assess_landmark_plausibility(landmarks, landmarks_3d=landmarks_3d)
     else:
-        landmark_result = {"is_abnormal": False, "suspicious_fingers": [], "degenerate": True}
+        landmark_result = {
+            "is_abnormal": False,
+            "suspicious_fingers": [],
+            "degenerate": True,
+            "used_3d": False,
+        }
 
     if landmark_result["degenerate"]:
         suspected_deficiency = mask_result["suspected_deficiency"]
@@ -696,4 +780,5 @@ def assess_hand_overall_quality(
         "deficiency_source": deficiency_source,
         "mask_hull_count": mask_result["hull_count"],
         "mask_skeleton_count": mask_result["skeleton_count"],
+        "used_3d": landmark_result.get("used_3d", False),
     }
