@@ -11,6 +11,7 @@ import pytest
 
 import nodes
 from utils.detection_types import BoundingBox, DetectionResult, HandDetection
+from utils.synthetic_hand import generate_synthetic_hand_mask
 
 
 class TestDetectionModePipelineSelection:
@@ -591,3 +592,75 @@ class TestDefensiveFallbackPaths:
         # 入力マスクがほぼそのまま返っているはず(0-1正規化の丸め誤差のみ許容)
         refined_np = (refined.numpy()[0] * 255).astype(np.uint8)
         assert np.abs(refined_np.astype(int) - input_mask.astype(int)).max() <= 1
+
+
+class TestProcessAllHandsDefaultsToTrue:
+    """
+    ★2026-07-09追加: 複数の手が写った画像で「手が1本しか直らない」という
+    ユーザー報告を受け、process_all_hands の既定値を False から True に
+    変更した（検出自体は既定でも全ての手を正しく検出できていたが、処理
+    対象がhand_index=0の1本に限定されていたことが原因だった）。
+    後方互換性の観点から、単一の手しか無い画像ではこれまで通り単一の
+    画像/remap_infoが返ることも合わせて確認する。
+    """
+
+    def test_orientation_optimizer_input_types_default_is_true(self):
+        input_types = nodes.AdvancedHandOrientationOptimizer.INPUT_TYPES()
+        assert input_types["optional"]["process_all_hands"][1]["default"] is True
+
+    def test_quality_checker_input_types_default_is_true(self):
+        input_types = nodes.AdvancedHandQualityChecker.INPUT_TYPES()
+        assert input_types["optional"]["process_all_hands"][1]["default"] is True
+
+    def test_auto_fixer_input_types_default_is_true(self):
+        input_types = nodes.AdvancedHandAutoFixer.INPUT_TYPES()
+        assert input_types["optional"]["process_all_hands"][1]["default"] is True
+
+    def test_orientation_optimizer_without_explicit_arg_processes_all_hands(self):
+        """process_all_handsを明示せずに呼んでも、新デフォルト(True)により複数の手がバッチ化される"""
+        optimizer = nodes.AdvancedHandOrientationOptimizer()
+        image = nodes.torch.from_numpy(np.zeros((1, 200, 200, 3), dtype=np.float32))
+
+        hand_a = HandDetection(
+            bbox=BoundingBox(10, 10, 60, 60),
+            landmarks=[(35.0, 35.0)] * 21,
+            mask=generate_synthetic_hand_mask(canvas_size=(200, 200), palm_radius=20),
+            confidence=0.9,
+        )
+        hand_b = HandDetection(
+            bbox=BoundingBox(120, 120, 170, 170),
+            landmarks=[(145.0, 145.0)] * 21,
+            mask=generate_synthetic_hand_mask(canvas_size=(200, 200), palm_radius=20),
+            confidence=0.8,
+        )
+
+        with patch.object(
+            nodes, "_detect_hands", return_value=DetectionResult(hands=[hand_a, hand_b])
+        ):
+            # process_all_hands を渡さない = 新デフォルトのTrueが使われる
+            cropped, remap_info = optimizer.optimize_orientation(image, padding=8)
+
+        assert cropped.shape[0] == 2  # 2つの手がバッチとして出力される
+        assert isinstance(remap_info, list) and len(remap_info) == 2
+
+    def test_single_hand_image_still_returns_unbatched_result(self):
+        """
+        後方互換性の確認: process_all_hands=True(新既定値)でも、手が1つしか
+        無い画像では従来通り単一の画像・単一のremap_infoが返る
+        （バッチ化による戻り値の型変化は手が2つ以上の場合のみ）。
+        """
+        optimizer = nodes.AdvancedHandOrientationOptimizer()
+        image = nodes.torch.from_numpy(np.zeros((1, 200, 200, 3), dtype=np.float32))
+
+        hand_a = HandDetection(
+            bbox=BoundingBox(10, 10, 60, 60),
+            landmarks=[(35.0, 35.0)] * 21,
+            mask=generate_synthetic_hand_mask(canvas_size=(200, 200), palm_radius=20),
+            confidence=0.9,
+        )
+
+        with patch.object(nodes, "_detect_hands", return_value=DetectionResult(hands=[hand_a])):
+            cropped, remap_info = optimizer.optimize_orientation(image, padding=8)
+
+        assert cropped.shape[0] == 1
+        assert isinstance(remap_info, dict)  # リストではなく単一のdictのまま

@@ -271,7 +271,7 @@ class AdvancedHandOrientationOptimizer:
                     {"default": 0, "min": 0, "max": 19, "step": 1},
                 ),
                 "detection_mode": (DETECTION_MODES, {"default": "full"}),
-                "process_all_hands": ("BOOLEAN", {"default": False}),
+                "process_all_hands": ("BOOLEAN", {"default": True}),
             },
         }
 
@@ -287,7 +287,7 @@ class AdvancedHandOrientationOptimizer:
         min_detection_confidence: float = 0.5,
         hand_index: int = 0,
         detection_mode: str = "full",
-        process_all_hands: bool = False,
+        process_all_hands: bool = True,
     ):
         """
         ★`process_all_hands`について: Trueにすると、`hand_index`は無視され、
@@ -858,7 +858,7 @@ class AdvancedHandQualityChecker:
                     {"default": 0, "min": 0, "max": 19, "step": 1},
                 ),
                 "detection_mode": (DETECTION_MODES, {"default": "full"}),
-                "process_all_hands": ("BOOLEAN", {"default": False}),
+                "process_all_hands": ("BOOLEAN", {"default": True}),
                 "expected_fingers": ("INT", {"default": 5, "min": 1, "max": 10, "step": 1}),
             },
         }
@@ -874,7 +874,7 @@ class AdvancedHandQualityChecker:
         min_detection_confidence: float = 0.5,
         hand_index: int = 0,
         detection_mode: str = "full",
-        process_all_hands: bool = False,
+        process_all_hands: bool = True,
         expected_fingers: int = 5,
     ):
         batch_size = image.shape[0]
@@ -1006,7 +1006,7 @@ class AdvancedHandAutoFixer:
                 ),
                 "hand_index": ("INT", {"default": 0, "min": 0, "max": 19, "step": 1}),
                 "detection_mode": (DETECTION_MODES, {"default": "full"}),
-                "process_all_hands": ("BOOLEAN", {"default": False}),
+                "process_all_hands": ("BOOLEAN", {"default": True}),
                 "expected_fingers": ("INT", {"default": 5, "min": 1, "max": 10, "step": 1}),
                 "mask_grow_pixels": ("INT", {"default": 6, "min": 0, "max": 64, "step": 1}),
                 "color_match_strength": (
@@ -1039,7 +1039,7 @@ class AdvancedHandAutoFixer:
         min_detection_confidence: float = 0.5,
         hand_index: int = 0,
         detection_mode: str = "full",
-        process_all_hands: bool = False,
+        process_all_hands: bool = True,
         expected_fingers: int = 5,
         mask_grow_pixels: int = 6,
         color_match_strength: float = 0.5,

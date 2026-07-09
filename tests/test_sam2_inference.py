@@ -15,6 +15,8 @@ run()の呼び出し内容を記録するフェイクセッションで検証す
 
 from __future__ import annotations
 
+import threading
+
 import cv2
 import numpy as np
 import pytest
@@ -53,6 +55,12 @@ def _make_instance(
     encoder_outputs: dict[str, np.ndarray] | None = None,
 ) -> tuple[Sam2OnnxInference, _FakeDecoderSession, _FakeEncoderSession]:
     obj = Sam2OnnxInference.__new__(Sam2OnnxInference)
+    # __init__ をバイパスしているため、実装が想定する属性は手動で用意する。
+    # ★2026-07-09: _encoder_lock/_decoder_lock（session.run()の同時
+    # 呼び出しによるネイティブクラッシュを防ぐためのロック）もここで
+    # 設定する必要がある。
+    obj._encoder_lock = threading.Lock()
+    obj._decoder_lock = threading.Lock()
 
     decoder_session = _FakeDecoderSession(raw_mask)
     obj._decoder_session = decoder_session
@@ -531,6 +539,8 @@ class TestPredictFromBoxTiled:
                 return [responses[idx]]
 
         obj = Sam2OnnxInference.__new__(Sam2OnnxInference)
+        obj._encoder_lock = threading.Lock()
+        obj._decoder_lock = threading.Lock()
         obj._decoder_session = _SequencedFakeDecoderSession()
         obj._decoder_input_names = decoder_names
         encoder_session = _FakeEncoderSession(encoder_outputs)
@@ -726,3 +736,127 @@ class TestPredictFromBoxWithAndWithoutPointsTiled:
 
         np.testing.assert_array_equal(mask_with_combined, mask_with_separate)
         np.testing.assert_array_equal(mask_without_combined, mask_without_separate)
+
+
+class TestConcurrentSessionAccessIsSerialized:
+    """
+    ★2026-07-09追加: ユーザーの実行環境で実際に発生した
+    "Windows fatal exception: access violation" クラッシュ
+    （複数スレッドが同時に _encoder_session.run() を呼び出していた）の
+    回帰テスト。エンコーダ・デコーダそれぞれの session.run() 相当の
+    呼び出しが、複数スレッドから同時に呼ばれても実際には1つずつしか
+    実行されない（ロックにより直列化されている）ことを検証する。
+
+    本物のonnxruntimeを使わず、「同時に2つ以上のrun()が実行されたら
+    それを検知できる」擬似セッションで代用することで、GPU/モデル無しの
+    テスト環境でも決定的に検証できるようにしている。
+    """
+
+    class _ConcurrencyTrackingSession:
+        """
+        run() の呼び出し中、同時に実行中の呼び出し数(`in_flight`)を
+        数える擬似セッション。ロックが無ければ複数スレッドが同時に
+        run() の内部に入り、`max_concurrent`が2以上を記録するはずである。
+        """
+
+        def __init__(self, output):
+            self._output = output
+            self.in_flight = 0
+            self.max_concurrent = 0
+            self._counter_lock = threading.Lock()
+
+        def run(self, output_names, input_feed):
+            with self._counter_lock:
+                self.in_flight += 1
+                self.max_concurrent = max(self.max_concurrent, self.in_flight)
+            try:
+                # 他スレッドがこの区間に割り込む余地を作るため、わずかに待つ
+                # （ロックが効いていなければここで複数スレッドが重なる）。
+                import time
+
+                time.sleep(0.02)
+                return [self._output] if not isinstance(self._output, list) else self._output
+            finally:
+                with self._counter_lock:
+                    self.in_flight -= 1
+
+    def test_encoder_run_calls_never_overlap_across_threads(self):
+        obj = Sam2OnnxInference.__new__(Sam2OnnxInference)
+        obj._encoder_lock = threading.Lock()
+        obj._decoder_lock = threading.Lock()
+
+        tracking_session = self._ConcurrencyTrackingSession(np.zeros((1, 1, 64, 64), dtype=np.float32))
+        obj._encoder_session = tracking_session
+        obj._encoder_input_name = "image"
+        obj._encoder_output_names = ["image_embed"]
+
+        image = np.zeros((64, 64, 3), dtype=np.uint8)
+
+        from concurrent.futures import ThreadPoolExecutor
+
+        with ThreadPoolExecutor(max_workers=6) as executor:
+            list(executor.map(lambda _: obj._encode_image(image), range(12)))
+
+        assert tracking_session.max_concurrent == 1, (
+            "複数スレッドが同時に encoder session.run() の内部に入っていた "
+            f"(max_concurrent={tracking_session.max_concurrent})。"
+            "ロックによる直列化が機能していない。"
+        )
+
+    def test_decoder_run_calls_never_overlap_across_threads(self):
+        obj = Sam2OnnxInference.__new__(Sam2OnnxInference)
+        obj._encoder_lock = threading.Lock()
+        obj._decoder_lock = threading.Lock()
+
+        raw_mask = np.zeros((1, 1, 256, 256), dtype=np.float32)
+        tracking_session = self._ConcurrencyTrackingSession([raw_mask])
+        obj._decoder_session = tracking_session
+        obj._decoder_input_names = [
+            "point_coords",
+            "point_labels",
+            "mask_input",
+            "has_mask_input",
+            "orig_im_size",
+            "image_embed",
+        ]
+
+        encoder_outputs = {"image_embed": np.zeros((1, 32, 64, 64), dtype=np.float32)}
+        point_coords = np.array([[[10.0, 10.0], [50.0, 50.0]]], dtype=np.float32)
+        point_labels = np.array([[2, 3]], dtype=np.float32)
+
+        from concurrent.futures import ThreadPoolExecutor
+
+        with ThreadPoolExecutor(max_workers=6) as executor:
+            list(
+                executor.map(
+                    lambda _: obj._run_decoder_prob(
+                        encoder_outputs, point_coords, point_labels, (64, 64)
+                    ),
+                    range(12),
+                )
+            )
+
+        assert tracking_session.max_concurrent == 1, (
+            "複数スレッドが同時に decoder session.run() の内部に入っていた "
+            f"(max_concurrent={tracking_session.max_concurrent})。"
+            "ロックによる直列化が機能していない。"
+        )
+
+    def test_lock_missing_would_have_shown_overlap(self):
+        """
+        上記2テストが「たまたま」ロック無しでも通ってしまう偽陰性で
+        ないことを確認する対照実験: ロックを一切使わずに同じ
+        ThreadPoolExecutorパターンで擬似セッションを叩くと、実際に
+        max_concurrentが2以上になる（＝この擬似セッション自体は
+        同時実行を正しく検知できる）ことを確認する。
+        """
+        tracking_session = self._ConcurrencyTrackingSession(np.zeros((4,), dtype=np.float32))
+
+        from concurrent.futures import ThreadPoolExecutor
+
+        with ThreadPoolExecutor(max_workers=6) as executor:
+            list(executor.map(lambda _: tracking_session.run(None, {}), range(12)))
+
+        assert tracking_session.max_concurrent > 1, (
+            "対照実験自体が同時実行を検知できていない（テスト設計の不備の可能性）"
+        )

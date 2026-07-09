@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import logging
 import os
+import threading
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
@@ -41,12 +42,19 @@ _TILE_OVERLAP_DEFAULT = 64
 _DESPECKLE_MIN_AREA_DEFAULT = 30
 
 #: タイル分割推論を並列実行する際の最大ワーカー数。
-#: onnxruntimeのInferenceSession.run()は、異なるスレッドから同一
-#: セッションを並行して呼び出しても安全（スレッドセーフ）であるため、
-#: タイルごとのエンコード・デコードをスレッドプールで並列化することで、
-#: タイル分割による処理時間の増加を緩和できる。CPUコア数に応じて
-#: 上限を決めるが、際限なく増やしても効果は頭打ちになるため
-#: 上限を設ける。
+#: ★2026-07-09重要な訂正: 以前のコメントは「onnxruntimeの
+#: InferenceSession.run()は異なるスレッドから同一セッションを並行して
+#: 呼び出しても安全（スレッドセーフ）」という前提でスレッドプール化して
+#: いたが、これは実行プロバイダ（特にWindowsで一般的なDirectML等）に
+#: よっては成り立たず、実際にユーザー環境で
+#: 「Windows fatal exception: access violation」というネイティブ
+#: レベルのクラッシュが _encoder_session.run() の同時呼び出し中に
+#: 発生することが実際のクラッシュログで確認された。そのため
+#: `Sam2OnnxInference`側で`_session_lock`を導入し、実際の
+#: `session.run()`呼び出し自体は直列化する（下記`_encode_image`/
+#: `_run_decoder_prob`を参照）。タイルごとの画像切り出し・前処理・
+#: 後処理はスレッドプールのまま並列化されるため、並列化の効果は
+#: 完全には失われない（ネイティブ推論呼び出しのみが安全側に倒される）。
 _MAX_TILE_WORKERS = min(4, os.cpu_count() or 1)
 
 
@@ -87,6 +95,17 @@ class Sam2OnnxInference:
         decoder_inputs = [i.name for i in self._decoder_session.get_inputs()]
         self._decoder_input_names = decoder_inputs
 
+        # ★2026-07-09追加: エンコーダ・デコーダそれぞれの実際の
+        # session.run() 呼び出しを直列化するためのロック。タイル分割
+        # 推論はThreadPoolExecutorで並列実行されるが、実際のONNX
+        # Runtimeセッションへの呼び出し自体はこのロックで1スレッドずつに
+        # 制限し、実行プロバイダ由来のネイティブクラッシュ（Windows環境で
+        # 実際に確認された access violation）を防ぐ。エンコーダと
+        # デコーダで別々のロックにしているのは、片方の推論中でも
+        # もう片方（別セッション）は並行して進められる余地を残すため。
+        self._encoder_lock = threading.Lock()
+        self._decoder_lock = threading.Lock()
+
     def _encode_image(
         self, image_rgb: np.ndarray
     ) -> tuple[dict[str, np.ndarray], tuple[float, float], tuple[int, int]]:
@@ -125,7 +144,11 @@ class Sam2OnnxInference:
         blob = resized.astype(np.float32) / 255.0
         blob = blob.transpose(2, 0, 1)[None, ...]
 
-        outputs = self._encoder_session.run(None, {self._encoder_input_name: blob})
+        # ★2026-07-09: 複数スレッドから同時にこのメソッドが呼ばれても
+        # 実際のONNX Runtime呼び出しは1スレッドずつになるようロックする
+        # （__init__のコメント参照。ネイティブクラッシュ対策）。
+        with self._encoder_lock:
+            outputs = self._encoder_session.run(None, {self._encoder_input_name: blob})
         output_dict = dict(zip(self._encoder_output_names, outputs))
 
         scale_x = _ENCODER_INPUT_SIZE / orig_w
@@ -295,11 +318,16 @@ class Sam2OnnxInference:
         weight = np.zeros((h, w), dtype=np.float32)
         any_tile_succeeded = False
 
-        # ★パフォーマンス最適化: onnxruntimeのInferenceSession.run()は
-        # 異なるスレッドから同一セッションを並行して呼び出しても安全
-        # （スレッドセーフ）であるため、タイルごとのエンコード・デコードを
-        # スレッドプールで並列実行する。タイル数が1以下なら並列化の
-        # オーバーヘッドを避けて直列実行する。
+        # ★パフォーマンス最適化: タイルごとの画像切り出し・前処理・後処理を
+        # スレッドプールで並列実行する。実際のONNX Runtimeセッション呼び出し
+        # （session.run()）自体は`_encoder_lock`/`_decoder_lock`で直列化
+        # されるため完全な並列にはならないが、それ以外のPython側の処理は
+        # 並列化される（2026-07-09訂正: 以前は「session.run()は異なる
+        # スレッドから同一セッションを呼んでも安全」という前提だったが、
+        # 実際にはWindows環境でネイティブクラッシュが確認されたため、
+        # ロックを導入した経緯がある。詳細は`_MAX_TILE_WORKERS`のコメント
+        # 参照）。タイル数が1以下なら並列化のオーバーヘッドを避けて
+        # 直列実行する。
         if len(jobs) > 1:
             with ThreadPoolExecutor(max_workers=min(_MAX_TILE_WORKERS, len(jobs))) as executor:
                 results = list(executor.map(_process, jobs))
@@ -650,7 +678,10 @@ class Sam2OnnxInference:
                     encoder_outputs, "high_res_feats_1"
                 )
 
-        outputs = self._decoder_session.run(None, decoder_inputs)
+        # ★2026-07-09: エンコーダ側と同様、実際のONNX Runtime呼び出しを
+        # 1スレッドずつに直列化する（ネイティブクラッシュ対策）。
+        with self._decoder_lock:
+            outputs = self._decoder_session.run(None, decoder_inputs)
 
         raw_mask = outputs[0]
         while raw_mask.ndim > 2:
