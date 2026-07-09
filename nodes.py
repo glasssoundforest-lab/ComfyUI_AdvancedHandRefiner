@@ -63,6 +63,61 @@ _sam2_detector = Sam2HandDetector()
 #: 場合に "mediapipe_only" / "yolo_mediapipe" でスキップできるようにする。
 DETECTION_MODES = ["full", "yolo_mediapipe", "mediapipe_only"]
 
+#: comfy.samplers が読み込めない環境（pytest等、本物のComfyUI本体が
+#: sys.path に無い場合）向けのフォールバック選択肢。
+#: ComfyUI標準の組み込みsampler/schedulerを静的に列挙したもので、
+#: 実際のComfyUI環境では _get_sampler_scheduler_choices() が
+#: comfy.samplers から取得した本物のリストで置き換える
+#: （バージョンによって追加されるsampler/schedulerにも自動追従する）。
+_FALLBACK_SAMPLERS = [
+    "euler", "euler_cfg_pp", "euler_ancestral", "euler_ancestral_cfg_pp",
+    "heun", "heunpp2", "dpm_2", "dpm_2_ancestral", "lms",
+    "dpm_fast", "dpm_adaptive",
+    "dpmpp_2s_ancestral", "dpmpp_2s_ancestral_cfg_pp",
+    "dpmpp_sde", "dpmpp_sde_gpu",
+    "dpmpp_2m", "dpmpp_2m_cfg_pp", "dpmpp_2m_sde", "dpmpp_2m_sde_gpu",
+    "dpmpp_3m_sde", "dpmpp_3m_sde_gpu",
+    "ddpm", "lcm", "ipndm", "ipndm_v", "deis", "ddim", "uni_pc", "uni_pc_bh2",
+]
+_FALLBACK_SCHEDULERS = [
+    "normal", "karras", "exponential", "sgm_uniform", "simple",
+    "ddim_uniform", "beta", "linear_quadratic", "kl_optimal",
+]
+
+#: 手の詳細（指の形・関節）を高精度に描き直すための推奨sampler/scheduler。
+#: dpmpp_2m + karras は、ADetailer等の「部分再生成（detailer）」系
+#: ワークフローで速度と精細さのバランスが良いとされる定番の組み合わせ
+#: （euler + normal は基本・高速だが、指のような細部の再現性では
+#: dpmpp系+karrasスケジューラの方が一般的に有利とされる）。
+RECOMMENDED_SAMPLER = "dpmpp_2m"
+RECOMMENDED_SCHEDULER = "karras"
+
+
+def _get_sampler_scheduler_choices() -> tuple[list[str], list[str]]:
+    """
+    ComfyUI本体の `comfy.samplers` から、実際に利用可能な sampler/scheduler の
+    一覧を取得する。KSampler等の標準ノードと同じ選択肢がドロップダウンに
+    表示されるようにするため。
+
+    本体が無い環境（pytest等）でも `INPUT_TYPES()` の構築自体は失敗させたく
+    ないため、import に失敗した場合は `_FALLBACK_SAMPLERS`/
+    `_FALLBACK_SCHEDULERS`（ComfyUI標準の代表的な選択肢を静的に列挙した
+    もの）にフォールバックする。実際のサンプリング処理
+    （`common_ksampler`呼び出し）は文字列をそのまま渡すだけなので、
+    どちらの経路でもロジックへの影響は無い。
+    """
+    try:
+        import comfy.samplers
+
+        return list(comfy.samplers.KSampler.SAMPLERS), list(comfy.samplers.KSampler.SCHEDULERS)
+    except ImportError:
+        return list(_FALLBACK_SAMPLERS), list(_FALLBACK_SCHEDULERS)
+
+
+def _default_choice(choices: list[str], preferred: str) -> str:
+    """`preferred`が選択肢に含まれていればそれを、無ければ選択肢の先頭を返す。"""
+    return preferred if preferred in choices else choices[0]
+
 _pipeline_cache: dict[str, DetectorPipeline] = {}
 
 
@@ -899,6 +954,7 @@ class AdvancedHandAutoFixer:
 
     @classmethod
     def INPUT_TYPES(s):
+        sampler_choices, scheduler_choices = _get_sampler_scheduler_choices()
         return {
             "required": {
                 "image": ("IMAGE",),
@@ -907,10 +963,25 @@ class AdvancedHandAutoFixer:
                 "negative": ("CONDITIONING",),
                 "vae": ("VAE",),
                 "seed": ("INT", {"default": 0, "min": 0, "max": 0xFFFFFFFFFFFFFFFF}),
-                "steps": ("INT", {"default": 20, "min": 1, "max": 150}),
+                "steps": ("INT", {"default": 25, "min": 1, "max": 150}),
                 "cfg": ("FLOAT", {"default": 7.0, "min": 0.0, "max": 30.0, "step": 0.1}),
-                "sampler_name": ("STRING", {"default": "euler"}),
-                "scheduler": ("STRING", {"default": "normal"}),
+                "sampler_name": (
+                    sampler_choices,
+                    {
+                        "default": _default_choice(sampler_choices, RECOMMENDED_SAMPLER),
+                        "tooltip": (
+                            "指の形状のような細部の再現性を優先するなら dpmpp_2m/dpmpp_2m_sde 系、"
+                            "速度を優先するなら euler が目安です。"
+                        ),
+                    },
+                ),
+                "scheduler": (
+                    scheduler_choices,
+                    {
+                        "default": _default_choice(scheduler_choices, RECOMMENDED_SCHEDULER),
+                        "tooltip": "karras はdpmpp系samplerと組み合わせた際に細部の描画精度が安定しやすい標準的な選択です。",
+                    },
+                ),
                 "denoise": ("FLOAT", {"default": 0.6, "min": 0.0, "max": 1.0, "step": 0.01}),
                 "max_retries": ("INT", {"default": 3, "min": 0, "max": 10}),
             },

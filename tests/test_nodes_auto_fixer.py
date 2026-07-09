@@ -387,3 +387,102 @@ class TestRunInpaintSamplingPadding:
 
         assert captured["encode_pixels_shape"][1:3] == (64, 48)
         assert result.shape[:2] == (64, 48)
+
+
+class TestSamplerSchedulerDropdown:
+    """
+    sampler_name / scheduler が ComfyUI 標準の KSampler 系ノードと同様、
+    自由入力の STRING ではなく選択式（COMBO）になっており、かつ
+    デフォルト値が推奨値になっていることを検証する。
+
+    テスト実行環境には本物の ComfyUI 本体（`comfy.samplers`）が無いため、
+    ここで検証されるのは常に `_FALLBACK_SAMPLERS`/`_FALLBACK_SCHEDULERS`
+    経由のフォールバック動作である。本物の環境では
+    `comfy.samplers.KSampler.SAMPLERS`/`SCHEDULERS` から取得したリストに
+    置き換わるが、"選択式であること"・"推奨値がデフォルトであること"
+    という契約はどちらの経路でも同一である。
+    """
+
+    def test_sampler_name_is_a_selectable_list_not_freeform_string(self):
+        input_types = nodes.AdvancedHandAutoFixer.INPUT_TYPES()
+        sampler_spec = input_types["required"]["sampler_name"]
+        assert isinstance(sampler_spec[0], list)
+        assert sampler_spec[0] != "STRING"
+        assert len(sampler_spec[0]) > 1
+
+    def test_scheduler_is_a_selectable_list_not_freeform_string(self):
+        input_types = nodes.AdvancedHandAutoFixer.INPUT_TYPES()
+        scheduler_spec = input_types["required"]["scheduler"]
+        assert isinstance(scheduler_spec[0], list)
+        assert scheduler_spec[0] != "STRING"
+        assert len(scheduler_spec[0]) > 1
+
+    def test_sampler_choices_include_common_comfyui_samplers(self):
+        input_types = nodes.AdvancedHandAutoFixer.INPUT_TYPES()
+        choices = input_types["required"]["sampler_name"][0]
+        for expected in ("euler", "dpmpp_2m", "dpmpp_sde", "ddim", "uni_pc"):
+            assert expected in choices
+
+    def test_scheduler_choices_include_common_comfyui_schedulers(self):
+        input_types = nodes.AdvancedHandAutoFixer.INPUT_TYPES()
+        choices = input_types["required"]["scheduler"][0]
+        for expected in ("normal", "karras", "exponential", "simple"):
+            assert expected in choices
+
+    def test_sampler_default_is_recommended_value(self):
+        input_types = nodes.AdvancedHandAutoFixer.INPUT_TYPES()
+        sampler_spec = input_types["required"]["sampler_name"]
+        assert sampler_spec[1]["default"] == "dpmpp_2m"
+        assert sampler_spec[1]["default"] in sampler_spec[0]
+
+    def test_scheduler_default_is_recommended_value(self):
+        input_types = nodes.AdvancedHandAutoFixer.INPUT_TYPES()
+        scheduler_spec = input_types["required"]["scheduler"]
+        assert scheduler_spec[1]["default"] == "karras"
+        assert scheduler_spec[1]["default"] in scheduler_spec[0]
+
+    def test_steps_default_is_tuned_for_detail_precision(self):
+        """指の描画精度を上げるため、既定の20から25へ引き上げている。"""
+        input_types = nodes.AdvancedHandAutoFixer.INPUT_TYPES()
+        assert input_types["required"]["steps"][1]["default"] == 25
+
+    def test_default_choice_helper_prefers_requested_value(self):
+        assert nodes._default_choice(["a", "b", "c"], "b") == "b"
+
+    def test_default_choice_helper_falls_back_to_first_when_missing(self):
+        assert nodes._default_choice(["a", "b", "c"], "not_present") == "a"
+
+    def test_get_sampler_scheduler_choices_returns_nonempty_lists(self):
+        samplers, schedulers = nodes._get_sampler_scheduler_choices()
+        assert len(samplers) > 0
+        assert len(schedulers) > 0
+        assert nodes.RECOMMENDED_SAMPLER in samplers
+        assert nodes.RECOMMENDED_SCHEDULER in schedulers
+
+    def test_auto_fix_still_accepts_plain_string_sampler_values(self):
+        """
+        INPUT_TYPES がドロップダウンになっても、ComfyUI実行時に渡ってくる
+        実際の値は依然として単なる文字列であり、auto_fix()等の関数シグネチャ・
+        common_ksamplerへの受け渡しには影響しないことを確認する
+        （後方互換性の確認）。
+        """
+        fixer = nodes.AdvancedHandAutoFixer()
+
+        with patch.object(nodes, "_detect_hands", return_value=DetectionResult(hands=[])):
+            image, report = fixer.auto_fix(
+                _image_tensor(),
+                model=None,
+                positive=None,
+                negative=None,
+                vae=None,
+                seed=0,
+                steps=25,
+                cfg=7.0,
+                sampler_name="dpmpp_2m",
+                scheduler="karras",
+                denoise=0.6,
+                max_retries=3,
+            )
+
+        assert image.shape == (1, 64, 64, 3)
+        assert "検出できませんでした" in report
