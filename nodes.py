@@ -354,11 +354,17 @@ class AdvancedHandOrientationOptimizer:
         selected,
         padding: int,
         image_index: int,
+        max_crop_size: tuple[int, int] | None = None,
     ) -> tuple[np.ndarray, RemapInfo]:
         """
         既に選択済みの1つの手（`selected`、Noneの場合は「手なし」を表す）に
         ついて、向き最適化・クロップを行う（検出処理自体はこの関数の外で
         1回だけ行う想定）。
+
+        `max_crop_size=(max_w, max_h)`を指定すると、クロップ領域がその
+        サイズを超えないよう中心を保ったまま制限する。`AdvancedHandAutoFixer`
+        のリトライループで、再検出結果の悪化によりクロップが際限なく
+        肥大化する（＝サンプリングコストが跳ね上がる）のを防ぐために使う。
         """
         orig_h, orig_w = img_rgb.shape[:2]
 
@@ -388,7 +394,11 @@ class AdvancedHandOrientationOptimizer:
         rotated_points = rotate_points(points_px, angle, old_center, new_center)
 
         rotated_h, rotated_w = rotated_img.shape[:2]
-        crop_box = compute_padded_bbox(rotated_points, padding, rotated_w, rotated_h)
+        max_w = max_crop_size[0] if max_crop_size is not None else None
+        max_h = max_crop_size[1] if max_crop_size is not None else None
+        crop_box = compute_padded_bbox(
+            rotated_points, padding, rotated_w, rotated_h, max_width=max_w, max_height=max_h
+        )
         x1, y1, x2, y2 = crop_box
 
         if x2 <= x1 or y2 <= y1:
@@ -1121,6 +1131,18 @@ class AdvancedHandAutoFixer:
         selected = initial_selected
         attempts_used = 0
         final_status = "unknown"
+        # ★2026-07-09: 実写環境でのログ調査により発見・修正した重大な
+        # パフォーマンス問題への対処。リトライのたびに「貼り戻し後の
+        # （完璧ではない）画像」に対して手を再検出し、その結果でクロップ
+        # 範囲を決め直していたため、再検出結果が悪化する（誤って広い
+        # 範囲を「手」と判定してしまう等）と、クロップ＝サンプリング対象の
+        # 画像サイズが際限なく肥大化し、KSamplerの1ステップあたりの時間が
+        # 指数的に悪化する（実測で1回目→3回目にかけて約50倍に悪化する
+        # ケースを確認）現象が起きていた。1回目の試行で得られたクロップ
+        # サイズを上限として記憶し、2回目以降はそれを超えないようクロップ
+        # 範囲を制限することで、リトライのたびに処理コストが跳ね上がる
+        # ことを防ぐ（詳細はMILESTONES.mdを参照）。
+        first_attempt_crop_size: tuple[int, int] | None = None
 
         for attempt in range(max_retries + 1):
             attempts_used = attempt + 1
@@ -1130,8 +1152,12 @@ class AdvancedHandAutoFixer:
                 break
 
             cropped_rgb, remap_info = optimizer._crop_for_hand(
-                current_rgb, selected, padding, image_index
+                current_rgb, selected, padding, image_index, max_crop_size=first_attempt_crop_size
             )
+
+            if first_attempt_crop_size is None:
+                crop_h, crop_w = cropped_rgb.shape[:2]
+                first_attempt_crop_size = (crop_w, crop_h)
 
             # ★重要: `selected.mask`は元画像（クロップ前）の座標系のマスク
             # であり、これから貼り戻し処理で扱う「クロップ後の画像」の

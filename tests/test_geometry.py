@@ -156,6 +156,60 @@ class TestComputePaddedBbox:
         assert bbox == (0, 0, 200, 200)
 
 
+class TestComputePaddedBboxMaxSizeCap:
+    """
+    ★2026-07-09追加: AdvancedHandAutoFixerのリトライ間でクロップ領域が
+    際限なく肥大化し、サンプリングコストが跳ね上がる問題（実写環境の
+    ログ調査で発見）を防ぐための max_width/max_height 上限機能のテスト。
+    """
+
+    def test_no_cap_when_max_size_not_specified(self):
+        """max_width/max_heightを指定しなければ従来通りの挙動（後方互換性）"""
+        points = [(10.0, 10.0), (900.0, 900.0)]
+        bbox = geometry.compute_padded_bbox(points, padding=10, image_width=1000, image_height=1000)
+        assert bbox == (0, 0, 910, 910)
+
+    def test_bbox_within_cap_is_unaffected(self):
+        """bboxが元々上限以下なら、指定しても何も変わらない"""
+        points = [(10.0, 10.0), (50.0, 50.0)]
+        bbox_uncapped = geometry.compute_padded_bbox(points, padding=5, image_width=200, image_height=200)
+        bbox_capped = geometry.compute_padded_bbox(
+            points, padding=5, image_width=200, image_height=200, max_width=200, max_height=200
+        )
+        assert bbox_uncapped == bbox_capped
+
+    def test_oversized_bbox_is_clamped_to_max_size(self):
+        """上限を超えるbboxは、中心を保ったまま指定サイズまで縮小される"""
+        points = [(10.0, 10.0), (900.0, 900.0)]
+        bbox = geometry.compute_padded_bbox(
+            points, padding=10, image_width=1000, image_height=1000, max_width=200, max_height=200
+        )
+        assert (bbox[2] - bbox[0]) == 200
+        assert (bbox[3] - bbox[1]) == 200
+        # 中心が元のbbox（x1=0, x2=910 → center=455）の中心付近に保たれていることを確認
+        orig_center_x = (0.0 + 910.0) / 2
+        capped_center_x = (bbox[0] + bbox[2]) / 2
+        assert abs(capped_center_x - orig_center_x) < 5
+
+    def test_capped_bbox_still_clips_to_image_bounds(self):
+        """上限適用後も画像範囲内に収まる（画像端付近での縮小時の押し戻しを確認）"""
+        points = [(5.0, 5.0), (50.0, 50.0)]  # 画像の左上端近く
+        bbox = geometry.compute_padded_bbox(
+            points, padding=10, image_width=100, image_height=100, max_width=200, max_height=200
+        )
+        assert bbox[0] >= 0 and bbox[1] >= 0
+        assert bbox[2] <= 100 and bbox[3] <= 100
+
+    def test_only_width_capped_height_unlimited(self):
+        """max_width/max_heightは独立して指定できる"""
+        points = [(10.0, 10.0), (900.0, 50.0)]
+        bbox = geometry.compute_padded_bbox(
+            points, padding=10, image_width=1000, image_height=1000, max_width=200, max_height=None
+        )
+        assert (bbox[2] - bbox[0]) == 200
+        assert (bbox[3] - bbox[1]) == 60  # padding込みの高さはそのまま(50-10=40+20)
+
+
 class TestInverseTransformRoundTrip:
     """forward変換(rotate_image)→逆変換(inverse_transform_image)の往復精度を検証"""
 

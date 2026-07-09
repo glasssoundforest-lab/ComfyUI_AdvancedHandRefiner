@@ -192,9 +192,25 @@ def compute_padded_bbox(
     padding: int,
     image_width: int,
     image_height: int,
+    max_width: int | None = None,
+    max_height: int | None = None,
 ) -> tuple[int, int, int, int]:
     """
     点群を囲むbounding boxをpaddingだけ広げ、画像範囲内に収める。
+
+    `max_width`/`max_height`を指定すると、bboxの一辺がその値を超える
+    場合、bboxの中心を保ったまま指定サイズまで縮小する（画像範囲内に
+    収まるようクリップした上で）。これは主に、AdvancedHandAutoFixerの
+    リトライループで「再検出結果が悪化し、bboxが際限なく肥大化して
+    サンプリングコストが跳ね上がる」ことを防ぐための安全弁として使う
+    （★2026-07-09: 実際にこの問題を実写環境のログで確認し追加した。
+    詳細はMILESTONES.mdを参照）。
+
+    Args:
+        points: 点群（ピクセル単位）
+        padding: bboxを広げるピクセル数
+        image_width, image_height: 画像サイズ（クリップ用）
+        max_width, max_height: bboxの最大サイズ（Noneの場合は無制限）
 
     Returns:
         (x1, y1, x2, y2) — 画像範囲でクリップ済み
@@ -207,6 +223,22 @@ def compute_padded_bbox(
     x2 = int(max(xs)) + padding
     y2 = int(max(ys)) + padding
 
+    if max_width is not None and (x2 - x1) > max_width:
+        cx = (x1 + x2) / 2.0
+        x1 = int(round(cx - max_width / 2.0))
+        x2 = x1 + max_width
+    if max_height is not None and (y2 - y1) > max_height:
+        cy = (y1 + y2) / 2.0
+        y1 = int(round(cy - max_height / 2.0))
+        y2 = y1 + max_height
+
+    # 画像範囲内にクリップする（縮小後に範囲外へはみ出した場合の押し戻しも含む）
+    if x1 < 0:
+        x2 -= x1
+        x1 = 0
+    if y1 < 0:
+        y2 -= y1
+        y1 = 0
     x1 = max(0, x1)
     y1 = max(0, y1)
     x2 = min(image_width, x2)

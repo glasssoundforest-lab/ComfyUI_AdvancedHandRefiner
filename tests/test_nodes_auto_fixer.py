@@ -389,7 +389,106 @@ class TestRunInpaintSamplingPadding:
         assert result.shape[:2] == (64, 48)
 
 
-class TestSamplerSchedulerDropdown:
+class TestRetryCropSizeCap:
+    """
+    ★2026-07-09追加: 実写環境のログ調査で発見した重大なパフォーマンス
+    問題（リトライのたびに再検出結果が悪化し、クロップ＝サンプリング対象
+    画像が際限なく肥大化して1回目→3回目で約50倍処理時間が悪化した事例）
+    に対する回帰テスト。1回目の試行で得られたクロップサイズが、以降の
+    リトライでのクロップ上限として機能することを、`auto_fix`経由の
+    エンドツーエンドで検証する。
+    """
+
+    def _common_kwargs(self):
+        return dict(
+            model=None,
+            positive=None,
+            negative=None,
+            vae=None,
+            seed=0,
+            steps=20,
+            cfg=7.0,
+            sampler_name="euler",
+            scheduler="normal",
+            denoise=0.6,
+        )
+
+    def test_retry_crop_size_is_capped_even_if_redetection_expands_drastically(self):
+        fixer = nodes.AdvancedHandAutoFixer()
+        canvas = 200  # "退化した"検出が画像全体近くに広がる余地を作るため大きめのキャンバス
+
+        call_state = {"n": 0}
+        captured_crop_shapes = []
+
+        def detect_side_effect(image_rgb, *_args, **_kwargs):
+            call_state["n"] += 1
+            h, w = image_rgb.shape[:2]
+            n = call_state["n"]
+            if n == 3:
+                # 1回目試行後、貼り戻し画像への再検出が「悪化」し、画像全体
+                # 近くに広がるlandmarksを返すケースを模す（実写環境で実際に
+                # 観測された「前景面積の急拡大」に相当）
+                landmarks = [(w * 0.02, h * 0.02), (w * 0.98, h * 0.98)] + [(w * 0.5, h * 0.5)] * 19
+            else:
+                landmarks = _landmarks_for_size(float(w), float(h))
+            mask = generate_synthetic_hand_mask(canvas_size=(w, h), palm_radius=min(w, h) * 0.15)
+            hand = HandDetection(
+                bbox=BoundingBox(w * 0.1, h * 0.1, w * 0.9, h * 0.9),
+                landmarks=landmarks,
+                mask=mask,
+                source="fake",
+            )
+            return DetectionResult(hands=[hand])
+
+        def fake_inpaint(self_, model, positive, negative, vae, image_crop_rgb, coarse_mask, **kwargs):
+            captured_crop_shapes.append(image_crop_rgb.shape[:2])
+            h, w = image_crop_rgb.shape[:2]
+            return np.zeros((h, w, 3), dtype=np.uint8)
+
+        def quality_side_effect(*_args, **_kwargs):
+            # 呼び出し3(1回目試行後の再検出直後)の時点ではリトライさせ、
+            # それ以降(2回目試行後)は正常判定して打ち切らせる
+            return {"is_abnormal": call_state["n"] <= 3}
+
+        with patch.object(nodes, "_detect_hands", side_effect=detect_side_effect), patch.object(
+            nodes.AdvancedHandAutoFixer, "_run_inpaint_sampling", fake_inpaint
+        ), patch.object(nodes, "assess_hand_overall_quality", side_effect=quality_side_effect):
+            image, report = fixer.auto_fix(
+                _image_tensor(h=canvas, w=canvas), max_retries=1, **self._common_kwargs()
+            )
+
+        assert len(captured_crop_shapes) == 2, "2回試行されているはず"
+        first_h, first_w = captured_crop_shapes[0]
+        second_h, second_w = captured_crop_shapes[1]
+
+        # 修正前は、退化したlandmarksにより2回目のクロップが画像全体近くまで
+        # 肥大化しうる問題があった。修正後は1回目のクロップサイズが上限として
+        # 効くため、大幅な拡大は起きないはず。
+        assert second_h <= first_h + 2
+        assert second_w <= first_w + 2
+        # 上限が「無意味に小さい」だけになっていないことも確認（実際に手サイズ相当）
+        assert first_h > 0 and first_w > 0
+
+    def test_max_crop_size_none_preserves_legacy_unbounded_behavior(self):
+        """
+        `_crop_for_hand`にmax_crop_sizeを渡さない場合（＝手動ワークフロー用の
+        `AdvancedHandOrientationOptimizer`単体利用時）は、従来通り上限無しで
+        動作すること（後方互換性）を確認する。
+        """
+        optimizer = nodes.AdvancedHandOrientationOptimizer()
+        img_rgb = np.zeros((200, 200, 3), dtype=np.uint8)
+        landmarks = [(4.0, 4.0), (196.0, 196.0)] + [(100.0, 100.0)] * 19
+        mask = generate_synthetic_hand_mask(canvas_size=(200, 200), palm_radius=20)
+        selected = HandDetection(
+            bbox=BoundingBox(4, 4, 196, 196), landmarks=landmarks, mask=mask, source="fake"
+        )
+
+        cropped, _remap_info = optimizer._crop_for_hand(img_rgb, selected, padding=5, image_index=0)
+        # 上限を指定していないので、landmarksの広い範囲に応じた大きなクロップになる
+        assert cropped.shape[0] > 150 or cropped.shape[1] > 150
+
+
+
     """
     sampler_name / scheduler が ComfyUI 標準の KSampler 系ノードと同様、
     自由入力の STRING ではなく選択式（COMBO）になっており、かつ
