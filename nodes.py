@@ -238,6 +238,42 @@ def _select_hand(result: DetectionResult, hand_index: int):
     return result.hands[hand_index]
 
 
+def _generous_fallback_mask(shape: tuple[int, int]) -> np.ndarray:
+    """
+    クロップ後の画像に対する再検出が完全に失敗した場合
+    （YOLO・MediaPipeともに何も検出できず、SAM2への
+    セグメンテーションプロンプトすら構築できない場合）のフォールバック
+    マスクを生成する。
+
+    ★2026-07-11追加: 従来は再検出に失敗すると、その手のインペイントを
+    完全に諦めて（`_fix_one_hand`のループを中断して）元の状態のまま
+    残していた。しかし実際にユーザー環境で、指を握り込んだ/グローブに
+    覆われた等の「そもそも検出が難しいポーズ」の手が、この経路で
+    一度もインペイントされないまま残ってしまうことを確認した。
+
+    クロップ自体は既に（親の検出結果のbboxに基づき）手の領域周辺に
+    絞られていることを踏まえ、「精密なマスクが得られないなら諦める」
+    のではなく、「クロップの大部分を覆う楕円形の大まかなマスクで、
+    ともかく再生成を試みる」方針に変更した。多少不正確でも、
+    全く手を加えないよりは改善の見込みがある。
+
+    Args:
+        shape: (H, W) クロップ画像のサイズ
+
+    Returns:
+        0-255 uint8 マスク（H, W）。クロップ中央を覆う楕円形。
+    """
+    h, w = shape
+    mask = np.zeros((h, w), dtype=np.uint8)
+    if h <= 0 or w <= 0:
+        return mask
+    center = (w // 2, h // 2)
+    # 端に接すると継ぎ目が目立ちやすいため、8割強に留めた余白を持たせる
+    axes = (max(1, int(w * 0.42)), max(1, int(h * 0.42)))
+    cv2.ellipse(mask, center, axes, 0, 0, 360, 255, -1)
+    return mask
+
+
 def _tensor_to_numpy_rgb(image: torch.Tensor, index: int = 0) -> np.ndarray:
     """ComfyUIの IMAGE テンソル（B, H, W, C, 0-1 float）のうち、
     index番目の画像を RGB uint8 ndarray（H, W, C）に変換する"""
@@ -1305,10 +1341,25 @@ class AdvancedHandAutoFixer:
             )
 
             if crop_selected is None or crop_selected.mask is None:
-                final_status = "クロップ後の画像で手を再検出できず中断"
-                break
-
-            coarse_mask = crop_selected.mask
+                # ★2026-07-11修正: 以前はここで即座に諦めて（このハンドの
+                # インペイントを完全に中断して）元の状態のまま残していた。
+                # 検出が難しいポーズ（指の握り込み・グローブ等）の手が
+                # 一度もインペイントされずに残ってしまう原因になっていた
+                # ため、精密な検出に失敗しても、クロップ中央を覆う大まかな
+                # 楕円マスクでともかく再生成を試みるよう変更した
+                # （`_generous_fallback_mask`参照）。
+                logger.warning(
+                    "HandAutoFixer: [image_index=%d, hand=%d, attempt=%d/%d] "
+                    "クロップ後の画像で手を検出できませんでした。"
+                    "大まかな楕円マスクでインペイントを試みます。",
+                    image_index,
+                    hand_index,
+                    attempt + 1,
+                    max_retries + 1,
+                )
+                coarse_mask = _generous_fallback_mask(cropped_rgb.shape[:2])
+            else:
+                coarse_mask = crop_selected.mask
 
             try:
                 inpainted_rgb = self._run_inpaint_sampling(

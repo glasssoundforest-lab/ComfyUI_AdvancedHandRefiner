@@ -390,6 +390,93 @@ class TestRunInpaintSamplingPadding:
         assert result.shape[:2] == (64, 48)
 
 
+class TestGenerousFallbackMaskWhenCropDetectionFails:
+    """
+    ★2026-07-11追加: クロップサイズのクラッシュ問題が解消された後、
+    ユーザーから提供された実行ログで新たに判明した問題への回帰テスト。
+
+    従来、クロップ後の画像に対する再検出が完全に失敗する
+    （YOLO・MediaPipeともに何も検出できず、SAM2への
+    セグメンテーションプロンプトすら構築できない）と、
+    `_fix_one_hand`はその手のインペイントを完全に諦めて元の状態のまま
+    残していた。指を握り込んだ/グローブに覆われた等の「そもそも検出が
+    難しいポーズ」の手が、一度もインペイントされないまま残ってしまう
+    ことを実際のログ・比較画像で確認した。
+
+    大まかな楕円マスク(`_generous_fallback_mask`)でともかく再生成を
+    試みるよう変更したことを検証する。
+    """
+
+    def test_generous_fallback_mask_covers_central_region(self):
+        mask = nodes._generous_fallback_mask((100, 200))
+        assert mask.shape == (100, 200)
+        assert mask.dtype == np.uint8
+        # 中央付近は覆われている
+        assert mask[50, 100] == 255
+        # 端はマージンとして空けてある
+        assert mask[0, 0] == 0
+        assert mask[99, 199] == 0
+
+    def test_generous_fallback_mask_handles_degenerate_shape_safely(self):
+        mask = nodes._generous_fallback_mask((0, 0))
+        assert mask.shape == (0, 0)
+
+    def test_auto_fix_still_inpaints_when_crop_level_detection_completely_fails(self):
+        """
+        クロップ後の検出が完全に失敗しても(YOLO/MediaPipe/SAM2いずれも
+        何も検出できない)、フォールバックマスクでインペイントが実行される
+        ことを確認する（以前は即座に諦めて元の画像のまま残っていた）。
+        """
+        fixer = nodes.AdvancedHandAutoFixer()
+        canvas = 200
+
+        initial_hand = HandDetection(
+            bbox=BoundingBox(20, 20, 180, 180),
+            landmarks=_landmarks_for_size(float(canvas), float(canvas)),
+            mask=generate_synthetic_hand_mask(canvas_size=(canvas, canvas), palm_radius=30),
+            source="fake",
+        )
+
+        call_state = {"n": 0}
+
+        def detect_side_effect(image_rgb, *_args, **_kwargs):
+            call_state["n"] += 1
+            if call_state["n"] == 1:
+                # 最初の全体検出のみ成功させる
+                return DetectionResult(hands=[initial_hand])
+            # クロップ後の再検出は常に失敗（YOLO/MediaPipeとも何も検出できない）
+            return DetectionResult(hands=[])
+
+        captured_masks = []
+
+        def fake_inpaint(self_, model, positive, negative, vae, image_crop_rgb, coarse_mask, **kwargs):
+            captured_masks.append(coarse_mask.copy())
+            h, w = image_crop_rgb.shape[:2]
+            return np.full((h, w, 3), 128, dtype=np.uint8)
+
+        with patch.object(nodes, "_detect_hands", side_effect=detect_side_effect), patch.object(
+            nodes.AdvancedHandAutoFixer, "_run_inpaint_sampling", fake_inpaint
+        ):
+            image, report = fixer.auto_fix(
+                _image_tensor(h=canvas, w=canvas),
+                model=None,
+                positive=None,
+                negative=None,
+                vae=None,
+                seed=0,
+                steps=20,
+                cfg=7.0,
+                sampler_name="euler",
+                scheduler="normal",
+                denoise=0.6,
+                max_retries=0,
+            )
+
+        # フォールバックマスクでインペイントが実際に呼ばれたことを確認
+        assert len(captured_masks) == 1
+        assert captured_masks[0].sum() > 0, "フォールバックマスクが空だった（インペイントが実行されなかった）"
+
+
 class TestCropForHandLandmarksUnavailableFallback:
     """
     ★2026-07-11追加: 実行ログの詳細な調査で発見した重大なバグの回帰テスト。
