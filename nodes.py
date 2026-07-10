@@ -1013,6 +1013,21 @@ class AdvancedHandAutoFixer:
                     "FLOAT",
                     {"default": 0.5, "min": 0.0, "max": 1.0, "step": 0.05},
                 ),
+                "max_crop_dimension": (
+                    "INT",
+                    {
+                        "default": 768,
+                        "min": 128,
+                        "max": 2048,
+                        "step": 32,
+                        "tooltip": (
+                            "クロップ（サンプリング対象領域）の一辺の絶対的な上限（px）。"
+                            "検出結果が悪化して手に対して不自然に広い範囲を検出してしまった"
+                            "場合でも、この値を超えるクロップは作られない。値を大きくしすぎると"
+                            "VRAM消費・処理時間が増え、OOM等のクラッシュリスクが高まる。"
+                        ),
+                    },
+                ),
             },
         }
 
@@ -1043,6 +1058,7 @@ class AdvancedHandAutoFixer:
         expected_fingers: int = 5,
         mask_grow_pixels: int = 6,
         color_match_strength: float = 0.5,
+        max_crop_dimension: int = 768,
     ):
         batch_size = image.shape[0]
         optimizer = AdvancedHandOrientationOptimizer()
@@ -1091,6 +1107,7 @@ class AdvancedHandAutoFixer:
                     expected_fingers=expected_fingers,
                     mask_grow_pixels=mask_grow_pixels,
                     color_match_strength=color_match_strength,
+                    max_crop_dimension=max_crop_dimension,
                 )
                 report_lines.append(hand_report)
 
@@ -1128,6 +1145,7 @@ class AdvancedHandAutoFixer:
         expected_fingers: int,
         mask_grow_pixels: int,
         color_match_strength: float,
+        max_crop_dimension: int = 768,
     ) -> tuple[np.ndarray, str]:
         """1つの手について、リトライループ全体を実行する内部ヘルパー"""
         current_rgb = base_image_rgb
@@ -1145,7 +1163,24 @@ class AdvancedHandAutoFixer:
         # サイズを上限として記憶し、2回目以降はそれを超えないようクロップ
         # 範囲を制限することで、リトライのたびに処理コストが跳ね上がる
         # ことを防ぐ（詳細はMILESTONES.mdを参照）。
+        #
+        # ★2026-07-11追加: 上記の対策は「同じ手の2回目以降の試行」で
+        # クロップが際限なく肥大化するのを防ぐものだったが、
+        # (a) 1回目の試行自体がそもそも検出結果の悪化により異常に
+        #     大きくなるケース、(b) process_all_hands=True で複数の手を
+        #     処理する際、後続の手の「1回目の試行」が独自に大きくなる
+        #     ケース、には対応できていなかった。実際にユーザー環境で、
+        #     この種の巨大クロップによりVAEデコード中にVRAM枯渇由来と
+        #     見られるネイティブクラッシュ（"Fatal Python error: Aborted"）
+        #     が発生することを実行ログで確認した。また、クロップが手に
+        #     対して過度に大きいと、拡散モデルが「周囲の生地（グローブ等）
+        #     の継続」を優先してしまい、手そのものがほとんど描かれない
+        #     （肌がほぼ見えない）症状にもつながることが分かった。
+        #     そのため、試行回数・手の順序に関わらず常に効く「絶対的な
+        #     上限」（`max_crop_dimension`）を追加し、1回目の試行から
+        #     一貫して適用するようにした。
         first_attempt_crop_size: tuple[int, int] | None = None
+        abs_cap = max(1, int(max_crop_dimension))
 
         for attempt in range(max_retries + 1):
             attempts_used = attempt + 1
@@ -1154,8 +1189,16 @@ class AdvancedHandAutoFixer:
                 final_status = "手が取得できず中断"
                 break
 
+            if first_attempt_crop_size is not None:
+                effective_cap = (
+                    min(first_attempt_crop_size[0], abs_cap),
+                    min(first_attempt_crop_size[1], abs_cap),
+                )
+            else:
+                effective_cap = (abs_cap, abs_cap)
+
             cropped_rgb, remap_info = optimizer._crop_for_hand(
-                current_rgb, selected, padding, image_index, max_crop_size=first_attempt_crop_size
+                current_rgb, selected, padding, image_index, max_crop_size=effective_cap
             )
 
             if first_attempt_crop_size is None:

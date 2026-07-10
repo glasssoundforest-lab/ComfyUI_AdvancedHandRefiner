@@ -469,6 +469,61 @@ class TestRetryCropSizeCap:
         # 上限が「無意味に小さい」だけになっていないことも確認（実際に手サイズ相当）
         assert first_h > 0 and first_w > 0
 
+    def test_absolute_cap_applies_even_on_first_attempt(self):
+        """
+        ★2026-07-11追加: 実写環境で、リトライ間の相対的な拡大防止だけでは
+        防げないケース（1回目の試行自体、あるいは複数の手を処理する際の
+        後続の手の1回目の試行が、そもそも異常に大きく検出されるケース）
+        で、VAEデコード中のネイティブクラッシュ（VRAM枯渇由来と見られる）
+        が発生することが実行ログで確認された。max_crop_dimension による
+        絶対的な上限が、リトライの有無・何回目かに関わらず、1回目の
+        試行から一貫して適用されることを確認する。
+        """
+        fixer = nodes.AdvancedHandAutoFixer()
+        canvas = 2000  # 実写環境同様、非常に大きな画像を想定
+
+        captured_crop_shapes = []
+
+        def detect_side_effect(image_rgb, *_args, **_kwargs):
+            h, w = image_rgb.shape[:2]
+            # 1回目の検出時点から、画像のほぼ全体に広がるlandmarksを返す
+            # （現実には、悪化した検出やlandmarksの誤爆でこの状態になりうる）
+            landmarks = [(w * 0.02, h * 0.02), (w * 0.98, h * 0.98)] + [(w * 0.5, h * 0.5)] * 19
+            mask = generate_synthetic_hand_mask(canvas_size=(w, h), palm_radius=min(w, h) * 0.15)
+            hand = HandDetection(
+                bbox=BoundingBox(w * 0.05, h * 0.05, w * 0.95, h * 0.95),
+                landmarks=landmarks,
+                mask=mask,
+                source="fake",
+            )
+            return DetectionResult(hands=[hand])
+
+        def fake_inpaint(self_, model, positive, negative, vae, image_crop_rgb, coarse_mask, **kwargs):
+            captured_crop_shapes.append(image_crop_rgb.shape[:2])
+            h, w = image_crop_rgb.shape[:2]
+            return np.zeros((h, w, 3), dtype=np.uint8)
+
+        with patch.object(nodes, "_detect_hands", side_effect=detect_side_effect), patch.object(
+            nodes.AdvancedHandAutoFixer, "_run_inpaint_sampling", fake_inpaint
+        ), patch.object(nodes, "assess_hand_overall_quality", return_value={"is_abnormal": False}):
+            image, report = fixer.auto_fix(
+                _image_tensor(h=canvas, w=canvas),
+                max_retries=0,
+                max_crop_dimension=768,
+                **self._common_kwargs(),
+            )
+
+        assert len(captured_crop_shapes) == 1
+        first_h, first_w = captured_crop_shapes[0]
+        # 上限(768)を明確に超えるサイズ(canvas=2000の大部分)にはなっていないはず
+        assert first_h <= 768
+        assert first_w <= 768
+
+    def test_default_max_crop_dimension_input_type(self):
+        input_types = nodes.AdvancedHandAutoFixer.INPUT_TYPES()
+        spec = input_types["optional"]["max_crop_dimension"]
+        assert spec[1]["default"] == 768
+
     def test_max_crop_size_none_preserves_legacy_unbounded_behavior(self):
         """
         `_crop_for_hand`にmax_crop_sizeを渡さない場合（＝手動ワークフロー用の
