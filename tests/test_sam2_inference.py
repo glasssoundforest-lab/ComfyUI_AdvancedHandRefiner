@@ -21,7 +21,12 @@ import cv2
 import numpy as np
 import pytest
 
-from utils.sam2_inference import Sam2OnnxInference, _remove_small_regions, _tile_starts
+from utils.sam2_inference import (
+    Sam2OnnxInference,
+    _dedupe_points_and_labels,
+    _remove_small_regions,
+    _tile_starts,
+)
 
 
 class _FakeDecoderSession:
@@ -860,3 +865,106 @@ class TestConcurrentSessionAccessIsSerialized:
         assert tracking_session.max_concurrent > 1, (
             "対照実験自体が同時実行を検知できていない（テスト設計の不備の可能性）"
         )
+
+
+class TestDedupePointsAndLabels:
+    """
+    ★2026-07-11追加: 実際のCUDA実行プロバイダ環境で
+    `ScatterND with reduction=='none' only guarantees to be correct if
+    indices are not duplicated.` という警告が確認されたことを受け、
+    デコーダへ渡す座標プロンプトから完全に重複する座標を除去する
+    `_dedupe_points_and_labels()`のテスト。
+    """
+
+    def test_no_duplicates_returns_unchanged(self):
+        coords = [[10.0, 20.0], [30.0, 40.0], [50.0, 60.0]]
+        labels = [2, 3, 1]
+        out_coords, out_labels = _dedupe_points_and_labels(coords, labels)
+        assert out_coords == coords
+        assert out_labels == labels
+
+    def test_exact_duplicate_is_removed_keeping_first_occurrence_label(self):
+        """
+        bboxの隅(label=2)の後にpointプロンプト(label=1)が全く同じ座標に
+        重複した場合、先に出現するbbox隅側のラベルが優先されることを確認する
+        （bboxの隅というラベルの意味を、後続の重複pointに奪われないように
+        するため、この優先順位は重要）。
+        """
+        coords = [[10.0, 20.0], [30.0, 40.0], [10.0, 20.0]]
+        labels = [2, 3, 1]
+        out_coords, out_labels = _dedupe_points_and_labels(coords, labels)
+        assert out_coords == [[10.0, 20.0], [30.0, 40.0]]
+        assert out_labels == [2, 3]
+
+    def test_near_identical_floating_point_values_are_treated_as_duplicate(self):
+        """浮動小数点の丸め誤差程度の違い（小数第3位までで一致）は重複として扱う"""
+        coords = [[10.0, 20.0], [10.0000001, 19.9999999]]
+        labels = [2, 1]
+        out_coords, out_labels = _dedupe_points_and_labels(coords, labels)
+        assert len(out_coords) == 1
+
+    def test_empty_input_returns_empty(self):
+        out_coords, out_labels = _dedupe_points_and_labels([], [])
+        assert out_coords == []
+        assert out_labels == []
+
+    def test_degenerate_box_with_identical_corners_collapses_to_one_point(self):
+        """bboxが実質1点に潰れている（x1==x2, y1==y2）退化ケースの確認"""
+        coords = [[100.0, 100.0], [100.0, 100.0]]
+        labels = [2, 3]
+        out_coords, out_labels = _dedupe_points_and_labels(coords, labels)
+        assert len(out_coords) == 1
+        assert out_labels == [2]  # 先頭(top-left)側のラベルが残る
+
+
+class TestDedupeAppliedInRealDecoderCalls:
+    """
+    `_dedupe_points_and_labels`が、実際の推論経路
+    （`_predict_prob_from_box`/`_predict_prob_from_points`）から
+    正しく呼ばれ、デコーダへ渡される`point_coords`/`point_labels`の
+    件数が実際に減っていることをエンドツーエンドで確認する。
+    """
+
+    def test_predict_from_box_with_duplicate_point_deduplicates_before_decoder(self):
+        decoder_names = [
+            "point_coords",
+            "point_labels",
+            "mask_input",
+            "has_mask_input",
+            "orig_im_size",
+            "image_embed",
+        ]
+        raw_mask = np.ones((1, 1, 64, 64), dtype=np.float32)
+        encoder_outputs = {"image_embed": np.zeros((1, 32, 64, 64), dtype=np.float32)}
+        obj, decoder_session, _encoder_session = _make_instance(
+            decoder_names, raw_mask, encoder_outputs=encoder_outputs
+        )
+
+        image = np.zeros((64, 64, 3), dtype=np.uint8)
+        # bboxの右下隅(64,64)と厳密に同じ座標のpointを追加で渡す
+        obj._predict_prob_from_box(image, (0.0, 0.0, 64.0, 64.0), points=[(64.0, 64.0)])
+
+        sent_coords = decoder_session.last_input_feed["point_coords"]
+        # bbox隅2点のみが残り、重複したpointは除去されているはず(3点ではなく2点)
+        assert sent_coords.shape[1] == 2
+
+    def test_predict_from_points_with_duplicate_points_deduplicates_before_decoder(self):
+        decoder_names = [
+            "point_coords",
+            "point_labels",
+            "mask_input",
+            "has_mask_input",
+            "orig_im_size",
+            "image_embed",
+        ]
+        raw_mask = np.ones((1, 1, 64, 64), dtype=np.float32)
+        encoder_outputs = {"image_embed": np.zeros((1, 32, 64, 64), dtype=np.float32)}
+        obj, decoder_session, _encoder_session = _make_instance(
+            decoder_names, raw_mask, encoder_outputs=encoder_outputs
+        )
+
+        image = np.zeros((64, 64, 3), dtype=np.uint8)
+        obj._predict_prob_from_points(image, [(10.0, 10.0), (20.0, 20.0), (10.0, 10.0)])
+
+        sent_coords = decoder_session.last_input_feed["point_coords"]
+        assert sent_coords.shape[1] == 2  # 3点中1点は重複のため2点に減っているはず

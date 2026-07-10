@@ -77,6 +77,50 @@ def _tile_starts(length: int, tile_size: int, overlap: int) -> list[tuple[int, i
     return [(s, tile_size) for s in starts]
 
 
+def _dedupe_points_and_labels(
+    coords: list[list[float]], labels: list[float]
+) -> tuple[list[list[float]], list[float]]:
+    """
+    座標プロンプト列(bbox隅+追加point等)から、完全に一致する座標の
+    重複を取り除く。
+
+    ★2026-07-11追加: 実際にCUDA実行プロバイダで
+    `[W:onnxruntime:Default, scatter_nd.h] ScatterND with reduction=='none'
+    only guarantees to be correct if indices are not duplicated.` という
+    警告が確認された。SAM2デコーダは内部でpoint promptをposition
+    embeddingへ変換する際にScatterND演算を使っており、渡した座標に
+    重複があると（GPU上のスレッド間で書き込み順序が保証されないため）
+    結果が非決定的になりうる。
+
+    bboxの隅とMediaPipeランドマークを同時にpoint promptとして渡す設計
+    上、bboxが極端に小さい（実質1点に潰れている）検出や、境界条件で
+    landmarks側の点がbboxの隅と厳密に一致するケースでは、完全に同じ
+    座標が重複して渡される可能性があるため、デコーダへ渡す直前に
+    重複を除去する（同じ座標への重複プロンプトはそもそも情報量が無く、
+    除去しても意味的な劣化は無い）。
+
+    ★限界: これはあくまで「我々が渡す座標同士が完全に一致する」ケースの
+    重複のみを除去する。SAM2デコーダの内部実装がposition embeddingを
+    構築する際に使う離散グリッドの解像度までは制御できないため、
+    「異なるが非常に近い」2点が内部でさらに同じグリッドセルへ丸められ
+    衝突する可能性は、この対策の範囲外として残る（モデルアーキテクチャ
+    自体に起因するため、呼び出し側からは制御できない）。
+
+    ラベルは同じ座標が複数回出現した場合、最初に出現したものを優先する。
+    """
+    seen: set[tuple[float, float]] = set()
+    out_coords: list[list[float]] = []
+    out_labels: list[float] = []
+    for coord, label in zip(coords, labels):
+        key = (round(float(coord[0]), 3), round(float(coord[1]), 3))
+        if key in seen:
+            continue
+        seen.add(key)
+        out_coords.append(coord)
+        out_labels.append(label)
+    return out_coords, out_labels
+
+
 class Sam2OnnxInference:
     """onnxruntime を使ったSAM2セグメンテーションの推論ラッパー"""
 
@@ -202,6 +246,11 @@ class Sam2OnnxInference:
         if points:
             coords.extend([[px * scale_x, py * scale_y] for px, py in points])
             labels.extend([1] * len(points))
+
+        # bboxの隅とpointsの間で座標が完全に重複すると、SAM2デコーダ内部の
+        # ScatterND演算がCUDA上で非決定的になりうるため、重複を除去する
+        # （bboxの隅が先頭にあるため、重複時はbbox隅側のラベルが優先される）
+        coords, labels = _dedupe_points_and_labels(coords, labels)
 
         point_coords = np.array([coords], dtype=np.float32)
         point_labels = np.array([labels], dtype=np.float32)
@@ -440,6 +489,7 @@ class Sam2OnnxInference:
                 if lp:
                     coords.extend([[px * scale_x, py * scale_y] for px, py in lp])
                     labels.extend([1] * len(lp))
+                coords, labels = _dedupe_points_and_labels(coords, labels)
                 point_coords = np.array([coords], dtype=np.float32)
                 point_labels = np.array([labels], dtype=np.float32)
                 tile_prob_with = self._run_decoder_prob(
@@ -548,8 +598,10 @@ class Sam2OnnxInference:
         encoder_outputs, (scale_x, scale_y), (orig_h, orig_w) = self._encode_image(image_rgb)
 
         scaled_points = [[px * scale_x, py * scale_y] for px, py in points]
+        labels = [1] * len(points)
+        scaled_points, labels = _dedupe_points_and_labels(scaled_points, labels)
         point_coords = np.array([scaled_points], dtype=np.float32)
-        point_labels = np.array([[1] * len(points)], dtype=np.float32)
+        point_labels = np.array([labels], dtype=np.float32)
 
         return self._run_decoder_prob(encoder_outputs, point_coords, point_labels, (orig_h, orig_w))
 
