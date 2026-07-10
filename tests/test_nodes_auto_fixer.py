@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import sys
 import types
+import types
 from unittest.mock import patch
 
 import numpy as np
@@ -640,3 +641,99 @@ class TestRetryCropSizeCap:
 
         assert image.shape == (1, 64, 64, 3)
         assert "検出できませんでした" in report
+
+
+class TestDiagnosticLoggingForCropSize:
+    """
+    ★2026-07-11追加: max_crop_dimension導入後もユーザー環境で同一の
+    クラッシュ/低速化が再現したため、実際に使われているクロップサイズを
+    実行ログから確定できるよう診断ログを追加した。そのログが実際に
+    出力されることを確認する回帰テスト。
+    """
+
+    def _common_kwargs(self):
+        return dict(
+            model=None,
+            positive=None,
+            negative=None,
+            vae=None,
+            seed=0,
+            steps=20,
+            cfg=7.0,
+            sampler_name="euler",
+            scheduler="normal",
+            denoise=0.6,
+        )
+
+    def test_crop_size_is_logged_before_inpaint_sampling(self, caplog):
+        fixer = nodes.AdvancedHandAutoFixer()
+        canvas = 200
+
+        hand = HandDetection(
+            bbox=BoundingBox(20, 20, 180, 180),
+            landmarks=_landmarks_for_size(float(canvas), float(canvas)),
+            mask=generate_synthetic_hand_mask(canvas_size=(canvas, canvas), palm_radius=30),
+            source="fake",
+        )
+
+        def fake_inpaint(self_, model, positive, negative, vae, image_crop_rgb, coarse_mask, **kwargs):
+            h, w = image_crop_rgb.shape[:2]
+            return np.zeros((h, w, 3), dtype=np.uint8)
+
+        with caplog.at_level("INFO", logger="HandRefiner"), patch.object(
+            nodes, "_detect_hands", return_value=DetectionResult(hands=[hand])
+        ), patch.object(nodes.AdvancedHandAutoFixer, "_run_inpaint_sampling", fake_inpaint), patch.object(
+            nodes, "assess_hand_overall_quality", return_value={"is_abnormal": False}
+        ):
+            fixer.auto_fix(
+                _image_tensor(h=canvas, w=canvas), max_retries=0, **self._common_kwargs()
+            )
+
+        messages = [r.message for r in caplog.records]
+        assert any("クロップ処理開始" in m and "crop上限" in m for m in messages), (
+            "クロップサイズの診断ログが出力されていない"
+        )
+
+    def test_vae_decode_wrapped_by_cuda_cache_cleanup_does_not_crash_without_cuda(self):
+        """
+        torch.cuda.is_available()がFalse（本テスト環境相当）でも
+        _run_inpaint_samplingが例外を出さずに完走することを確認する
+        （CUDAキャッシュクリア処理の防御的ガードの確認）。
+        """
+        fixer = nodes.AdvancedHandAutoFixer()
+
+        fake_comfy_nodes = types.ModuleType("nodes")
+
+        class _FakeVAEEncodeForInpaint:
+            def encode(self, vae, pixels, mask, grow_mask_by):
+                return ({"samples": nodes.torch.zeros(1, 4, 8, 8)},)
+
+        class _FakeVAEDecode:
+            def decode(self, vae, samples):
+                return (nodes.torch.zeros(1, 64, 64, 3),)
+
+        def fake_common_ksampler(*args, **kwargs):
+            return ({"samples": nodes.torch.zeros(1, 4, 8, 8)},)
+
+        fake_comfy_nodes.VAEEncodeForInpaint = _FakeVAEEncodeForInpaint
+        fake_comfy_nodes.VAEDecode = _FakeVAEDecode
+        fake_comfy_nodes.common_ksampler = fake_common_ksampler
+
+        with patch.dict(sys.modules, {"nodes": fake_comfy_nodes}):
+            result = fixer._run_inpaint_sampling(
+                model=None,
+                positive=None,
+                negative=None,
+                vae=None,
+                image_crop_rgb=np.zeros((64, 64, 3), dtype=np.uint8),
+                coarse_mask=np.zeros((64, 64), dtype=np.uint8),
+                seed=0,
+                steps=1,
+                cfg=1.0,
+                sampler_name="euler",
+                scheduler="normal",
+                denoise=1.0,
+                grow_mask_by=0,
+            )
+
+        assert result.shape == (64, 64, 3)

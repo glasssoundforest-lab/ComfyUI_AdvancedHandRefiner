@@ -1197,6 +1197,21 @@ class AdvancedHandAutoFixer:
             else:
                 effective_cap = (abs_cap, abs_cap)
 
+            # ★2026-07-11追加: このログはAdvancedHandAutoFixer内部の処理だと
+            # 明示するためのもの。ワークフロー上に別途配置された
+            # AdvancedHandOrientationOptimizer等、他ノードのログ出力と
+            # 区別できるようにする（実行ログの解析時の手がかりにするため）。
+            logger.info(
+                "HandAutoFixer: [image_index=%d, hand=%d, attempt=%d/%d] "
+                "クロップ処理開始 (crop上限=%dx%d)",
+                image_index,
+                hand_index,
+                attempt + 1,
+                max_retries + 1,
+                effective_cap[0],
+                effective_cap[1],
+            )
+
             cropped_rgb, remap_info = optimizer._crop_for_hand(
                 current_rgb, selected, padding, image_index, max_crop_size=effective_cap
             )
@@ -1349,6 +1364,19 @@ class AdvancedHandAutoFixer:
         pad_h = (8 - orig_h % 8) % 8
         pad_w = (8 - orig_w % 8) % 8
 
+        # ★2026-07-11追加: max_crop_dimensionによる上限が実際に効いているかを
+        # 実行ログから確定できるようにするための診断ログ。ここで記録される
+        # サイズが小さいにも関わらず後続でクラッシュ/極端な低速化が起きる
+        # 場合は、クロップサイズ自体は原因ではなく、VRAM管理（モデルの
+        # 再読み込みの繰り返し等）の方を疑う必要があることを示す。
+        logger.info(
+            "HandAutoFixer: インペイント実行 crop=%dx%d (padding後=%dx%d)",
+            orig_w,
+            orig_h,
+            orig_w + pad_w,
+            orig_h + pad_h,
+        )
+
         if pad_h > 0 or pad_w > 0:
             padded_image = cv2.copyMakeBorder(
                 image_crop_rgb, 0, pad_h, 0, pad_w, cv2.BORDER_REPLICATE
@@ -1378,6 +1406,18 @@ class AdvancedHandAutoFixer:
             latent,
             denoise=denoise,
         )
+
+        # ★2026-07-11追加: VAEデコード直前にCUDAの未使用キャッシュを解放する。
+        # サンプリング中に確保されたメモリ（特にリトライ・複数の手を繰り返し
+        # 処理する中で、torchのキャッシングアロケータが断片化しうる）を
+        # デコード前に整理しておくことで、デコードに必要な連続領域の確保
+        # 失敗（ネイティブクラッシュにつながりうる）のリスクを下げる。
+        # torch/CUDAが無い環境（テスト等）でも安全に無視されるようガードする。
+        try:
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+        except Exception:
+            pass
 
         vae_decode = comfy_nodes.VAEDecode()
         (decoded_image,) = vae_decode.decode(vae, sampled_latent)
