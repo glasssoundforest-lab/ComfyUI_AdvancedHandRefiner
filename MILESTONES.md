@@ -1912,6 +1912,73 @@ README.mdに正直に記載した。
 
 ---
 
+## ✅ 根本原因を確定・修正: `_crop_for_hand`のlandmarks無しフォールバックがmax_crop_sizeを無視していた（2026-07-11）
+
+前回追加した診断ログの状態でユーザーに再現していただいた結果、
+決定的な証拠が得られた。3回目の試行のログ:
+
+```
+[INFO] HandAutoFixer: [image_index=0, hand=0, attempt=3/4] クロップ処理開始 (crop上限=238x269)
+[WARNING] HandOrientationOptimizer: 手が検出できませんでした(image_index=0)。入力画像をそのまま返します。
+[INFO] HandAutoFixer: インペイント実行 crop=2304x3456 (padding後=2304x3456)
+```
+
+`crop上限=238x269`が正しく計算・記録されているにも関わらず、実際に
+`_run_inpaint_sampling`へ渡されたクロップは`2304x3456`——**ユーザーの
+元画像のフルサイズそのもの**だった。
+
+### 真の根本原因
+
+`_crop_for_hand`のコードを再点検し、以下の未発見だった分岐を特定した:
+
+```python
+if selected is None or selected.landmarks is None:
+    logger.warning("...入力画像をそのまま返します。")
+    ...
+    return img_rgb, remap_info  # ← max_crop_sizeを全く見ずに元画像を丸ごと返す
+```
+
+`selected.landmarks is None`になるのは、`Sam2HandDetector`が
+landmarksを信頼できないと判断してbboxのみの結果にフォールバックした
+場合（実際のログに繰り返し出現していた「bbox+landmarks併用時の前景
+面積が...大幅に少ないため、bboxのみの結果を採用します」の直後に
+相当）。この時、`_crop_for_hand`はこの早期リターン分岐に入り、
+**`max_crop_size`パラメータを一切参照せずに元画像をそのまま返して
+いた**。
+
+これまでの2回の修正（2026-07-09の相対的上限、2026-07-11前半の絶対的
+上限）は、いずれも「landmarksが正常に取得できた通常の検出結果」に
+対する`compute_padded_bbox`呼び出し経路にのみ効いており、この
+「landmarksが無い場合の全画像フォールバック」という別経路には全く
+効いていなかった。2回の修正が「効いているように見えて実は効いて
+いなかった」理由がここにあった。
+
+### 修正
+
+- landmarksが無くても`selected.bbox`があれば、bbox+paddingで
+  クロップする（`max_crop_size`を正しく適用）よう変更
+- bboxも無い（本当に手がかりが一切無い）場合も、`max_crop_size`が
+  指定されていれば画像中央基準でその上限まで縮小してから返すよう変更
+  （無制限の巨大画像を後段のサンプリングに渡さない）
+- `max_crop_size`が未指定の場合（`AdvancedHandOrientationOptimizer`
+  単体の手動ワークフロー等）は、従来通り元画像全体を返す後方互換動作を
+  維持
+
+### 検証
+
+修正前のコードで新規テストを実行すると、`max_crop_dimension=512`を
+指定していても、landmarksが無いフォールバックが発生した試行のクロップ
+高さが2000px（キャンバスサイズそのもの）になってしまうことを確認した
+上で、修正後は512px以内に収まることを検証した。
+
+新規テスト4件追加（`TestCropForHandLandmarksUnavailableFallback`:
+bboxありでの正しいクロップ、bboxなしでも上限を尊重、`max_crop_size`
+未指定時の後方互換性、`auto_fix`経由のエンドツーエンド確認）。計391件
+全てパス（SAM2実モデル関連4件+4エラーは開発環境の既知の制約で今回の
+変更とは無関係）。
+
+---
+
 ## 直近の次アクション（着手順）
 
 1. 実写真での3ノード連携・見た目の確認（`wrist_blur`/`finger_sharpness`/

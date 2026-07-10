@@ -390,6 +390,133 @@ class TestRunInpaintSamplingPadding:
         assert result.shape[:2] == (64, 48)
 
 
+class TestCropForHandLandmarksUnavailableFallback:
+    """
+    ★2026-07-11追加: 実行ログの詳細な調査で発見した重大なバグの回帰テスト。
+
+    `_crop_for_hand`は、`selected.landmarks is None`（例:
+    `Sam2HandDetector`がlandmarksを信頼できないと判断し、bboxのみの
+    結果にフォールバックした場合）の際、**`max_crop_size`を完全に無視して
+    元画像を丸ごとそのまま返してしまう**バグがあった。これにより、
+    AdvancedHandAutoFixerのリトライループで、再検出がbboxのみの
+    フォールバックに陥ると、クロップが（例えば2304x3456のような）
+    元画像フルサイズまで一気に肥大化し、VAEデコード中のクラッシュに
+    直結することを実行ログで確認した。
+    """
+
+    def test_landmarks_none_but_bbox_present_crops_to_bbox_not_full_image(self):
+        optimizer = nodes.AdvancedHandOrientationOptimizer()
+        img = np.zeros((3456, 2304, 3), dtype=np.uint8)
+        hand = HandDetection(
+            bbox=BoundingBox(1000, 1500, 1200, 1750), landmarks=None, mask=None, source="sam2_bbox_only"
+        )
+
+        cropped, remap_info = optimizer._crop_for_hand(
+            img, hand, padding=16, image_index=0, max_crop_size=(238, 269)
+        )
+
+        assert cropped.shape[0] <= 269
+        assert cropped.shape[1] <= 238
+        # 元画像丸ごと(3456x2304)にはなっていないことを明示的に確認
+        assert cropped.shape[:2] != (3456, 2304)
+
+    def test_landmarks_none_and_no_bbox_still_respects_max_crop_size(self):
+        """selectedがNone(手がかりが一切無い)場合でも、max_crop_sizeが
+        指定されていれば無制限の巨大画像を返さない。"""
+        optimizer = nodes.AdvancedHandOrientationOptimizer()
+        img = np.zeros((3456, 2304, 3), dtype=np.uint8)
+
+        cropped, remap_info = optimizer._crop_for_hand(
+            img, None, padding=16, image_index=0, max_crop_size=(238, 269)
+        )
+
+        assert cropped.shape[0] <= 269
+        assert cropped.shape[1] <= 238
+
+    def test_landmarks_none_without_max_crop_size_preserves_legacy_full_image_behavior(self):
+        """max_crop_size未指定時（AdvancedHandOrientationOptimizer単体の
+        手動ワークフロー等）は、従来通り元画像全体を返す（後方互換性）。"""
+        optimizer = nodes.AdvancedHandOrientationOptimizer()
+        img = np.zeros((3456, 2304, 3), dtype=np.uint8)
+
+        cropped, remap_info = optimizer._crop_for_hand(
+            img, None, padding=16, image_index=0, max_crop_size=None
+        )
+
+        assert cropped.shape[:2] == (3456, 2304)
+        assert remap_info["crop_box"] == (0, 0, 2304, 3456)
+
+    def test_auto_fix_end_to_end_never_exceeds_max_crop_dimension_even_with_bbox_only_fallback(self):
+        """
+        AdvancedHandAutoFixer.auto_fix()経由のエンドツーエンドで、
+        再検出がlandmarks無し(bboxのみ)のフォールバックに陥っても、
+        インペイント対象のクロップがmax_crop_dimensionを超えないことを
+        確認する（実際にユーザー環境で観測された「フルサイズ画像への
+        肥大化」の回帰テスト）。
+        """
+        fixer = nodes.AdvancedHandAutoFixer()
+        canvas = 2000
+
+        captured_crop_shapes = []
+        call_state = {"n": 0}
+
+        def detect_side_effect(image_rgb, *_args, **_kwargs):
+            call_state["n"] += 1
+            h, w = image_rgb.shape[:2]
+            n = call_state["n"]
+            mask = generate_synthetic_hand_mask(canvas_size=(w, h), palm_radius=min(w, h) * 0.15)
+            if n == 3:
+                # 実際のログで観測された状況を再現: 再検出がlandmarks無し
+                # (bboxのみ)のフォールバックに陥る
+                hand = HandDetection(
+                    bbox=BoundingBox(w * 0.3, h * 0.3, w * 0.7, h * 0.7),
+                    landmarks=None,
+                    mask=mask,
+                    source="sam2_bbox_only",
+                )
+            else:
+                landmarks = _landmarks_for_size(float(w), float(h))
+                hand = HandDetection(
+                    bbox=BoundingBox(w * 0.1, h * 0.1, w * 0.9, h * 0.9),
+                    landmarks=landmarks,
+                    mask=mask,
+                    source="fake",
+                )
+            return DetectionResult(hands=[hand])
+
+        def fake_inpaint(self_, model, positive, negative, vae, image_crop_rgb, coarse_mask, **kwargs):
+            captured_crop_shapes.append(image_crop_rgb.shape[:2])
+            h, w = image_crop_rgb.shape[:2]
+            return np.zeros((h, w, 3), dtype=np.uint8)
+
+        def quality_side_effect(*_args, **_kwargs):
+            return {"is_abnormal": call_state["n"] <= 3}
+
+        with patch.object(nodes, "_detect_hands", side_effect=detect_side_effect), patch.object(
+            nodes.AdvancedHandAutoFixer, "_run_inpaint_sampling", fake_inpaint
+        ), patch.object(nodes, "assess_hand_overall_quality", side_effect=quality_side_effect):
+            fixer.auto_fix(
+                _image_tensor(h=canvas, w=canvas),
+                model=None,
+                positive=None,
+                negative=None,
+                vae=None,
+                seed=0,
+                steps=20,
+                cfg=7.0,
+                sampler_name="euler",
+                scheduler="normal",
+                denoise=0.6,
+                max_retries=1,
+                max_crop_dimension=512,
+            )
+
+        assert len(captured_crop_shapes) == 2
+        for h, w in captured_crop_shapes:
+            assert h <= 512, f"クロップの高さ({h})がmax_crop_dimension(512)を超えている"
+            assert w <= 512, f"クロップの幅({w})がmax_crop_dimension(512)を超えている"
+
+
 class TestRetryCropSizeCap:
     """
     ★2026-07-09追加: 実写環境のログ調査で発見した重大なパフォーマンス

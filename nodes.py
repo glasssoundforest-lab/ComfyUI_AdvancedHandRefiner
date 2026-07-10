@@ -369,12 +369,80 @@ class AdvancedHandOrientationOptimizer:
         orig_h, orig_w = img_rgb.shape[:2]
 
         if selected is None or selected.landmarks is None:
+            # ★2026-07-11修正: 重大なバグを発見・修正。
+            # 従来はここで無条件に「元画像を丸ごとそのまま」返しており、
+            # `max_crop_size`（リトライ間のクロップサイズ上限）を完全に
+            # 無視していた。実際にユーザー環境で、再検出がbboxのみの
+            # フォールバック（landmarksが信頼できないと判定された場合。
+            # `Sam2HandDetector`の「bboxのみの結果を採用」ログ参照）に
+            # 陥った際、`selected.landmarks is None`となってこの分岐に
+            # 入り、クロップが2304x3456（元画像フルサイズ）まで一気に
+            # 肥大化し、VAEデコード中のクラッシュに直結することを
+            # 実行ログで確認した。
+            #
+            # 修正: landmarksが無くてもbboxがあれば、bbox+paddingで
+            # クロップする（`max_crop_size`も正しく適用する）。本当に
+            # bboxも無い（手がかりが一切無い）場合のみ、元画像全体を
+            # 返すが、その場合も`max_crop_size`が指定されていれば
+            # 中央基準でその上限まで縮小してから返す（無制限の巨大画像を
+            # 後段のサンプリングに渡さないようにするため）。
             logger.warning(
                 "HandOrientationOptimizer: 手が検出できませんでした"
-                "(image_index=%d)。入力画像をそのまま返します。",
+                "(image_index=%d)。%s",
                 image_index,
+                "bboxを基準にクロップします。"
+                if (selected is not None and selected.bbox is not None)
+                else "入力画像をそのまま返します。",
             )
-            remap_info: RemapInfo = {
+
+            if selected is not None and selected.bbox is not None:
+                bbox = selected.bbox
+                max_w = max_crop_size[0] if max_crop_size is not None else None
+                max_h = max_crop_size[1] if max_crop_size is not None else None
+                crop_box = compute_padded_bbox(
+                    [(bbox.x1, bbox.y1), (bbox.x2, bbox.y2)],
+                    padding,
+                    orig_w,
+                    orig_h,
+                    max_width=max_w,
+                    max_height=max_h,
+                )
+                cx1, cy1, cx2, cy2 = crop_box
+                if cx2 > cx1 and cy2 > cy1:
+                    cropped = img_rgb[cy1:cy2, cx1:cx2]
+                    remap_info: RemapInfo = {
+                        "angle": 0.0,
+                        "center": ((cx1 + cx2) / 2.0, (cy1 + cy2) / 2.0),
+                        "crop_box": crop_box,
+                        "original_size": (orig_w, orig_h),
+                        "rotated_size": (orig_w, orig_h),
+                        "content_size": (cx2 - cx1, cy2 - cy1),
+                    }
+                    return cropped, remap_info
+
+            # bboxも無い（本当に手がかりが一切無い）場合の最終フォールバック。
+            # max_crop_sizeが指定されていれば、画像中央基準でその上限まで
+            # 縮小したbboxを使う（無制限の巨大画像をそのまま後段へ渡さない）。
+            if max_crop_size is not None:
+                max_w, max_h = max_crop_size
+                cx, cy = orig_w / 2.0, orig_h / 2.0
+                fx1 = max(0, int(round(cx - max_w / 2.0)))
+                fy1 = max(0, int(round(cy - max_h / 2.0)))
+                fx2 = min(orig_w, fx1 + max_w)
+                fy2 = min(orig_h, fy1 + max_h)
+                if fx2 > fx1 and fy2 > fy1:
+                    cropped = img_rgb[fy1:fy2, fx1:fx2]
+                    remap_info = {
+                        "angle": 0.0,
+                        "center": ((fx1 + fx2) / 2.0, (fy1 + fy2) / 2.0),
+                        "crop_box": (fx1, fy1, fx2, fy2),
+                        "original_size": (orig_w, orig_h),
+                        "rotated_size": (orig_w, orig_h),
+                        "content_size": (fx2 - fx1, fy2 - fy1),
+                    }
+                    return cropped, remap_info
+
+            remap_info = {
                 "angle": 0.0,
                 "center": (orig_w / 2.0, orig_h / 2.0),
                 "crop_box": (0, 0, orig_w, orig_h),
