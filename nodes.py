@@ -23,6 +23,9 @@ try:
     from .utils.detectors.sam2_detector import Sam2HandDetector
     from .utils.detectors.yolo_detector import YoloHandDetector
     from .utils.geometry import (
+        FINGER_CHAINS,
+        MIDDLE_FINGER_MCP_IDX,
+        WRIST_IDX,
         RemapInfo,
         compute_padded_bbox,
         compute_rotation_angle,
@@ -39,6 +42,9 @@ except ImportError:
     from utils.detectors.sam2_detector import Sam2HandDetector
     from utils.detectors.yolo_detector import YoloHandDetector
     from utils.geometry import (
+        FINGER_CHAINS,
+        MIDDLE_FINGER_MCP_IDX,
+        WRIST_IDX,
         RemapInfo,
         compute_padded_bbox,
         compute_rotation_angle,
@@ -307,6 +313,89 @@ def _transform_landmarks_to_crop_coords(
     rotated = rotate_points(landmarks, angle, old_center, new_center) if angle != 0.0 else landmarks
     x1, y1, _x2, _y2 = crop_box
     return [(px - x1, py - y1) for px, py in rotated]
+
+
+def _landmarks_to_hand_mask(
+    landmarks: list[tuple[float, float]] | None,
+    shape: tuple[int, int],
+    thickness: int | None = None,
+) -> np.ndarray | None:
+    """
+    MediaPipeの21点landmarks（骨格点）から、指の骨格構造を太い線で
+    描画し、手の形状に沿ったマスクを構築する。
+
+    ★2026-07-11追加（ユーザー提案: 「他の3種のアルゴリズム
+    （MediaPipeのlandmarks・SAM2のセグメンテーション・YOLOのbbox）を
+    重ね合わせて、手の形を推論することはできないか」）。
+
+    従来、これら3つの検出器は「YOLO→MediaPipe→SAM2」という順番の
+    パイプラインで使われ、最終的なマスクは基本的にSAM2（またはその
+    フォールバック）の結果のみに依存していた。SAM2が失敗・不安定な
+    場合、landmarksが取得できていても、その情報はマスク自体の構築には
+    直接使われていなかった。
+
+    landmarksは単なる21個の点（骨格）に過ぎずそのままでは「線」にしか
+    ならないが、各指の関節チェーン（`FINGER_CHAINS`）に沿って太い線を
+    描画することで、指の太さを持った領域として扱える。単純な凸包
+    （convex hull）と異なり、**指を広げたポーズで指同士の間に隙間が
+    ある場合、その隙間はマスクに含まれない**（凸包だと指の間の隙間も
+    塗りつぶされてしまい、実際の手の形状と乖離する）。
+
+    この関数が返すマスクは、SAM2等のセグメンテーション結果と
+    論理和（OR）で合成することを想定している。セグメンテーションが
+    部分的にしか手を捉えられていない場合でも、landmarksから再構築した
+    「骨格の太さ」が最低限のカバー範囲を保証する。
+
+    Args:
+        landmarks: [(x, y), ...] 21点のlandmarks（クロップ座標系等、
+            マスクと同じ座標系であること）。Noneまたは21点未満の場合は
+            Noneを返す
+        shape: (H, W) 出力マスクのサイズ
+        thickness: 指を描画する線の太さ（px）。Noneの場合、手首→中指
+            付け根の距離から自動推定する
+
+    Returns:
+        0-255 uint8 マスク（H, W）。landmarksが不十分な場合はNone
+    """
+    if landmarks is None or len(landmarks) < 21:
+        return None
+
+    h, w = shape
+    h = max(0, h)
+    w = max(0, w)
+    mask = np.zeros((h, w), dtype=np.uint8)
+    if h <= 0 or w <= 0:
+        return mask
+
+    pts = [(int(round(x)), int(round(y))) for x, y in landmarks]
+
+    if thickness is None:
+        wrist = np.array(pts[WRIST_IDX], dtype=np.float32)
+        middle_mcp = np.array(pts[MIDDLE_FINGER_MCP_IDX], dtype=np.float32)
+        hand_scale = float(np.linalg.norm(middle_mcp - wrist))
+        # 手のサイズに応じた太さ。手のサイズが不明瞭(0に近い)な場合の
+        # 安全な最小値も設定する。
+        thickness = max(3, int(round(hand_scale * 0.38)))
+
+    # 掌(てのひら)領域: 手首+各指の付け根(MCP)の凸包を塗りつぶす。
+    # 指と違い、掌自体は指の間のような隙間を考慮する必要が無いため、
+    # 凸包で問題ない。
+    palm_indices = [WRIST_IDX] + [chain[0] for chain in FINGER_CHAINS.values()]
+    palm_points = np.array([pts[i] for i in palm_indices], dtype=np.int32)
+    if len(palm_points) >= 3:
+        hull = cv2.convexHull(palm_points)
+        cv2.fillConvexPoly(mask, hull, 255)
+
+    # 各指: MCP→PIP→DIP→TIPを太い線で結ぶ（指同士の隙間は保持される）
+    for chain in FINGER_CHAINS.values():
+        for i in range(len(chain) - 1):
+            cv2.line(
+                mask, pts[chain[i]], pts[chain[i + 1]], 255, thickness=thickness, lineType=cv2.LINE_AA
+            )
+        # 指先を丸く(角ばった終端にならないよう)
+        cv2.circle(mask, pts[chain[-1]], max(1, thickness // 2 + 1), 255, -1)
+
+    return mask
 
 
 def _refine_mask_with_shading(
@@ -1835,10 +1924,99 @@ class AdvancedHandAutoFixer:
                     deviation_iou,
                 )
 
+            # ★2026-07-11追加（ユーザー提案: 「YOLOのbbox・MediaPipeの
+            # landmarks・SAM2のセグメンテーションの3つを、順番の
+            # フォールバックではなく重ね合わせて手の形を推論できないか」）。
+            # 従来、これら3つの検出器は「YOLO→MediaPipe→SAM2」という順番の
+            # パイプラインで使われ、最終的なマスクは基本的にSAM2（または
+            # その幾何学的フォールバック）の結果のみに依存していた。
+            #
+            # ここでは、その時点で得られているlandmarks（クロップ後の
+            # 再検出、無ければクロップ前の検出結果を変換したもの）から
+            # `_landmarks_to_hand_mask`で骨格ベースのマスクを構築し、
+            # 以降の全ての優先度分岐で、選ばれたセグメンテーション
+            # マスクと論理和（OR）で合成する。セグメンテーションが
+            # 手の一部しか捉えられていない場合でも、landmarksから
+            # 再構築した「骨格の太さ」が最低限のカバー範囲を保証する。
+            #
+            # さらに、YOLOのbbox（クロップ後の再検出、無ければクロップ前の
+            # bboxを変換したもの）を軽く広げた範囲でアンサンブル結果を
+            # クリップし、bboxから大きく逸脱した誤検出がそのまま
+            # マスクへ混入することを防ぐ（3つの検出器全てを反映した
+            # 妥当性チェックとして機能する）。
+            # ★重要: マスクの優先順位判定（`crop_result_deviates`）と
+            # 矛盾しないよう、landmarks/bboxも同じ信頼判定に従う。
+            # クロップ後の再検出結果（マスク）が信頼できないと判断した
+            # 場合、そのlandmarks/bboxも同様に信頼せず、親側の情報を使う
+            # （でなければ、逸脱した誤検出のbboxでアンサンブル結果を
+            # クリップしてしまい、正しいはずの親マスクまで消えてしまう）。
+            crop_result_trusted = crop_selected is not None and not crop_result_deviates
+            ensemble_landmarks = (
+                crop_selected.landmarks if crop_result_trusted else None
+            ) or (
+                parent_prior_for_crop.hands[0].landmarks
+                if parent_prior_for_crop is not None and not parent_prior_for_crop.is_empty
+                else None
+            )
+            landmark_ensemble_mask = _landmarks_to_hand_mask(
+                ensemble_landmarks, cropped_rgb.shape[:2]
+            )
+
+            ensemble_bbox = (
+                crop_selected.bbox if crop_result_trusted else None
+            ) or (
+                parent_prior_for_crop.hands[0].bbox
+                if parent_prior_for_crop is not None and not parent_prior_for_crop.is_empty
+                else None
+            )
+            bbox_clip_mask: np.ndarray | None = None
+            if ensemble_bbox is not None:
+                clip_h, clip_w = cropped_rgb.shape[:2]
+                bbox_clip_mask = np.zeros((clip_h, clip_w), dtype=np.uint8)
+                bbox_pad = max(4, int(0.15 * max(ensemble_bbox.width, ensemble_bbox.height)))
+                cx1 = max(0, int(ensemble_bbox.x1) - bbox_pad)
+                cy1 = max(0, int(ensemble_bbox.y1) - bbox_pad)
+                cx2 = min(clip_w, int(ensemble_bbox.x2) + bbox_pad)
+                cy2 = min(clip_h, int(ensemble_bbox.y2) + bbox_pad)
+                if cx2 > cx1 and cy2 > cy1:
+                    bbox_clip_mask[cy1:cy2, cx1:cx2] = 255
+                else:
+                    bbox_clip_mask = None
+
+            def _apply_ensemble(base_mask: np.ndarray | None) -> np.ndarray | None:
+                """base_maskにlandmarkベースのマスクを論理和で重ね、bboxでクリップする"""
+                target_shape = cropped_rgb.shape[:2]
+
+                def _resize_to_target(m: np.ndarray | None) -> np.ndarray | None:
+                    # ★異常値耐性: 検出器/GrabCut等の出力が、クロップ本体と
+                    # わずかにサイズが食い違う場合がある（各処理段階で
+                    # 個別にリサイズ処理を持つため通常は問題にならないが、
+                    # ここでの論理和演算はサイズ完全一致を要求するため、
+                    # 明示的に揃える）。
+                    if m is None or m.shape[:2] == target_shape:
+                        return m
+                    return cv2.resize(
+                        m, (target_shape[1], target_shape[0]), interpolation=cv2.INTER_NEAREST
+                    )
+
+                base_mask = _resize_to_target(base_mask)
+                landmark_mask = _resize_to_target(landmark_ensemble_mask)
+                clip_mask = _resize_to_target(bbox_clip_mask)
+
+                if base_mask is None:
+                    result = landmark_mask
+                elif landmark_mask is not None:
+                    result = cv2.bitwise_or(base_mask, landmark_mask)
+                else:
+                    result = base_mask
+                if result is not None and clip_mask is not None:
+                    result = cv2.bitwise_and(result, clip_mask)
+                return result
+
             if crop_mask_candidate is not None and not crop_result_deviates:
                 # 最善: クロップ後の画像に対する再検出（より精密）が成功し、
                 # かつクロップ前の検出結果と矛盾していない
-                coarse_mask = crop_mask_candidate
+                coarse_mask = _apply_ensemble(crop_mask_candidate)
             elif parent_mask_in_crop_coords is not None:
                 # ★2026-07-11追加（ユーザー提案）: クロップ後の再検出が
                 # 失敗した、あるいは逸脱していた場合、クロップの時点で
@@ -1862,7 +2040,9 @@ class AdvancedHandAutoFixer:
                     attempt + 1,
                     max_retries + 1,
                 )
-                coarse_mask = _refine_mask_with_shading(cropped_rgb, parent_mask_in_crop_coords)
+                coarse_mask = _apply_ensemble(
+                    _refine_mask_with_shading(cropped_rgb, parent_mask_in_crop_coords)
+                )
             else:
                 # ★2026-07-11修正: 以前はここで即座に諦めて（このハンドの
                 # インペイントを完全に中断して）元の状態のまま残していた。
@@ -1884,8 +2064,10 @@ class AdvancedHandAutoFixer:
                     attempt + 1,
                     max_retries + 1,
                 )
-                coarse_mask = _refine_mask_with_shading(
-                    cropped_rgb, _generous_fallback_mask(cropped_rgb.shape[:2])
+                coarse_mask = _apply_ensemble(
+                    _refine_mask_with_shading(
+                        cropped_rgb, _generous_fallback_mask(cropped_rgb.shape[:2])
+                    )
                 )
 
             # ★2026-07-11追加: ユーザーから「手が真珠色の塊のような、

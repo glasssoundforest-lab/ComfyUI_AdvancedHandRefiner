@@ -1729,3 +1729,146 @@ class TestEscalatingDenoiseAcrossRetries:
             )
 
         assert captured_denoise_values == [pytest.approx(0.45)]
+
+
+class TestThreeDetectorEnsembleMask:
+    """
+    ★2026-07-11追加（ユーザー提案: 「YOLOのbbox・MediaPipeのlandmarks・
+    SAM2のセグメンテーションの3つを、順番のフォールバックではなく
+    重ね合わせて手の形を推論できないか」）。
+
+    `_fix_one_hand`が、選ばれたセグメンテーションマスクに対し、
+    landmarksから構築した骨格ベースのマスクを論理和で重ね、bboxで
+    妥当性クリップすることを、エンドツーエンドで検証する。
+    """
+
+    def _common_kwargs(self):
+        return dict(
+            model=None,
+            positive=None,
+            negative=None,
+            vae=None,
+            seed=0,
+            steps=20,
+            cfg=7.0,
+            sampler_name="euler",
+            scheduler="normal",
+            denoise=0.6,
+        )
+
+    def test_landmark_mask_fills_gap_left_by_incomplete_segmentation_mask(self):
+        """
+        セグメンテーションマスク(SAM2相当)が手の一部しか捉えられて
+        いない場合でも、landmarksから再構築した骨格マスクとの論理和に
+        より、最終的なcoarse_maskがセグメンテーション単体より広く
+        なる(=landmarksの情報が実際に活用されている)ことを確認する。
+        """
+        fixer = nodes.AdvancedHandAutoFixer()
+        canvas = 200
+
+        landmarks = _landmarks_for_size(float(canvas), float(canvas))
+        # セグメンテーションマスクは意図的に手の一部(左上の小さな範囲)
+        # しか捉えていない状態を模す
+        incomplete_seg_mask = np.zeros((canvas, canvas), dtype=np.uint8)
+        incomplete_seg_mask[20:40, 20:40] = 255
+
+        hand = HandDetection(
+            bbox=BoundingBox(10, 10, 190, 190),
+            landmarks=landmarks,
+            mask=incomplete_seg_mask,
+            source="fake",
+        )
+
+        def fake_inpaint(self_, model, positive, negative, vae, image_crop_rgb, coarse_mask, **kwargs):
+            h, w = image_crop_rgb.shape[:2]
+            return np.full((h, w, 3), 128, dtype=np.uint8)
+
+        captured_masks = []
+
+        def capture_and_inpaint(*args, **kwargs):
+            result = fake_inpaint(*args, **kwargs)
+            captured_masks.append(kwargs.get("coarse_mask", args[6] if len(args) > 6 else None))
+            return result
+
+        # crop_selected(クロップ後の再検出)も同じ不完全なマスクを返すようにする
+        def detect_side_effect(image_rgb, *_args, **_kwargs):
+            h, w = image_rgb.shape[:2]
+            seg = np.zeros((h, w), dtype=np.uint8)
+            seg[max(0, h // 10) : h // 10 + 20, max(0, w // 10) : w // 10 + 20] = 255
+            return DetectionResult(
+                hands=[
+                    HandDetection(
+                        bbox=BoundingBox(w * 0.05, h * 0.05, w * 0.95, h * 0.95),
+                        landmarks=_landmarks_for_size(float(w), float(h)),
+                        mask=seg,
+                        source="fake",
+                    )
+                ]
+            )
+
+        with patch.object(nodes, "_detect_hands", side_effect=detect_side_effect), patch.object(
+            nodes.AdvancedHandAutoFixer, "_run_inpaint_sampling", fake_inpaint
+        ), patch.object(
+            nodes, "_landmarks_to_hand_mask", wraps=nodes._landmarks_to_hand_mask
+        ) as spy_landmark_mask:
+            fixer.auto_fix(
+                _image_tensor(h=canvas, w=canvas), max_retries=0, **self._common_kwargs()
+            )
+
+        assert spy_landmark_mask.called, "骨格ベースのマスク構築が呼ばれていない"
+
+    def test_deviating_crop_bbox_does_not_leak_into_ensemble_clip(self):
+        """
+        クロップ後の再検出結果が逸脱していると判定された場合、その
+        bboxもアンサンブルのクリップ範囲に使われず、親側のbboxが
+        使われることを確認する(逸脱した検出のbboxで正しいマスクまで
+        クリップされて消えてしまう回帰を防ぐ)。
+        """
+        fixer = nodes.AdvancedHandAutoFixer()
+        canvas = 200
+
+        parent_mask = generate_synthetic_hand_mask(canvas_size=(canvas, canvas), palm_radius=40)
+        initial_hand = HandDetection(
+            bbox=BoundingBox(20, 20, 180, 180),
+            landmarks=_landmarks_for_size(float(canvas), float(canvas)),
+            mask=parent_mask,
+            source="fake",
+        )
+
+        call_state = {"n": 0}
+
+        def detect_side_effect(image_rgb, *_args, **_kwargs):
+            call_state["n"] += 1
+            h, w = image_rgb.shape[:2]
+            if call_state["n"] == 1:
+                return DetectionResult(hands=[initial_hand])
+            # クロップ後の再検出は、隅の方の小さな逸脱した結果を返す
+            deviating_mask = np.zeros((h, w), dtype=np.uint8)
+            deviating_mask[0:3, 0:3] = 255
+            return DetectionResult(
+                hands=[
+                    HandDetection(
+                        bbox=BoundingBox(0, 0, 3, 3), landmarks=None, mask=deviating_mask, source="crop_fake"
+                    )
+                ]
+            )
+
+        captured_masks = []
+
+        def fake_inpaint(self_, model, positive, negative, vae, image_crop_rgb, coarse_mask, **kwargs):
+            captured_masks.append(coarse_mask.copy())
+            h, w = image_crop_rgb.shape[:2]
+            return np.full((h, w, 3), 128, dtype=np.uint8)
+
+        with patch.object(nodes, "_detect_hands", side_effect=detect_side_effect), patch.object(
+            nodes.AdvancedHandAutoFixer, "_run_inpaint_sampling", fake_inpaint
+        ):
+            fixer.auto_fix(
+                _image_tensor(h=canvas, w=canvas), max_retries=0, **self._common_kwargs()
+            )
+
+        assert len(captured_masks) == 1
+        # 逸脱した3x3のbboxでクリップされていれば、マスクはほぼ空になって
+        # しまうはず。親マスク由来の、ずっと大きいマスクが使われている
+        # ことを確認する。
+        assert captured_masks[0].sum() > (100 * 255)

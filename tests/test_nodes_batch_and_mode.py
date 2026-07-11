@@ -918,3 +918,96 @@ class TestDetectHandsNoneImageGuard:
     def test_none_image_returns_empty_result_instead_of_crashing(self):
         result = nodes._detect_hands(None, 0.5)
         assert result.is_empty
+
+
+class TestLandmarksToHandMask:
+    """
+    ★2026-07-11追加（ユーザー提案: 「YOLOのbbox・MediaPipeのlandmarks・
+    SAM2のセグメンテーションの3つを、順番のフォールバックではなく
+    重ね合わせて手の形を推論できないか」）: `_landmarks_to_hand_mask`
+    （MediaPipeの21点landmarksから、指の骨格構造を太い線で描画し、
+    手の形状に沿ったマスクを構築するヘルパー）の単体テスト。
+    """
+
+    def _spread_hand_landmarks(self):
+        """
+        指を広げたポーズを模した21点landmarksを生成する。
+        手首を原点近くに置き、各指を扇状の異なる角度の直線上に
+        配置することで、指同士が重ならない、幾何学的に予測しやすい
+        形状にする。
+        """
+        import math
+
+        wrist = (150.0, 300.0)
+        # 5本の指をそれぞれ異なる角度（真上=90度を中心に扇状）へ配置
+        finger_angles_deg = [55, 72, 90, 108, 125]
+        landmarks = [wrist]
+        for angle_deg in finger_angles_deg:
+            angle = math.radians(angle_deg)
+            dx, dy = math.cos(angle), -math.sin(angle)  # 画像座標系(下向きがY+)なので上方向は-sin
+            for j in range(1, 5):
+                length = 40 * j
+                x = wrist[0] + dx * length
+                y = wrist[1] + dy * length
+                landmarks.append((x, y))
+        return landmarks[:21]
+
+    def test_returns_none_for_missing_landmarks(self):
+        assert nodes._landmarks_to_hand_mask(None, (100, 100)) is None
+
+    def test_returns_none_for_insufficient_landmarks(self):
+        assert nodes._landmarks_to_hand_mask([(1.0, 1.0)] * 5, (100, 100)) is None
+
+    def test_produces_nonempty_mask_for_valid_landmarks(self):
+        landmarks = self._spread_hand_landmarks()
+        mask = nodes._landmarks_to_hand_mask(landmarks, (400, 300))
+        assert mask is not None
+        assert mask.shape == (400, 300)
+        assert np.count_nonzero(mask) > 0
+
+    def test_gap_between_spread_fingers_is_preserved_not_filled(self):
+        """
+        指を大きく広げたポーズ（隣り合わない指同士、例えば1本目と
+        5本目の指）の間には、マスクに含まれない隙間が存在する
+        （単純な凸包と異なり、指の間を塗りつぶさない）ことを確認する。
+        """
+        landmarks = self._spread_hand_landmarks()
+        mask = nodes._landmarks_to_hand_mask(landmarks, (400, 300), thickness=6)
+
+        # 1本目(55度)の指先と5本目(125度)の指先のちょうど中間方向
+        # (90度、手首から120px)は、掌の凸包(手首周辺のみ)より外側、
+        # かつどの指のライン上にも無いはずの座標
+        import math
+
+        wrist = landmarks[0]
+        mid_angle = math.radians(90)
+        radius = 120
+        gap_x = wrist[0] + math.cos(mid_angle) * radius
+        gap_y = wrist[1] - math.sin(mid_angle) * radius
+        # 中指(90度)そのものの延長線上は塗りつぶされているはずなので、
+        # 少し横にずらした、1本目と2本目の間(55度と72度の中間=63.5度)を見る
+        between_1_2_angle = math.radians((55 + 72) / 2)
+        gap_x = wrist[0] + math.cos(between_1_2_angle) * radius
+        gap_y = wrist[1] - math.sin(between_1_2_angle) * radius
+
+        y, x = int(gap_y), int(gap_x)
+        assert 0 <= y < mask.shape[0] and 0 <= x < mask.shape[1]
+        assert mask[y, x] == 0, "指の間の隙間が誤って塗りつぶされている"
+
+        # 比較のため、全21点の凸包ならこの座標は塗りつぶされることも確認
+        full_hull_mask = np.zeros((400, 300), dtype=np.uint8)
+        pts = np.array([(int(px), int(py)) for px, py in landmarks], dtype=np.int32)
+        hull = cv2.convexHull(pts)
+        cv2.fillConvexPoly(full_hull_mask, hull, 255)
+        assert full_hull_mask[y, x] == 255, "テスト座標の選び方自体が不適切（凸包でも塗られていない）"
+
+    def test_degenerate_shape_handled_safely(self):
+        landmarks = self._spread_hand_landmarks()
+        mask = nodes._landmarks_to_hand_mask(landmarks, (0, 0))
+        assert mask.shape == (0, 0)
+
+    def test_custom_thickness_increases_coverage(self):
+        landmarks = self._spread_hand_landmarks()
+        thin_mask = nodes._landmarks_to_hand_mask(landmarks, (400, 300), thickness=2)
+        thick_mask = nodes._landmarks_to_hand_mask(landmarks, (400, 300), thickness=20)
+        assert np.count_nonzero(thick_mask) > np.count_nonzero(thin_mask)
