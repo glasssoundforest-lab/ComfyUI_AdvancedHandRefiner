@@ -2880,6 +2880,64 @@ with_each_other`）。計479件全てパス（SAM2実モデル関連4件+4エラ
 
 ---
 
+## 🦴 DWPoseのような骨格ベースのControlNet誘導を追加（ユーザー提案、2026-07-11）
+
+ユーザーから2点のご質問・提案を受けた:「KSamplerと同等の描画力が
+あるか確認してほしい」「DWPoseの様に、マスク生成した際のデータを
+用いて近い手の形になるようにしてほしい」。
+
+### KSamplerとの同等性の確認
+
+`_run_inpaint_sampling`のコードを確認したところ、`comfy_nodes.
+common_ksampler`（ComfyUI本体の`nodes.py`から直接importした、標準の
+`KSampler`ノードが内部で呼び出しているのと全く同じ関数）を、`model,
+seed, steps, cfg, sampler_name, scheduler, positive, negative, latent,
+denoise`という完全な標準パラメータセットで呼び出していることを確認
+した。描画力に差は無いと結論づけた。
+
+### DWPose風の骨格ベース誘導の実装
+
+DWPose等のポーズ推定ControlNetプリプロセッサは、検出した骨格を可視化
+した画像を作り、それをControlNetの入力として拡散モデルへ「この骨格に
+従って描いてください」という強い構造的ヒントを与える。当プラグインは
+既にMediaPipeの21点landmarksを保持しているため（3検出器アンサンブル
+マスク機能で既に活用中）、同様の骨格可視化画像を自前で構築し、hand
+pose対応のControlNetモデルへの入力画像として使えるようにした。
+
+新規ヘルパー`_landmarks_to_pose_skeleton_image`を追加。黒背景に、
+各指ごとに異なる色（親指=赤、人差し指=橙、中指=黄、薬指=緑、小指=青）
+の線で`FINGER_CHAINS`の関節チェーンを描画し、関節点を白い円で示す
+（一般的なOpenPose系hand pose ControlNetの入力形式に準じている）。
+
+`AdvancedHandAutoFixer`に新規オプション`hand_pose_controlnet`
+（`CONTROLNET`型）・`controlnet_strength`（既定0.6）を追加した。
+`hand_pose_controlnet`が接続されている場合、`_run_inpaint_sampling`
+は、既にアンサンブルマスク構築のために取得済みの`ensemble_landmarks`
+から骨格画像を構築し、`ControlNetApplyAdvanced`でpositive/negative
+conditioningを更新してからサンプリングする。骨格画像は、`guide_size`
+による拡大・8の倍数へのpaddingを画像・マスクと全く同じ変換で経てから
+使うため、latentの空間解像度と正しく一致する。`hand_pose_controlnet`
+を接続しない場合（既定）は、従来通りプロンプトとマスクのみで生成する
+（完全な後方互換）。ControlNetの適用自体が失敗した場合は、警告を
+出しつつ元のconditioningでそのまま続行する（安全側フォールバック）。
+
+### 検証
+
+フェイクの`ControlNetApplyAdvanced`・`common_ksampler`を使い、(1)
+`hand_pose_controlnet`未指定時はControlNetが一切呼ばれず元の
+conditioningがそのまま使われること、(2)指定時はControlNetが正しい
+強度で呼ばれ、その結果（変更後のconditioning）が実際にKSamplerへ
+渡ること、(3)骨格画像のサイズが`guide_size`拡大後のサンプリング解像度
+と一致すること、(4)landmarksが無い場合はControlNetをスキップすること、
+(5)ControlNet適用自体が例外を送出してもクラッシュせず元のconditioning
+で続行すること、をそれぞれエンドツーエンドで確認した。
+
+新規テスト11件追加（`TestLandmarksToPoseSkeletonImage`5件、
+`TestHandPoseControlNet`6件）。計490件全てパス（SAM2実モデル関連4件+
+4エラーは開発環境の既知の制約で今回の変更とは無関係）。
+
+---
+
 ## 直近の次アクション（着手順）
 
 1. 実写真での3ノード連携・見た目の確認（`wrist_blur`/`finger_sharpness`/

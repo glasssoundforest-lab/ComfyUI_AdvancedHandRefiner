@@ -398,6 +398,80 @@ def _landmarks_to_hand_mask(
     return mask
 
 
+#: 指ごとの色（OpenPose/DWPose系のhand pose ControlNetでよく使われる
+#: 配色に準じた、判別しやすい色分け）
+_HAND_SKELETON_FINGER_COLORS: dict[str, tuple[int, int, int]] = {
+    "thumb": (255, 0, 0),
+    "index": (255, 165, 0),
+    "middle": (255, 255, 0),
+    "ring": (0, 255, 0),
+    "pinky": (0, 128, 255),
+}
+
+
+def _landmarks_to_pose_skeleton_image(
+    landmarks: list[tuple[float, float]] | None,
+    shape: tuple[int, int],
+    line_thickness: int | None = None,
+) -> np.ndarray | None:
+    """
+    MediaPipeの21点landmarksから、DWPose/OpenPose形式の手の骨格可視化
+    画像（黒背景に色分けされた線・関節点）を構築する。
+
+    ★2026-07-11追加（ユーザー提案: 「DWPoseの様に、マスク生成した際の
+    データを用いて近い手の形になるようにしてほしい」）。DWPose等の
+    ポーズ推定ControlNetプリプロセッサは、検出した骨格を可視化した
+    画像を作り、それをControlNetの入力として拡散モデルへ「この骨格に
+    従って描いてください」という強い構造的ヒントを与える。当プラグイン
+    は既にMediaPipeの21点landmarksを保持しているため、同様の骨格可視化
+    画像を自前で構築し、hand pose対応のControlNetモデルへの入力画像
+    として使えるようにした。
+
+    配色は各指ごとに異なる色（親指=赤、人差し指=橙、中指=黄、薬指=緑、
+    小指=青）とし、関節点は白い円で示す。これは一般的なOpenPose系
+    hand pose ControlNetの入力形式に準じている。
+
+    Args:
+        landmarks: [(x, y), ...] 21点のlandmarks（クロップ座標系等、
+            実際にサンプリングする画像と同じ座標系であること）
+        shape: (H, W) 出力画像のサイズ
+        line_thickness: 骨格線の太さ（px）。Noneの場合、手のサイズから自動推定
+
+    Returns:
+        RGB uint8画像（H, W, 3）。landmarksが不十分な場合はNone
+    """
+    if landmarks is None or len(landmarks) < 21:
+        return None
+
+    h, w = shape
+    h = max(0, h)
+    w = max(0, w)
+    image = np.zeros((h, w, 3), dtype=np.uint8)
+    if h <= 0 or w <= 0:
+        return image
+
+    pts = [(int(round(x)), int(round(y))) for x, y in landmarks]
+
+    if line_thickness is None:
+        wrist = np.array(pts[WRIST_IDX], dtype=np.float32)
+        middle_mcp = np.array(pts[MIDDLE_FINGER_MCP_IDX], dtype=np.float32)
+        hand_scale = float(np.linalg.norm(middle_mcp - wrist))
+        line_thickness = max(1, int(round(hand_scale * 0.12)))
+
+    for name, chain in FINGER_CHAINS.items():
+        color = _HAND_SKELETON_FINGER_COLORS.get(name, (255, 255, 255))
+        prev_idx = WRIST_IDX
+        for idx in chain:
+            cv2.line(image, pts[prev_idx], pts[idx], color, thickness=line_thickness, lineType=cv2.LINE_AA)
+            prev_idx = idx
+
+    joint_radius = max(1, line_thickness)
+    for x, y in pts:
+        cv2.circle(image, (x, y), joint_radius, (255, 255, 255), -1, lineType=cv2.LINE_AA)
+
+    return image
+
+
 def _refine_mask_with_shading(
     image_rgb: np.ndarray,
     rough_mask: np.ndarray | None,
@@ -1611,6 +1685,27 @@ class AdvancedHandAutoFixer:
                         ),
                     },
                 ),
+                "hand_pose_controlnet": (
+                    "CONTROLNET",
+                    {
+                        "tooltip": (
+                            "hand pose対応のControlNetモデル（任意）。DWPose等のポーズ推定"
+                            "プリプロセッサと同様に、既に検出できている手のlandmarksから"
+                            "骨格可視化画像を構築し、実際の手の構造に従うよう生成を強く誘導する。"
+                            "接続しない場合、従来通りプロンプトとマスクのみで生成する。"
+                        ),
+                    },
+                ),
+                "controlnet_strength": (
+                    "FLOAT",
+                    {
+                        "default": 0.6,
+                        "min": 0.0,
+                        "max": 2.0,
+                        "step": 0.05,
+                        "tooltip": "hand_pose_controlnetの適用強度。hand_pose_controlnet未接続時は無視される。",
+                    },
+                ),
             },
         }
 
@@ -1643,6 +1738,8 @@ class AdvancedHandAutoFixer:
         color_match_strength: float = 0.5,
         max_crop_dimension: int = 768,
         guide_size: int = 768,
+        hand_pose_controlnet=None,
+        controlnet_strength: float = 0.6,
     ):
         batch_size = image.shape[0]
         optimizer = AdvancedHandOrientationOptimizer()
@@ -1732,6 +1829,8 @@ class AdvancedHandAutoFixer:
                         color_match_strength=color_match_strength,
                         max_crop_dimension=max_crop_dimension,
                         guide_size=guide_size,
+                        hand_pose_controlnet=hand_pose_controlnet,
+                        controlnet_strength=controlnet_strength,
                     )
                 except Exception as e:
                     logger.error(
@@ -1789,6 +1888,8 @@ class AdvancedHandAutoFixer:
         color_match_strength: float,
         max_crop_dimension: int = 768,
         guide_size: int = 768,
+        hand_pose_controlnet=None,
+        controlnet_strength: float = 0.6,
     ) -> tuple[np.ndarray, str]:
         """1つの手について、リトライループ全体を実行する内部ヘルパー"""
         current_rgb = base_image_rgb
@@ -2118,6 +2219,9 @@ class AdvancedHandAutoFixer:
                     denoise=escalated_denoise,
                     grow_mask_by=mask_grow_pixels,
                     guide_size=guide_size,
+                    pose_landmarks=ensemble_landmarks,
+                    hand_pose_controlnet=hand_pose_controlnet,
+                    controlnet_strength=controlnet_strength,
                 )
             except Exception as e:
                 logger.warning(
@@ -2216,6 +2320,9 @@ class AdvancedHandAutoFixer:
         denoise: float,
         grow_mask_by: int,
         guide_size: int = 768,
+        pose_landmarks: list[tuple[float, float]] | None = None,
+        hand_pose_controlnet=None,
+        controlnet_strength: float = 0.6,
     ) -> np.ndarray:
         """
         ComfyUI本体の標準的なインペイント機構（`VAEEncodeForInpaint`→
@@ -2257,6 +2364,21 @@ class AdvancedHandAutoFixer:
                 し、結果を元のクロップサイズへ縮小して返す。クロップの
                 長辺が既にこのサイズ以上の場合は拡大しない
                 （縮小もしない。過度な縮小は逆に精度を落とすため）。
+            pose_landmarks: ★2026-07-11追加（ユーザー提案:
+                「DWPoseの様に、マスク生成した際のデータを用いて近い
+                手の形になるようにしてほしい」）。`image_crop_rgb`と
+                同じ座標系の21点landmarks。`hand_pose_controlnet`が
+                指定されている場合、これらから骨格可視化画像
+                （`_landmarks_to_pose_skeleton_image`）を構築し、
+                ControlNetの入力として使う。Noneの場合はControlNetの
+                適用自体をスキップする。
+            hand_pose_controlnet: hand pose対応のControlNetモデル
+                （ComfyUIの`CONTROLNET`型）。指定された場合、
+                `pose_landmarks`から構築した骨格画像を使い、実際に
+                検出できている手の構造に従うよう、生成を強く誘導する。
+                Noneの場合はControlNetを使わず、従来通りプロンプトと
+                マスクのみで生成する。
+            controlnet_strength: ControlNetの適用強度。
         """
         import nodes as comfy_nodes  # ComfyUI本体のnodes.py（遅延import）
 
@@ -2323,6 +2445,54 @@ class AdvancedHandAutoFixer:
         vae_encode_inpaint = comfy_nodes.VAEEncodeForInpaint()
         (latent,) = vae_encode_inpaint.encode(vae, image_tensor, mask_tensor, grow_mask_by)
 
+        # ★2026-07-11追加（ユーザー提案: 「DWPoseの様に、マスク生成した
+        # 際のデータを用いて近い手の形になるようにしてほしい」）。
+        # DWPose等のポーズ推定ControlNetプリプロセッサと同様に、
+        # 既に検出できているlandmarksから骨格可視化画像を構築し、
+        # hand pose対応のControlNetモデルが指定されていれば、それを
+        # 使ってpositive/negative conditioningを更新する。これにより、
+        # 拡散モデルはプロンプトだけでなく「実際に検出できている手の
+        # 骨格構造」にも強く従うよう誘導される。骨格画像は、image/mask
+        # と全く同じ座標変換（guide_sizeによる拡大→8の倍数へのpadding）
+        # を経てから使うことで、latentの空間解像度と一致させる。
+        active_positive, active_negative = positive, negative
+        if hand_pose_controlnet is not None and pose_landmarks is not None:
+            skeleton_image = _landmarks_to_pose_skeleton_image(pose_landmarks, (orig_h, orig_w))
+            if skeleton_image is not None:
+                if (sample_h, sample_w) != (orig_h, orig_w):
+                    skeleton_image = cv2.resize(
+                        skeleton_image, (sample_w, sample_h), interpolation=cv2.INTER_NEAREST
+                    )
+                if pad_h > 0 or pad_w > 0:
+                    skeleton_image = cv2.copyMakeBorder(
+                        skeleton_image, 0, pad_h, 0, pad_w, cv2.BORDER_CONSTANT, value=0
+                    )
+                skeleton_tensor = _numpy_rgb_to_tensor(skeleton_image)
+                try:
+                    controlnet_apply = comfy_nodes.ControlNetApplyAdvanced()
+                    (active_positive, active_negative) = controlnet_apply.apply_controlnet(
+                        positive,
+                        negative,
+                        hand_pose_controlnet,
+                        skeleton_tensor,
+                        controlnet_strength,
+                        0.0,
+                        1.0,
+                        vae=vae,
+                    )
+                    logger.info(
+                        "HandAutoFixer: hand pose ControlNet（強度=%.2f）を適用しました。",
+                        controlnet_strength,
+                    )
+                except Exception as e:
+                    logger.warning(
+                        "HandAutoFixer: hand pose ControlNetの適用に失敗しました。"
+                        "通常のプロンプトのみで続行します (%s: %s)",
+                        type(e).__name__,
+                        e,
+                    )
+                    active_positive, active_negative = positive, negative
+
         (sampled_latent,) = comfy_nodes.common_ksampler(
             model,
             seed,
@@ -2330,8 +2500,8 @@ class AdvancedHandAutoFixer:
             cfg,
             sampler_name,
             scheduler,
-            positive,
-            negative,
+            active_positive,
+            active_negative,
             latent,
             denoise=denoise,
         )

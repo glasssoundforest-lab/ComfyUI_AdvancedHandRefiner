@@ -1011,3 +1011,42 @@ class TestLandmarksToHandMask:
         thin_mask = nodes._landmarks_to_hand_mask(landmarks, (400, 300), thickness=2)
         thick_mask = nodes._landmarks_to_hand_mask(landmarks, (400, 300), thickness=20)
         assert np.count_nonzero(thick_mask) > np.count_nonzero(thin_mask)
+
+
+class TestLandmarksToPoseSkeletonImage:
+    """
+    ★2026-07-11追加（ユーザー提案: 「DWPoseの様に、マスク生成した際の
+    データを用いて近い手の形になるようにしてほしい」）:
+    `_landmarks_to_pose_skeleton_image`（MediaPipeの21点landmarksから
+    DWPose/OpenPose形式の骨格可視化画像を構築するヘルパー）の単体テスト。
+    """
+
+    def _sample_landmarks(self):
+        return [(50.0 + i * 3, 100.0 + i * 2) for i in range(21)]
+
+    def test_returns_none_for_missing_landmarks(self):
+        assert nodes._landmarks_to_pose_skeleton_image(None, (100, 100)) is None
+
+    def test_returns_none_for_insufficient_landmarks(self):
+        assert nodes._landmarks_to_pose_skeleton_image([(1.0, 1.0)] * 5, (100, 100)) is None
+
+    def test_produces_colored_skeleton_image(self):
+        landmarks = self._sample_landmarks()
+        image = nodes._landmarks_to_pose_skeleton_image(landmarks, (200, 200))
+        assert image is not None
+        assert image.shape == (200, 200, 3)
+        # 黒背景に色のついた骨格が描かれているはず
+        assert np.count_nonzero(image.sum(axis=2)) > 0
+
+    def test_background_is_black(self):
+        """DWPose/OpenPose形式の慣習に従い、骨格以外の背景は黒であるべき"""
+        landmarks = self._sample_landmarks()
+        image = nodes._landmarks_to_pose_skeleton_image(landmarks, (200, 200))
+        # 四隅は骨格から十分離れているはずなので黒であるべき
+        assert tuple(image[0, 0]) == (0, 0, 0)
+        assert tuple(image[199, 199]) == (0, 0, 0)
+
+    def test_degenerate_shape_handled_safely(self):
+        landmarks = self._sample_landmarks()
+        image = nodes._landmarks_to_pose_skeleton_image(landmarks, (0, 0))
+        assert image.shape == (0, 0, 3)

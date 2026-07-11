@@ -870,6 +870,41 @@ MediaPipeの21点landmarksから、各指の関節チェーン（付け根→中
 そのlandmarks/bboxもマスクと同様に信頼せず、親側の情報を使うように
 しています（矛盾した優先順位判定を避けるため）。
 
+#### DWPoseのような骨格ベースのControlNet誘導を追加（ユーザー提案、2026-07-11）
+
+ユーザーから2点のご質問・提案をいただきました:「KSamplerと同等の
+描画力があるか確認してほしい」「DWPoseの様に、マスク生成した際の
+データを用いて近い手の形になるようにしてほしい」。
+
+**KSamplerとの同等性について**: `_run_inpaint_sampling`は
+`comfy_nodes.common_ksampler`（ComfyUI本体の`nodes.py`から直接import
+した、標準の`KSampler`ノードが内部で呼び出しているのと全く同じ関数）
+を、`model, seed, steps, cfg, sampler_name, scheduler, positive,
+negative, latent, denoise`という完全な標準パラメータセットで呼び出して
+います。描画力に差はありません。
+
+**DWPose風の骨格ベース誘導**: DWPose等のポーズ推定ControlNet
+プリプロセッサは、検出した骨格を可視化した画像を作り、それを
+ControlNetの入力として拡散モデルへ「この骨格に従って描いてください」
+という強い構造的ヒントを与えます。当プラグインは既にMediaPipeの21点
+landmarksを保持しているため、同様の骨格可視化画像を自前で構築し、
+hand pose対応のControlNetモデルへの入力画像として使えるようにしました。
+
+新規ヘルパー`_landmarks_to_pose_skeleton_image`は、黒背景に、各指ごとに
+異なる色（親指=赤、人差し指=橙、中指=黄、薬指=緑、小指=青）の線で
+関節チェーンを描画し、関節点を白い円で示します（一般的なOpenPose系
+hand pose ControlNetの入力形式に準じています）。`AdvancedHandAutoFixer`
+に新規オプション`hand_pose_controlnet`（`CONTROLNET`型）・
+`controlnet_strength`（既定0.6）を追加しました。`hand_pose_controlnet`
+が接続されている場合、既に検出できているlandmarksから骨格画像を構築し、
+`ControlNetApplyAdvanced`でpositive/negative conditioningを更新して
+からサンプリングします。骨格画像は、`guide_size`による拡大・8の倍数
+へのpaddingを画像・マスクと全く同じ変換で経てから使うため、latentの
+空間解像度と正しく一致します。`hand_pose_controlnet`を接続しない場合
+（既定）は、従来通りプロンプトとマスクのみで生成します。ControlNetの
+適用自体が失敗した場合は、警告を出しつつ元のconditioningでそのまま
+続行します（安全側フォールバック）。
+
 ## テスト
 
 ```bash

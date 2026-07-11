@@ -303,6 +303,8 @@ def _make_fake_comfy_nodes_module(captured: dict):
         model, seed, steps, cfg, sampler_name, scheduler, positive, negative, latent, denoise=1.0
     ):
         captured["ksampler_called"] = True
+        captured["ksampler_positive"] = positive
+        captured["ksampler_negative"] = negative
         return (latent,)
 
     class FakeVAEDecode:
@@ -311,9 +313,19 @@ def _make_fake_comfy_nodes_module(captured: dict):
             img = np.zeros((1, h, w, 3), dtype=np.float32)
             return (nodes.torch.from_numpy(img),)
 
+    class FakeControlNetApplyAdvanced:
+        def apply_controlnet(self, positive, negative, control_net, image, strength, start, end, vae=None):
+            captured["controlnet_called"] = True
+            captured["controlnet_image_shape"] = tuple(image.shape[1:3])
+            captured["controlnet_strength"] = strength
+            captured["controlnet_positive_in"] = positive
+            captured["controlnet_negative_in"] = negative
+            return ("MODIFIED_POSITIVE", "MODIFIED_NEGATIVE")
+
     fake.VAEEncodeForInpaint = FakeVAEEncodeForInpaint
     fake.common_ksampler = fake_common_ksampler
     fake.VAEDecode = FakeVAEDecode
+    fake.ControlNetApplyAdvanced = FakeControlNetApplyAdvanced
     return fake
 
 
@@ -1872,3 +1884,204 @@ class TestThreeDetectorEnsembleMask:
         # しまうはず。親マスク由来の、ずっと大きいマスクが使われている
         # ことを確認する。
         assert captured_masks[0].sum() > (100 * 255)
+
+
+class TestHandPoseControlNet:
+    """
+    ★2026-07-11追加（ユーザー提案: 「DWPoseの様に、マスク生成した際の
+    データを用いて近い手の形になるようにしてほしい」）。DWPose等の
+    ポーズ推定ControlNetプリプロセッサと同様に、既に検出できている
+    landmarksから骨格可視化画像を構築し、hand pose対応のControlNet
+    モデルが指定されていれば、それを使ってpositive/negative
+    conditioningを更新する機能のテスト。
+    """
+
+    def test_controlnet_not_applied_when_not_provided(self):
+        """hand_pose_controlnet未指定時は、ControlNetは一切呼ばれない（従来通りの動作）"""
+        fixer = nodes.AdvancedHandAutoFixer()
+        captured: dict = {}
+        fake_module = _make_fake_comfy_nodes_module(captured)
+
+        crop = np.zeros((161, 298, 3), dtype=np.uint8)
+        mask = np.full((161, 298), 255, dtype=np.uint8)
+        landmarks = [(50.0 + i, 100.0 + i) for i in range(21)]
+
+        with patch.dict(sys.modules, {"nodes": fake_module}):
+            fixer._run_inpaint_sampling(
+                model=None,
+                positive="ORIG_POSITIVE",
+                negative="ORIG_NEGATIVE",
+                vae=None,
+                image_crop_rgb=crop,
+                coarse_mask=mask,
+                seed=0,
+                steps=1,
+                cfg=1.0,
+                sampler_name="euler",
+                scheduler="normal",
+                denoise=1.0,
+                grow_mask_by=6,
+                guide_size=768,
+                pose_landmarks=landmarks,
+                hand_pose_controlnet=None,
+                controlnet_strength=0.7,
+            )
+
+        assert "controlnet_called" not in captured
+        assert captured["ksampler_positive"] == "ORIG_POSITIVE"
+        assert captured["ksampler_negative"] == "ORIG_NEGATIVE"
+
+    def test_controlnet_applied_when_provided_with_landmarks(self):
+        fixer = nodes.AdvancedHandAutoFixer()
+        captured: dict = {}
+        fake_module = _make_fake_comfy_nodes_module(captured)
+
+        crop = np.zeros((161, 298, 3), dtype=np.uint8)
+        mask = np.full((161, 298), 255, dtype=np.uint8)
+        landmarks = [(50.0 + i, 100.0 + i) for i in range(21)]
+
+        with patch.dict(sys.modules, {"nodes": fake_module}):
+            fixer._run_inpaint_sampling(
+                model=None,
+                positive="ORIG_POSITIVE",
+                negative="ORIG_NEGATIVE",
+                vae=None,
+                image_crop_rgb=crop,
+                coarse_mask=mask,
+                seed=0,
+                steps=1,
+                cfg=1.0,
+                sampler_name="euler",
+                scheduler="normal",
+                denoise=1.0,
+                grow_mask_by=6,
+                guide_size=768,
+                pose_landmarks=landmarks,
+                hand_pose_controlnet="FAKE_CONTROLNET",
+                controlnet_strength=0.7,
+            )
+
+        assert captured["controlnet_called"] is True
+        assert captured["controlnet_strength"] == 0.7
+        assert captured["controlnet_positive_in"] == "ORIG_POSITIVE"
+        # ControlNet適用後のconditioningがKSamplerに渡っているはず
+        assert captured["ksampler_positive"] == "MODIFIED_POSITIVE"
+        assert captured["ksampler_negative"] == "MODIFIED_NEGATIVE"
+
+    def test_controlnet_skeleton_image_matches_sampling_resolution(self):
+        """
+        骨格画像は、guide_sizeによる拡大後のサンプリング解像度
+        （8の倍数へのpadding込み）と一致するサイズで渡されるはず
+        （latentの空間解像度と一致させる必要があるため）。
+        """
+        fixer = nodes.AdvancedHandAutoFixer()
+        captured: dict = {}
+        fake_module = _make_fake_comfy_nodes_module(captured)
+
+        crop = np.zeros((161, 298, 3), dtype=np.uint8)
+        mask = np.full((161, 298), 255, dtype=np.uint8)
+        landmarks = [(50.0 + i, 100.0 + i) for i in range(21)]
+
+        with patch.dict(sys.modules, {"nodes": fake_module}):
+            fixer._run_inpaint_sampling(
+                model=None,
+                positive="P",
+                negative="N",
+                vae=None,
+                image_crop_rgb=crop,
+                coarse_mask=mask,
+                seed=0,
+                steps=1,
+                cfg=1.0,
+                sampler_name="euler",
+                scheduler="normal",
+                denoise=1.0,
+                grow_mask_by=6,
+                guide_size=768,
+                pose_landmarks=landmarks,
+                hand_pose_controlnet="FAKE_CONTROLNET",
+                controlnet_strength=0.6,
+            )
+
+        assert captured["controlnet_image_shape"] == captured["encode_pixels_shape"][1:3]
+
+    def test_controlnet_skipped_when_landmarks_unavailable(self):
+        """hand_pose_controlnetは指定されていても、pose_landmarksが無ければControlNetは呼ばれない"""
+        fixer = nodes.AdvancedHandAutoFixer()
+        captured: dict = {}
+        fake_module = _make_fake_comfy_nodes_module(captured)
+
+        crop = np.zeros((161, 298, 3), dtype=np.uint8)
+        mask = np.full((161, 298), 255, dtype=np.uint8)
+
+        with patch.dict(sys.modules, {"nodes": fake_module}):
+            fixer._run_inpaint_sampling(
+                model=None,
+                positive="ORIG_POSITIVE",
+                negative="ORIG_NEGATIVE",
+                vae=None,
+                image_crop_rgb=crop,
+                coarse_mask=mask,
+                seed=0,
+                steps=1,
+                cfg=1.0,
+                sampler_name="euler",
+                scheduler="normal",
+                denoise=1.0,
+                grow_mask_by=6,
+                guide_size=768,
+                pose_landmarks=None,
+                hand_pose_controlnet="FAKE_CONTROLNET",
+                controlnet_strength=0.6,
+            )
+
+        assert "controlnet_called" not in captured
+        assert captured["ksampler_positive"] == "ORIG_POSITIVE"
+
+    def test_controlnet_failure_falls_back_to_original_conditioning(self):
+        """ControlNet適用自体が例外を送出しても、クラッシュせず元のconditioningで続行する"""
+        fixer = nodes.AdvancedHandAutoFixer()
+        captured: dict = {}
+        fake_module = _make_fake_comfy_nodes_module(captured)
+
+        class _FailingControlNetApply:
+            def apply_controlnet(self, *args, **kwargs):
+                raise RuntimeError("模擬的なControlNet適用失敗")
+
+        fake_module.ControlNetApplyAdvanced = _FailingControlNetApply
+
+        crop = np.zeros((161, 298, 3), dtype=np.uint8)
+        mask = np.full((161, 298), 255, dtype=np.uint8)
+        landmarks = [(50.0 + i, 100.0 + i) for i in range(21)]
+
+        with patch.dict(sys.modules, {"nodes": fake_module}):
+            result = fixer._run_inpaint_sampling(
+                model=None,
+                positive="ORIG_POSITIVE",
+                negative="ORIG_NEGATIVE",
+                vae=None,
+                image_crop_rgb=crop,
+                coarse_mask=mask,
+                seed=0,
+                steps=1,
+                cfg=1.0,
+                sampler_name="euler",
+                scheduler="normal",
+                denoise=1.0,
+                grow_mask_by=6,
+                guide_size=768,
+                pose_landmarks=landmarks,
+                hand_pose_controlnet="FAKE_CONTROLNET",
+                controlnet_strength=0.6,
+            )
+
+        assert result is not None
+        assert captured["ksampler_positive"] == "ORIG_POSITIVE"
+        assert captured["ksampler_negative"] == "ORIG_NEGATIVE"
+
+    def test_input_types_expose_hand_pose_controlnet_and_strength(self):
+        input_types = nodes.AdvancedHandAutoFixer.INPUT_TYPES()
+        assert "hand_pose_controlnet" in input_types["optional"]
+        assert input_types["optional"]["hand_pose_controlnet"][0] == "CONTROLNET"
+        strength_spec = input_types["optional"]["controlnet_strength"]
+        assert strength_spec[1]["default"] == 0.6
