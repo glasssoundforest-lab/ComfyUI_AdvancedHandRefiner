@@ -502,6 +502,14 @@ def _generous_fallback_mask(shape: tuple[int, int]) -> np.ndarray:
         0-255 uint8 マスク（H, W）。クロップ中央を覆う楕円形。
     """
     h, w = shape
+    # ★2026-07-11追加（異常値耐性の点検で発見）: hまたはwが負の場合、
+    # 下の`h <= 0 or w <= 0`によるガードへ到達する前に
+    # `np.zeros((h, w), ...)`自体が
+    # `ValueError: negative dimensions are not allowed`で例外を送出して
+    # しまっていた。実際のパイプラインではnumpy配列の`.shape`から得られる
+    # 値のため負になることは無いはずだが、防御的に0未満は0へクランプする。
+    h = max(0, h)
+    w = max(0, w)
     mask = np.zeros((h, w), dtype=np.uint8)
     if h <= 0 or w <= 0:
         return mask

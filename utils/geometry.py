@@ -83,6 +83,19 @@ def compute_rotation_angle(landmarks: list[tuple[float, float]]) -> float:
     dx = middle_mcp[0] - wrist[0]
     dy = middle_mcp[1] - wrist[1]
 
+    # ★2026-07-11追加（異常値耐性の点検で発見）: dx/dyがNaN/Infの場合
+    # （検出器が何らかの理由で不正な座標を返した場合）、下の
+    # `math.hypot(dx, dy) < 1e-6`によるガードはすり抜けてしまう
+    # （IEEE754の仕様上、NaNとの比較は常にFalseになるため）。
+    # その結果 atan2(nan, -nan) = nan がそのまま返り、これを
+    # `rotate_image`に渡すと`cv2.getRotationMatrix2D`の結果を
+    # 整数キャンバスサイズへ変換する際に
+    # `ValueError: cannot convert float NaN to integer`でクラッシュ
+    # することを確認した。方向が定まらない以上、他の退化ケースと同じく
+    # 回転しない(角度0)ことが最も安全なフォールバックである。
+    if not (math.isfinite(dx) and math.isfinite(dy)):
+        return 0.0
+
     # ★退化ケースへの対処: 手首と中指付け根がほぼ同一点の場合（極端な手の
     # ポーズや検出ノイズにより landmarks が潰れた場合）、方向ベクトルの
     # 大きさが実質0になる。この場合 dy はしばしば厳密に 0.0 になり、
@@ -215,8 +228,35 @@ def compute_padded_bbox(
     Returns:
         (x1, y1, x2, y2) — 画像範囲でクリップ済み
     """
-    xs = [p[0] for p in points]
-    ys = [p[1] for p in points]
+    # ★2026-07-11追加（異常値耐性の点検で発見）: 以下2つのクラッシュを
+    # 実際に確認した。
+    # 1. `points`が空リストの場合、`min(xs)`が
+    #    `ValueError: min() iterable argument is empty`で例外を送出する
+    # 2. `points`にNaN/Infが含まれる場合、`int(min(xs))`が
+    #    `ValueError: cannot convert float NaN to integer`や
+    #    `OverflowError: cannot convert float infinity to integer`で
+    #    例外を送出する（検出器が何らかの理由で不正な座標を返した場合に
+    #    起こりうる）
+    # どちらのケースも、有効なbboxを計算できないため、安全側に倒して
+    # 画像全体を返す（クロップを諦めるより、画像全体を対象にした方が
+    # 後続処理が継続できるため）。
+    finite_points = [
+        p for p in points if math.isfinite(p[0]) and math.isfinite(p[1])
+    ]
+    if not finite_points:
+        if max_width is not None or max_height is not None:
+            # 画像中央基準で、指定された上限まで縮小したbboxを返す
+            # （無制限の巨大bboxをそのまま返さないようにするため）
+            cx, cy = image_width / 2.0, image_height / 2.0
+            w = min(image_width, max_width) if max_width is not None else image_width
+            h = min(image_height, max_height) if max_height is not None else image_height
+            fx1 = max(0, int(round(cx - w / 2.0)))
+            fy1 = max(0, int(round(cy - h / 2.0)))
+            return (fx1, fy1, min(image_width, fx1 + w), min(image_height, fy1 + h))
+        return (0, 0, image_width, image_height)
+
+    xs = [p[0] for p in finite_points]
+    ys = [p[1] for p in finite_points]
 
     x1 = int(min(xs)) - padding
     y1 = int(min(ys)) - padding
