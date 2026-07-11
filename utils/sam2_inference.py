@@ -139,16 +139,32 @@ class Sam2OnnxInference:
         decoder_inputs = [i.name for i in self._decoder_session.get_inputs()]
         self._decoder_input_names = decoder_inputs
 
-        # ★2026-07-09追加: エンコーダ・デコーダそれぞれの実際の
-        # session.run() 呼び出しを直列化するためのロック。タイル分割
-        # 推論はThreadPoolExecutorで並列実行されるが、実際のONNX
+        # ★2026-07-09追加、2026-07-11修正: エンコーダ・デコーダそれぞれの
+        # 実際の session.run() 呼び出しを直列化するためのロック。タイル
+        # 分割推論はThreadPoolExecutorで並列実行されるが、実際のONNX
         # Runtimeセッションへの呼び出し自体はこのロックで1スレッドずつに
         # 制限し、実行プロバイダ由来のネイティブクラッシュ（Windows環境で
-        # 実際に確認された access violation）を防ぐ。エンコーダと
-        # デコーダで別々のロックにしているのは、片方の推論中でも
-        # もう片方（別セッション）は並行して進められる余地を残すため。
+        # 実際に確認された access violation）を防ぐ。
+        #
+        # ★2026-07-11修正: 当初はエンコーダ・デコーダを別々のロックに
+        # していた（片方の推論中でももう片方（別セッション）は並行して
+        # 進められる余地を残すため）。しかし、この設計を適用した後も
+        # 同じ種類のクラッシュがユーザー環境で再発することを実行ログで
+        # 確認した。クラッシュ時のスタックトレースを精査したところ、
+        # 「あるスレッドがエンコーダセッションを実行中、別のスレッドが
+        # 同時にデコーダセッションを実行中」という状況が実際に発生して
+        # いたことが分かった。エンコーダ・デコーダは別々のONNX
+        # Runtimeセッションだが、同じGPU上で動作する以上、**異なる
+        # セッション同士が同時に実行されること自体**が、一部の実行
+        # プロバイダ（DirectML等）・ドライバの組み合わせでは不安定要因に
+        # なりうると判断し、エンコーダ用ロックとデコーダ用ロックを
+        # 同一のロックオブジェクトに統合した（`_encoder_lock`/
+        # `_decoder_lock`という属性名自体は後方互換のため残すが、実体は
+        # 同じLockを指す）。これにより、エンコーダ・デコーダを含め、
+        # このインスタンスが行う実際のONNX Runtime呼び出しは常に
+        # 1スレッドずつに制限される（並列性は失うが、安定性を優先する）。
         self._encoder_lock = threading.Lock()
-        self._decoder_lock = threading.Lock()
+        self._decoder_lock = self._encoder_lock
 
     def _encode_image(
         self, image_rgb: np.ndarray

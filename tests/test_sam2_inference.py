@@ -866,6 +866,104 @@ class TestConcurrentSessionAccessIsSerialized:
             "対照実験自体が同時実行を検知できていない（テスト設計の不備の可能性）"
         )
 
+    def test_encoder_and_decoder_run_calls_never_overlap_with_each_other(self):
+        """
+        ★2026-07-11追加: エンコーダ用ロックとデコーダ用ロックが別々の
+        オブジェクトだった時期、ユーザーの実行環境で同じ種類の
+        "Windows fatal exception: access violation" クラッシュが
+        再発することを実行ログで確認した。クラッシュ時のスタック
+        トレースを精査したところ、「あるスレッドがエンコーダセッションを
+        実行中、別のスレッドが同時にデコーダセッションを実行中」という
+        状況が実際に発生していたことが分かった。
+
+        `__init__`で`_decoder_lock`を`_encoder_lock`と同一オブジェクトに
+        統合したことで、エンコーダの実行中はデコーダの実行も（逆も
+        同様に）ブロックされる、すなわち「このインスタンス全体で
+        ONNX Runtimeへの呼び出しは常に1つずつ」になっていることを
+        検証する。
+        """
+        obj = Sam2OnnxInference.__new__(Sam2OnnxInference)
+        # __init__と同じ統合ロックのパターンを再現する
+        obj._encoder_lock = threading.Lock()
+        obj._decoder_lock = obj._encoder_lock
+
+        # エンコーダ・デコーダ両方のin_flightカウントを共有する、
+        # 単一のトラッキングセッションを両方に割り当てる
+        shared_tracker = self._ConcurrencyTrackingSession(
+            np.zeros((1, 1, 64, 64), dtype=np.float32)
+        )
+
+        class _DecoderTrackingSession(self._ConcurrencyTrackingSession):
+            """エンコーダ側と同じin_flightカウンタを共有するデコーダ用セッション"""
+
+            def __init__(self, shared):
+                self._output = [np.zeros((1, 1, 256, 256), dtype=np.float32)]
+                self._shared = shared
+
+            @property
+            def in_flight(self):
+                return self._shared.in_flight
+
+            @property
+            def max_concurrent(self):
+                return self._shared.max_concurrent
+
+            def run(self, output_names, input_feed):
+                with self._shared._counter_lock:
+                    self._shared.in_flight += 1
+                    self._shared.max_concurrent = max(
+                        self._shared.max_concurrent, self._shared.in_flight
+                    )
+                try:
+                    import time
+
+                    time.sleep(0.02)
+                    return self._output
+                finally:
+                    with self._shared._counter_lock:
+                        self._shared.in_flight -= 1
+
+        obj._encoder_session = shared_tracker
+        obj._encoder_input_name = "image"
+        obj._encoder_output_names = ["image_embed"]
+
+        obj._decoder_session = _DecoderTrackingSession(shared_tracker)
+        obj._decoder_input_names = [
+            "point_coords",
+            "point_labels",
+            "mask_input",
+            "has_mask_input",
+            "orig_im_size",
+            "image_embed",
+        ]
+
+        image = np.zeros((64, 64, 3), dtype=np.uint8)
+        encoder_outputs = {"image_embed": np.zeros((1, 32, 64, 64), dtype=np.float32)}
+        point_coords = np.array([[[10.0, 10.0], [50.0, 50.0]]], dtype=np.float32)
+        point_labels = np.array([[2, 3]], dtype=np.float32)
+
+        def _run_encoder(_):
+            obj._encode_image(image)
+
+        def _run_decoder(_):
+            obj._run_decoder_prob(encoder_outputs, point_coords, point_labels, (64, 64))
+
+        from concurrent.futures import ThreadPoolExecutor
+
+        # エンコーダ呼び出しとデコーダ呼び出しを交互に混ぜて同時実行する
+        with ThreadPoolExecutor(max_workers=8) as executor:
+            futures = []
+            for i in range(12):
+                futures.append(executor.submit(_run_encoder if i % 2 == 0 else _run_decoder, i))
+            for f in futures:
+                f.result()
+
+        assert shared_tracker.max_concurrent == 1, (
+            "エンコーダとデコーダのsession.run()が同時に実行されていた "
+            f"(max_concurrent={shared_tracker.max_concurrent})。"
+            "ロックの統合が機能していない。"
+        )
+
 
 class TestDedupePointsAndLabels:
     """
