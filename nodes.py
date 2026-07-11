@@ -1682,6 +1682,12 @@ class AdvancedHandAutoFixer:
                             "元のクロップサイズへ縮小して貼り戻す。SDXL系モデルの学習解像度"
                             "（1024前後）から大きく外れた小さい解像度で直接サンプリングすると、"
                             "著しく乏しい結果になりうるための対策。"
+                            "★注意: 値を大きくするほどVRAM消費量が増える（1024はSDXLの"
+                            "標準解像度に最も近く高品質だが、768より重い）。VRAMが12〜16GB"
+                            "程度など限られた環境で、複数の手・複数回のリトライを伴う長時間の"
+                            "実行を行うと、途中でCUDA out of memoryが発生することが実際に"
+                            "確認されている。安定性を優先する場合は768前後に留めるか、"
+                            "ComfyUI起動時に--lowvram等のVRAM管理オプションの併用を検討する。"
                         ),
                     },
                 ),
@@ -1990,6 +1996,25 @@ class AdvancedHandAutoFixer:
             # （従来は「prior（前段のbbox/landmarks）が無いため
             # セグメンテーションのプロンプトを構築できません」という
             # ログと共にSAM2がスキップしていた）。
+            # ★2026-07-11追加: ユーザー環境で実際にCUDA OOM
+            # （まずYOLO/SAM2の検出処理自体がメモリ確保に失敗し、続けて
+            # インペイントも失敗し、最終的にComfyUI本体のクリーンアップ
+            # 処理自体が例外を起こしてprompt_workerスレッドごと異常終了
+            # する）ことを実行ログで確認した。特に`guide_size`を1024等
+            # 高めに設定した場合、直前のサンプリング（PyTorch/CUDA側）で
+            # 確保されたメモリが、この後に呼ぶ検出処理（YOLO/SAM2は別途
+            # onnxruntimeが独自にCUDAメモリを確保する）と競合しうる。
+            # 検出処理の直前でVRAMキャッシュを明示的に解放しておくことで、
+            # 検出処理に必要なメモリの確保失敗リスクを減らす（根本的な
+            # VRAM容量不足そのものは解消できないが、少しでも安全マージン
+            # を確保する）。
+            try:
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+            except Exception:
+                pass
+            gc.collect()
+
             crop_detect_result = _detect_hands(
                 cropped_rgb,
                 min_detection_confidence,
@@ -2226,10 +2251,11 @@ class AdvancedHandAutoFixer:
             except Exception as e:
                 logger.warning(
                     "HandAutoFixer: インペイントに失敗しました"
-                    "(image_index=%d, hand=%d, attempt=%d) (%s)",
+                    "(image_index=%d, hand=%d, attempt=%d/%d) (%s)",
                     image_index,
                     hand_index,
-                    attempt,
+                    attempt + 1,
+                    max_retries + 1,
                     e,
                 )
                 final_status = f"インペイント失敗({e})"

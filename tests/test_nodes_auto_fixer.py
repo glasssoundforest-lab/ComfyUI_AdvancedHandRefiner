@@ -2085,3 +2085,55 @@ class TestHandPoseControlNet:
         assert input_types["optional"]["hand_pose_controlnet"][0] == "CONTROLNET"
         strength_spec = input_types["optional"]["controlnet_strength"]
         assert strength_spec[1]["default"] == 0.6
+
+
+class TestInpaintFailureLogging:
+    """
+    ★2026-07-11追加: ユーザー提供の実行ログ（CUDA OOM発生時）を精査した
+    際に、インペイント失敗時の警告ログで試行回数が0始まりのまま出力
+    されており（他のログが`attempt=X/4`という1始まりの表記で統一されて
+    いるのに対して不整合だった）、ログを見比べる際に混乱を招く軽微な
+    バグを発見した。修正を検証する。
+    """
+
+    def _common_kwargs(self):
+        return dict(
+            model=None,
+            positive=None,
+            negative=None,
+            vae=None,
+            seed=0,
+            steps=20,
+            cfg=7.0,
+            sampler_name="euler",
+            scheduler="normal",
+            denoise=0.6,
+        )
+
+    def test_inpaint_failure_log_uses_1_indexed_attempt_number(self, caplog):
+        fixer = nodes.AdvancedHandAutoFixer()
+        canvas = 100
+
+        hand = HandDetection(
+            bbox=BoundingBox(10, 10, 90, 90),
+            landmarks=_landmarks_for_size(90.0, 90.0),
+            mask=generate_synthetic_hand_mask(canvas_size=(canvas, canvas), palm_radius=20),
+            source="fake",
+        )
+
+        def failing_inpaint(self_, *args, **kwargs):
+            raise RuntimeError("模擬的なCUDA OOM")
+
+        with caplog.at_level("WARNING", logger="HandRefiner"), patch.object(
+            nodes, "_detect_hands", return_value=DetectionResult(hands=[hand])
+        ), patch.object(nodes.AdvancedHandAutoFixer, "_run_inpaint_sampling", failing_inpaint):
+            fixer.auto_fix(
+                _image_tensor(h=canvas, w=canvas), max_retries=3, **self._common_kwargs()
+            )
+
+        messages = [r.message for r in caplog.records]
+        assert any("attempt=1/4" in m for m in messages), (
+            "インペイント失敗ログの試行回数が1始まりで出力されていない"
+        )
+        # 0始まりの表記(旧バグ)は出力されていないはず
+        assert not any("attempt=0)" in m for m in messages)
