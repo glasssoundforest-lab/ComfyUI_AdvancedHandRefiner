@@ -162,7 +162,7 @@ class TestOrientationOptimizerBatchSupport:
         # _crop_for_hand を直接呼び出して、パディングロジック自体を検証する。
         batch_image = nodes.torch.from_numpy(np.zeros((2, 80, 60, 3), dtype=np.float32))
         img_rgb = nodes._tensor_to_numpy_rgb(batch_image, 0)
-        cropped1, remap1 = optimizer._crop_for_hand(img_rgb, None, 0, 0)
+        cropped1, remap1, _parent_mask1 = optimizer._crop_for_hand(img_rgb, None, 0, 0)
         assert cropped1.shape[:2] == (80, 60)
         assert remap1["content_size"] == (60, 80)
 
@@ -534,7 +534,7 @@ class TestDefensiveFallbackPaths:
             bbox=BoundingBox(45, 45, 55, 55), landmarks=landmarks, source="fake"
         )
 
-        cropped, remap_info = optimizer._crop_for_hand(
+        cropped, remap_info, _parent_mask = optimizer._crop_for_hand(
             img_rgb, selected, padding=-1000, image_index=0
         )
 
@@ -664,3 +664,48 @@ class TestProcessAllHandsDefaultsToTrue:
 
         assert cropped.shape[0] == 1
         assert isinstance(remap_info, dict)  # リストではなく単一のdictのまま
+
+
+class TestTransformMaskToCropCoords:
+    """
+    ★2026-07-11追加: `_transform_mask_to_crop_coords`（親検出時点の
+    マスクを、画像と同じ回転+クロップ変換に通してクロップ座標系へ変換
+    するヘルパー）の単体テスト。
+    """
+
+    def test_none_mask_returns_none(self):
+        result = nodes._transform_mask_to_crop_coords(None, 0.0, (0, 0, 10, 10))
+        assert result is None
+
+    def test_zero_angle_just_crops(self):
+        mask = np.zeros((100, 100), dtype=np.uint8)
+        mask[20:80, 20:80] = 255
+        result = nodes._transform_mask_to_crop_coords(mask, 0.0, (10, 10, 90, 90))
+        assert result is not None
+        assert result.shape == (80, 80)
+        # クロップ範囲内に元のマスク領域が正しく含まれている
+        assert result[10:70, 10:70].sum() > 0
+
+    def test_nonzero_angle_rotates_before_cropping(self):
+        mask = np.zeros((100, 100), dtype=np.uint8)
+        mask[40:60, 40:60] = 255
+        result_no_rotation = nodes._transform_mask_to_crop_coords(mask, 0.0, (0, 0, 100, 100))
+        result_rotated = nodes._transform_mask_to_crop_coords(mask, 45.0, (0, 0, 100, 100))
+        assert result_rotated is not None
+        # 回転ありと回転無しで、キャンバスサイズや内容が異なるはず
+        assert result_rotated.shape != result_no_rotation.shape or not np.array_equal(
+            result_rotated, result_no_rotation
+        )
+
+    def test_crop_box_outside_mask_bounds_returns_none(self):
+        mask = np.zeros((50, 50), dtype=np.uint8)
+        mask[10:40, 10:40] = 255
+        # 回転無しで、マスクの範囲を完全に超えるcrop_boxを指定
+        result = nodes._transform_mask_to_crop_coords(mask, 0.0, (100, 100, 200, 200))
+        assert result is None
+
+    def test_degenerate_crop_box_returns_none(self):
+        mask = np.zeros((50, 50), dtype=np.uint8)
+        mask[10:40, 10:40] = 255
+        result = nodes._transform_mask_to_crop_coords(mask, 0.0, (30, 30, 20, 20))
+        assert result is None

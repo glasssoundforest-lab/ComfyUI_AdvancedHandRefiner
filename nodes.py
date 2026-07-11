@@ -238,6 +238,43 @@ def _select_hand(result: DetectionResult, hand_index: int):
     return result.hands[hand_index]
 
 
+def _transform_mask_to_crop_coords(
+    mask: np.ndarray | None,
+    angle: float,
+    crop_box: tuple[int, int, int, int],
+) -> np.ndarray | None:
+    """
+    親の検出時点で得られていたマスク（元画像の座標系）を、画像本体に
+    適用したのと全く同じ回転+クロップ変換に通し、クロップ後の画像と
+    同じ座標系のマスクへ変換する。
+
+    ★2026-07-11追加（ユーザー提案）: クロップの時点で既に手を認識できて
+    いる（マスクを持つ`selected`が存在する）なら、クロップ後の画像に
+    対する再検出が失敗しても、この変換済みマスクを使って引き続き
+    精度の高いインペイントを試みられるようにするため。
+
+    Args:
+        mask: 元画像座標系のマスク（0-255 uint8、(H,W)）。Noneなら常にNoneを返す
+        angle: 画像に適用したのと同じ回転角度（度）。0.0なら回転をスキップする
+        crop_box: 回転後の画像に対するクロップ範囲 (x1, y1, x2, y2)
+
+    Returns:
+        クロップ座標系のマスク（0-255 uint8）。変換できない場合はNone
+    """
+    if mask is None:
+        return None
+
+    rotated_mask = rotate_image(mask, angle)[0] if angle != 0.0 else mask
+
+    x1, y1, x2, y2 = crop_box
+    rh, rw = rotated_mask.shape[:2]
+    cx1, cy1 = max(0, x1), max(0, y1)
+    cx2, cy2 = min(rw, x2), min(rh, y2)
+    if cx2 <= cx1 or cy2 <= cy1:
+        return None
+    return rotated_mask[cy1:cy2, cx1:cx2]
+
+
 def _generous_fallback_mask(shape: tuple[int, int]) -> np.ndarray:
     """
     クロップ後の画像に対する再検出が完全に失敗した場合
@@ -359,7 +396,7 @@ class AdvancedHandOrientationOptimizer:
                 selected_list = [_select_hand(result, hand_index)]
 
             for selected in selected_list:
-                cropped, remap_info = self._crop_for_hand(img_rgb, selected, padding, i)
+                cropped, remap_info, _parent_mask = self._crop_for_hand(img_rgb, selected, padding, i)
                 crops.append(cropped)
                 remap_infos.append(remap_info)
 
@@ -391,7 +428,7 @@ class AdvancedHandOrientationOptimizer:
         padding: int,
         image_index: int,
         max_crop_size: tuple[int, int] | None = None,
-    ) -> tuple[np.ndarray, RemapInfo]:
+    ) -> tuple[np.ndarray, RemapInfo, np.ndarray | None]:
         """
         既に選択済みの1つの手（`selected`、Noneの場合は「手なし」を表す）に
         ついて、向き最適化・クロップを行う（検出処理自体はこの関数の外で
@@ -401,6 +438,25 @@ class AdvancedHandOrientationOptimizer:
         サイズを超えないよう中心を保ったまま制限する。`AdvancedHandAutoFixer`
         のリトライループで、再検出結果の悪化によりクロップが際限なく
         肥大化する（＝サンプリングコストが跳ね上がる）のを防ぐために使う。
+
+        ★2026-07-11追加（ユーザー提案）: `selected.mask`（クロップ前、
+        親の検出時点で既に得られている粗いセグメンテーション）を、
+        画像に適用したのと全く同じ回転+クロップ変換に通し、クロップ後の
+        画像と同じ座標系のマスクとして3番目の戻り値
+        （`parent_mask_in_crop_coords`）で返すようにした。
+
+        従来、クロップ後の画像に対する検出（YOLO/MediaPipe/SAM2の
+        再実行）が失敗すると、精密なマスクを諦めて汎用的な楕円マスクに
+        フォールバックしていた。しかし、クロップの時点で既に手を認識
+        できている（`selected`が存在する）以上、その時点の粗い
+        セグメンテーションを変換して使う方が、汎用的な楕円よりずっと
+        実際の手の形状に沿ったフォールバックになる。呼び出し側
+        （`_fix_one_hand`）は、クロップ後の再検出が失敗した場合に、
+        汎用楕円マスクより先にこの変換済みマスクを優先して使う。
+
+        Returns:
+            (クロップ画像, remap_info, 親マスクをクロップ座標系に変換したもの。
+            `selected`が無い/`selected.mask`が無い場合は None)
         """
         orig_h, orig_w = img_rgb.shape[:2]
 
@@ -454,7 +510,8 @@ class AdvancedHandOrientationOptimizer:
                         "rotated_size": (orig_w, orig_h),
                         "content_size": (cx2 - cx1, cy2 - cy1),
                     }
-                    return cropped, remap_info
+                    parent_mask = _transform_mask_to_crop_coords(selected.mask, 0.0, crop_box)
+                    return cropped, remap_info, parent_mask
 
             # bboxも無い（本当に手がかりが一切無い）場合の最終フォールバック。
             # max_crop_sizeが指定されていれば、画像中央基準でその上限まで
@@ -476,7 +533,12 @@ class AdvancedHandOrientationOptimizer:
                         "rotated_size": (orig_w, orig_h),
                         "content_size": (fx2 - fx1, fy2 - fy1),
                     }
-                    return cropped, remap_info
+                    parent_mask = (
+                        _transform_mask_to_crop_coords(selected.mask, 0.0, (fx1, fy1, fx2, fy2))
+                        if selected is not None
+                        else None
+                    )
+                    return cropped, remap_info, parent_mask
 
             remap_info = {
                 "angle": 0.0,
@@ -486,7 +548,7 @@ class AdvancedHandOrientationOptimizer:
                 "rotated_size": (orig_w, orig_h),
                 "content_size": (orig_w, orig_h),
             }
-            return img_rgb, remap_info
+            return img_rgb, remap_info, None
 
         # 選択された手（デフォルトでは信頼度が最も高い手、hand_indexで
         # 指定された手、あるいはprocess_all_hands時はそのうちの1つ）
@@ -526,7 +588,8 @@ class AdvancedHandOrientationOptimizer:
             "content_size": (crop_w, crop_h),
         }
 
-        return cropped, remap_info
+        parent_mask = _transform_mask_to_crop_coords(selected.mask, angle, crop_box)
+        return cropped, remap_info, parent_mask
 
 def _mask_tensor_to_numpy(mask: torch.Tensor, index: int = 0) -> np.ndarray:
     """ComfyUIの MASK テンソル（B, H, W, 0-1 float）のうち、
@@ -1316,7 +1379,7 @@ class AdvancedHandAutoFixer:
                 effective_cap[1],
             )
 
-            cropped_rgb, remap_info = optimizer._crop_for_hand(
+            cropped_rgb, remap_info, parent_mask_in_crop_coords = optimizer._crop_for_hand(
                 current_rgb, selected, padding, image_index, max_crop_size=effective_cap
             )
 
@@ -1333,6 +1396,10 @@ class AdvancedHandAutoFixer:
             # 後の画像に対して改めて検出をやり直し、クロップ座標系の
             # マスクを取得する（`AdvancedHandMaskRefiner`が自身の入力
             #画像に対して独自に検出をやり直すのと同じ設計）。
+            #
+            # クロップ後の画像はズームインされている分、元画像より
+            # 精密な検出結果が期待できるため、これが得られる場合は
+            # 最優先で使う。
             crop_detect_result = _detect_hands(
                 cropped_rgb, min_detection_confidence, detection_mode
             )
@@ -1340,26 +1407,46 @@ class AdvancedHandAutoFixer:
                 _select_hand(crop_detect_result, 0) if not crop_detect_result.is_empty else None
             )
 
-            if crop_selected is None or crop_selected.mask is None:
+            if crop_selected is not None and crop_selected.mask is not None:
+                # 最善: クロップ後の画像に対する再検出（より精密）が成功した
+                coarse_mask = crop_selected.mask
+            elif parent_mask_in_crop_coords is not None:
+                # ★2026-07-11追加（ユーザー提案）: クロップ後の再検出が
+                # 失敗しても、クロップの時点で既に手を認識できていた
+                # （親の検出結果にマスクがあった）なら、それを画像と同じ
+                # 回転+クロップ変換に通してクロップ座標系に変換した
+                # `parent_mask_in_crop_coords`を使う。精密さは劣るが、
+                # 実際の手の形状に沿っている分、汎用的な楕円マスクより
+                # 良いフォールバックになる。
+                logger.info(
+                    "HandAutoFixer: [image_index=%d, hand=%d, attempt=%d/%d] "
+                    "クロップ後の画像で手を再検出できませんでしたが、"
+                    "クロップ前の検出結果（マスク）を変換して使用します。",
+                    image_index,
+                    hand_index,
+                    attempt + 1,
+                    max_retries + 1,
+                )
+                coarse_mask = parent_mask_in_crop_coords
+            else:
                 # ★2026-07-11修正: 以前はここで即座に諦めて（このハンドの
                 # インペイントを完全に中断して）元の状態のまま残していた。
                 # 検出が難しいポーズ（指の握り込み・グローブ等）の手が
                 # 一度もインペイントされずに残ってしまう原因になっていた
-                # ため、精密な検出に失敗しても、クロップ中央を覆う大まかな
-                # 楕円マスクでともかく再生成を試みるよう変更した
-                # （`_generous_fallback_mask`参照）。
+                # ため、精密な検出にも親マスクの変換にも失敗した場合のみ、
+                # クロップ中央を覆う大まかな楕円マスクでともかく再生成を
+                # 試みるよう変更した（`_generous_fallback_mask`参照）。
                 logger.warning(
                     "HandAutoFixer: [image_index=%d, hand=%d, attempt=%d/%d] "
-                    "クロップ後の画像で手を検出できませんでした。"
-                    "大まかな楕円マスクでインペイントを試みます。",
+                    "クロップ後の画像で手を検出できず、親マスクの変換も"
+                    "利用できませんでした。大まかな楕円マスクでインペイント"
+                    "を試みます。",
                     image_index,
                     hand_index,
                     attempt + 1,
                     max_retries + 1,
                 )
                 coarse_mask = _generous_fallback_mask(cropped_rgb.shape[:2])
-            else:
-                coarse_mask = crop_selected.mask
 
             try:
                 inpainted_rgb = self._run_inpaint_sampling(
