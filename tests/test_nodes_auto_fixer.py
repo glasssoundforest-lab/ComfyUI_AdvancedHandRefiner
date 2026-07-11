@@ -351,6 +351,7 @@ class TestRunInpaintSamplingPadding:
                 scheduler="normal",
                 denoise=1.0,
                 grow_mask_by=6,
+                guide_size=0,  # このテストの主旨(8の倍数化)から切り離すため無効化
             )
 
         # エンコード時に渡された画像は8の倍数のサイズになっているはず
@@ -384,10 +385,130 @@ class TestRunInpaintSamplingPadding:
                 scheduler="normal",
                 denoise=1.0,
                 grow_mask_by=6,
+                guide_size=0,  # このテストの主旨(8の倍数化)から切り離すため無効化
             )
 
         assert captured["encode_pixels_shape"][1:3] == (64, 48)
         assert result.shape[:2] == (64, 48)
+
+
+class TestGuideSizeUpscaling:
+    """
+    ★2026-07-11追加（ユーザーからの「同一Model・同一プロンプトで
+    Detailer (SEGS)と比較すると、AdvancedHandAutoFixerでは手が
+    生成されていない」という報告により発見）: ADetailerやImpact Packの
+    Detailer (SEGS)は、検出領域をそのままのサイズでサンプリングする
+    のではなく、`guide_size`と呼ばれる目標サイズへ一旦拡大してから
+    KSamplerに渡し、結果を元のクロップサイズへ縮小して貼り戻す設計に
+    なっている。当ノードは元々、クロップした「ありのまま」のサイズ
+    （SDXLの学習解像度である1024前後を大きく下回りうる）で直接
+    サンプリングしていたため、この差を埋めるための`guide_size`機能を
+    検証する。
+    """
+
+    def test_small_crop_is_upscaled_to_guide_size_before_sampling(self):
+        fixer = nodes.AdvancedHandAutoFixer()
+        captured: dict = {}
+        fake_module = _make_fake_comfy_nodes_module(captured)
+
+        # 実行ログで実際に観測された、SDXLの学習解像度を大きく下回るクロップサイズ
+        image_crop = np.zeros((161, 298, 3), dtype=np.uint8)
+        mask = np.full((161, 298), 255, dtype=np.uint8)
+
+        with patch.dict(sys.modules, {"nodes": fake_module}):
+            result = fixer._run_inpaint_sampling(
+                model=None,
+                positive=None,
+                negative=None,
+                vae=None,
+                image_crop_rgb=image_crop,
+                coarse_mask=mask,
+                seed=0,
+                steps=1,
+                cfg=1.0,
+                sampler_name="euler",
+                scheduler="normal",
+                denoise=1.0,
+                grow_mask_by=6,
+                guide_size=768,
+            )
+
+        # 長辺(298)がguide_size(768)に近づくよう、アスペクト比を保って拡大されているはず
+        encoded_h, encoded_w = captured["encode_pixels_shape"][1:3]
+        assert max(encoded_h, encoded_w) >= 760  # 8の倍数化パディングを考慮し多少の余裕を持たせる
+        # アスペクト比が保たれている(元は161:298 ≈ 0.540)
+        assert abs((encoded_h / encoded_w) - (161 / 298)) < 0.02
+        # 最終的な出力は元のクロップサイズへ縮小され戻っているはず
+        assert result.shape[:2] == (161, 298)
+
+    def test_crop_already_larger_than_guide_size_is_not_upscaled(self):
+        fixer = nodes.AdvancedHandAutoFixer()
+        captured: dict = {}
+        fake_module = _make_fake_comfy_nodes_module(captured)
+
+        image_crop = np.zeros((900, 1000, 3), dtype=np.uint8)  # 既にguide_size超
+        mask = np.full((900, 1000), 255, dtype=np.uint8)
+
+        with patch.dict(sys.modules, {"nodes": fake_module}):
+            result = fixer._run_inpaint_sampling(
+                model=None,
+                positive=None,
+                negative=None,
+                vae=None,
+                image_crop_rgb=image_crop,
+                coarse_mask=mask,
+                seed=0,
+                steps=1,
+                cfg=1.0,
+                sampler_name="euler",
+                scheduler="normal",
+                denoise=1.0,
+                grow_mask_by=6,
+                guide_size=768,
+            )
+
+        # 既にguide_size以上なので拡大されない(8の倍数化パディングのみ)
+        encoded_h, encoded_w = captured["encode_pixels_shape"][1:3]
+        assert encoded_h < 908  # 900 + 8未満のパディングのみ
+        assert encoded_w == 1000  # 既に8の倍数なのでパディング無し
+        assert result.shape[:2] == (900, 1000)
+
+    def test_guide_size_zero_disables_upscaling(self):
+        fixer = nodes.AdvancedHandAutoFixer()
+        captured: dict = {}
+        fake_module = _make_fake_comfy_nodes_module(captured)
+
+        image_crop = np.zeros((161, 298, 3), dtype=np.uint8)
+        mask = np.full((161, 298), 255, dtype=np.uint8)
+
+        with patch.dict(sys.modules, {"nodes": fake_module}):
+            result = fixer._run_inpaint_sampling(
+                model=None,
+                positive=None,
+                negative=None,
+                vae=None,
+                image_crop_rgb=image_crop,
+                coarse_mask=mask,
+                seed=0,
+                steps=1,
+                cfg=1.0,
+                sampler_name="euler",
+                scheduler="normal",
+                denoise=1.0,
+                grow_mask_by=6,
+                guide_size=0,
+            )
+
+        encoded_h, encoded_w = captured["encode_pixels_shape"][1:3]
+        # guide_size=0なら拡大されず、8の倍数化パディングのみで済むはず
+        assert encoded_h < 169
+        assert encoded_w < 306
+        assert result.shape[:2] == (161, 298)
+
+    def test_auto_fix_input_types_expose_guide_size_with_default_768(self):
+        input_types = nodes.AdvancedHandAutoFixer.INPUT_TYPES()
+        spec = input_types["optional"]["guide_size"]
+        assert spec[1]["default"] == 768
 
 
 class TestParentMaskTransformedToCropCoords:

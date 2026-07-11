@@ -1505,6 +1505,23 @@ class AdvancedHandAutoFixer:
                         ),
                     },
                 ),
+                "guide_size": (
+                    "INT",
+                    {
+                        "default": 768,
+                        "min": 256,
+                        "max": 2048,
+                        "step": 64,
+                        "tooltip": (
+                            "サンプリングを行う目標解像度（px）。ADetailer/Impact Packの"
+                            "Detailer (SEGS)と同様、クロップの長辺がこれより小さい場合は"
+                            "アスペクト比を保ったまま拡大してからサンプリングし、結果を"
+                            "元のクロップサイズへ縮小して貼り戻す。SDXL系モデルの学習解像度"
+                            "（1024前後）から大きく外れた小さい解像度で直接サンプリングすると、"
+                            "著しく乏しい結果になりうるための対策。"
+                        ),
+                    },
+                ),
             },
         }
 
@@ -1536,6 +1553,7 @@ class AdvancedHandAutoFixer:
         mask_grow_pixels: int = 6,
         color_match_strength: float = 0.5,
         max_crop_dimension: int = 768,
+        guide_size: int = 768,
     ):
         batch_size = image.shape[0]
         optimizer = AdvancedHandOrientationOptimizer()
@@ -1624,6 +1642,7 @@ class AdvancedHandAutoFixer:
                         mask_grow_pixels=mask_grow_pixels,
                         color_match_strength=color_match_strength,
                         max_crop_dimension=max_crop_dimension,
+                        guide_size=guide_size,
                     )
                 except Exception as e:
                     logger.error(
@@ -1680,6 +1699,7 @@ class AdvancedHandAutoFixer:
         mask_grow_pixels: int,
         color_match_strength: float,
         max_crop_dimension: int = 768,
+        guide_size: int = 768,
     ) -> tuple[np.ndarray, str]:
         """1つの手について、リトライループ全体を実行する内部ヘルパー"""
         current_rgb = base_image_rgb
@@ -1915,6 +1935,7 @@ class AdvancedHandAutoFixer:
                     scheduler=scheduler,
                     denoise=escalated_denoise,
                     grow_mask_by=mask_grow_pixels,
+                    guide_size=guide_size,
                 )
             except Exception as e:
                 logger.warning(
@@ -2012,21 +2033,31 @@ class AdvancedHandAutoFixer:
         scheduler: str,
         denoise: float,
         grow_mask_by: int,
+        guide_size: int = 768,
     ) -> np.ndarray:
         """
         ComfyUI本体の標準的なインペイント機構（`VAEEncodeForInpaint`→
         `common_ksampler`→`VAEDecode`）を使って、クロップ画像に対して
         1回分のインペイントを実行する。
 
-        ★ComfyUI本体の`nodes`モジュールを遅延import している理由:
-        本体の`nodes.py`はComfyUI起動時にトップレベルモジュール`nodes`
-        として登録されるが、本プラグイン自身のファイルも同じ
-        `nodes.py`という名前であるため、モジュールレベルで
-        `import nodes`とすると、pytest等でこのファイル自体が
-        トップレベルモジュール`nodes`として読み込まれる場合に自己
-        importとなり混乱を招く。関数内での遅延importにすることで、
-        実際にこのメソッドが呼ばれるまで（＝本物のComfyUI環境で
-        実行されるまで）このimportを遅らせている。
+        ★2026-07-11追加（ユーザーからの「同一Model・同一プロンプトで
+        Detailer (SEGS)と比較すると、AdvancedHandAutoFixerでは手が
+        生成されていない」という報告により発見）: ADetailerや
+        Impact PackのDetailer (SEGS)は、検出領域をそのままのサイズで
+        サンプリングするのではなく、`guide_size`と呼ばれる目標サイズへ
+        一旦拡大（アスペクト比を保ったまま、長辺が`guide_size`に
+        近づくよう）してからKSamplerに渡し、結果を元のクロップサイズへ
+        縮小して貼り戻す、という設計になっている。
+
+        当ノードは元々、クロップした「ありのまま」のサイズ（実測で
+        161x298・237x276等、SDXLの学習解像度である1024前後を大きく
+        下回る）で直接サンプリングしていた。拡散モデルは学習解像度から
+        大きく外れた極端に小さい解像度で使うと、U-Netの受容野・
+        スケール前提が学習時と合わなくなり、著しく乏しい/実質的に
+        「何も描かれていないに等しい」結果になりうる。この差が、
+        同一モデル・同一プロンプトでもDetailer (SEGS)より明らかに
+        劣る結果になっていた実態と一致する。
+
         ★8の倍数へのパディングについて: `image_crop_rgb`のサイズ
         （`compute_padded_bbox`で計算された、ランドマークの外接矩形+
         paddingの結果）は、8の倍数になる保証が無い。多くの拡散モデルの
@@ -2034,13 +2065,49 @@ class AdvancedHandAutoFixer:
         ため、入力サイズが8の倍数でないと、エンコード・デコードで
         誤差や不整合が生じる可能性がある。そのため、実際にエンコード
         する前に画像・マスクを8の倍数のサイズまで右・下方向にパディング
-        し、デコード後に元のサイズへ切り戻す。
+        し、デコード後に元のサイズへ切り戻す（`guide_size`による
+        拡大後のサイズに対して行う）。
+
+        Args:
+            guide_size: サンプリングを行う目標サイズ（px）。クロップの
+                長辺がこれより小さい場合、アスペクト比を保ったまま
+                長辺がこのサイズに近づくよう拡大してからサンプリング
+                し、結果を元のクロップサイズへ縮小して返す。クロップの
+                長辺が既にこのサイズ以上の場合は拡大しない
+                （縮小もしない。過度な縮小は逆に精度を落とすため）。
         """
         import nodes as comfy_nodes  # ComfyUI本体のnodes.py（遅延import）
 
         orig_h, orig_w = image_crop_rgb.shape[:2]
-        pad_h = (8 - orig_h % 8) % 8
-        pad_w = (8 - orig_w % 8) % 8
+
+        # ★guide_sizeへの拡大: クロップの長辺がguide_size未満の場合のみ、
+        # アスペクト比を保ったまま長辺がguide_sizeに近づくよう拡大する。
+        long_side = max(orig_h, orig_w)
+        if guide_size > 0 and 0 < long_side < guide_size:
+            scale = guide_size / float(long_side)
+            sample_h = max(1, int(round(orig_h * scale)))
+            sample_w = max(1, int(round(orig_w * scale)))
+            sample_image = cv2.resize(
+                image_crop_rgb, (sample_w, sample_h), interpolation=cv2.INTER_LANCZOS4
+            )
+            sample_mask = cv2.resize(
+                coarse_mask, (sample_w, sample_h), interpolation=cv2.INTER_LINEAR
+            )
+            logger.info(
+                "HandAutoFixer: guide_size=%dに合わせてクロップを%dx%d→%dx%dへ拡大してサンプリングします。",
+                guide_size,
+                orig_w,
+                orig_h,
+                sample_w,
+                sample_h,
+            )
+        else:
+            sample_image = image_crop_rgb
+            sample_mask = coarse_mask
+            sample_h, sample_w = orig_h, orig_w
+
+        pad_h = (8 - sample_h % 8) % 8
+        pad_w = (8 - sample_w % 8) % 8
 
         # ★2026-07-11追加: max_crop_dimensionによる上限が実際に効いているかを
         # 実行ログから確定できるようにするための診断ログ。ここで記録される
@@ -2048,23 +2115,25 @@ class AdvancedHandAutoFixer:
         # 場合は、クロップサイズ自体は原因ではなく、VRAM管理（モデルの
         # 再読み込みの繰り返し等）の方を疑う必要があることを示す。
         logger.info(
-            "HandAutoFixer: インペイント実行 crop=%dx%d (padding後=%dx%d)",
+            "HandAutoFixer: インペイント実行 crop=%dx%d サンプリング解像度=%dx%d (padding後=%dx%d)",
             orig_w,
             orig_h,
-            orig_w + pad_w,
-            orig_h + pad_h,
+            sample_w,
+            sample_h,
+            sample_w + pad_w,
+            sample_h + pad_h,
         )
 
         if pad_h > 0 or pad_w > 0:
             padded_image = cv2.copyMakeBorder(
-                image_crop_rgb, 0, pad_h, 0, pad_w, cv2.BORDER_REPLICATE
+                sample_image, 0, pad_h, 0, pad_w, cv2.BORDER_REPLICATE
             )
             padded_mask = cv2.copyMakeBorder(
-                coarse_mask, 0, pad_h, 0, pad_w, cv2.BORDER_CONSTANT, value=0
+                sample_mask, 0, pad_h, 0, pad_w, cv2.BORDER_CONSTANT, value=0
             )
         else:
-            padded_image = image_crop_rgb
-            padded_mask = coarse_mask
+            padded_image = sample_image
+            padded_mask = sample_mask
 
         image_tensor = _numpy_rgb_to_tensor(padded_image)
         mask_tensor = _numpy_mask_to_tensor(padded_mask)
@@ -2102,7 +2171,19 @@ class AdvancedHandAutoFixer:
 
         decoded_rgb = _tensor_to_numpy_rgb(decoded_image, 0)
         if pad_h > 0 or pad_w > 0:
-            decoded_rgb = decoded_rgb[:orig_h, :orig_w]
+            # ★修正: guide_sizeによる拡大後のサイズ(sample_h, sample_w)へ
+            # 切り戻す（8の倍数化パディングの除去）。誤って元のクロップ
+            # サイズ(orig_h, orig_w)を使うと、guide_size拡大時に
+            # サイズが食い違いクラッシュ・不正な切り出しになってしまう。
+            decoded_rgb = decoded_rgb[:sample_h, :sample_w]
+
+        # ★guide_sizeによる拡大を行っていた場合、元のクロップサイズへ
+        # 縮小して返す（呼び出し元・貼り戻し処理はクロップの元サイズを
+        # 前提としているため）。
+        if (sample_h, sample_w) != (orig_h, orig_w):
+            decoded_rgb = cv2.resize(
+                decoded_rgb, (orig_w, orig_h), interpolation=cv2.INTER_LANCZOS4
+            )
 
         # ★2026-07-11追加: ユーザーから「手の生成が全くされていない状態で
         # 出力されている」という報告を受けた。KSamplerはログ上正常に完走
