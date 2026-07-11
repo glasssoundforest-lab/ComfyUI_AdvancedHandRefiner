@@ -189,6 +189,16 @@ def _detect_hands(
             での結果を使い回さないよう、キャッシュを完全にバイパスする
             （読み書きどちらも行わない）。
     """
+    # ★2026-07-11追加（異常値耐性の点検で発見）: image_rgb=Noneが渡ると
+    # `_image_content_hash`が`AttributeError: 'NoneType' object has no
+    # attribute 'tobytes'`でクラッシュしていた。通常のパイプラインでは
+    # 起こらないはずだが（常に実際のnumpy配列が渡る）、防御的に
+    # ガードし、検出できない扱い（空のDetectionResult）として処理を
+    # 継続できるようにする。
+    if image_rgb is None:
+        logger.warning("_detect_hands: image_rgb が None です。空の検出結果を返します。")
+        return DetectionResult()
+
     if initial_prior is not None:
         pipeline = _get_detector_pipeline(detection_mode)
         return pipeline.run(

@@ -2297,6 +2297,65 @@ NaN/Inf/負の値/空リスト/型不一致/極端なサイズを個別に投入
 
 ---
 
+## 🛡️ 異常値耐性の体系的な点検（第2ラウンド、2026-07-11）
+
+ユーザーから改めて「異常値に対する耐性を確認してください」という
+依頼を受けた（前回のラウンドで3件のバグを修正済み、計445件パス）。
+今回は前回の点検で見落としていた箇所を中心に、`utils/geometry.py`の
+汎用ユーティリティ関数群と`_detect_hands`を対象に、NaN・Inf・負の値・
+0サイズ・空リストを体系的に投入した。
+
+### 発見した5件のバグ
+
+1. **`rotate_image`（angle=NaN/Inf）**: 前回`compute_rotation_angle`
+   自体のNaN/Inf対策は行ったが、`rotate_image`は他の呼び出し元からも
+   独立して使われる汎用ユーティリティのため、angle引数そのものが
+   NaN/Infの場合の防御が漏れていた。`int(h*sin+w*cos)`が
+   `ValueError: cannot convert float NaN to integer`でクラッシュする
+   ことを確認
+2. **`rotate_points`（angle=NaN/Inf）**: 同様の理由で、`math.cos`/
+   `math.sin`が`ValueError: math domain error`でクラッシュすることを
+   確認
+3. **`compute_padded_bbox`（`max_width`/`max_height`が0以下）**:
+   `x1 = round(cx - max_width/2)`が中心より右へ、
+   `x2 = x1 + max_width`がさらにそこから左へ計算され、x1 > x2という
+   反転したbboxが生成される論理バグ。クラッシュはしないが、呼び出し側の
+   `img[y1:y2, x1:x2]`スライスが空配列になり後続処理が的外れになりうる
+4. **`compute_padded_bbox`（`image_width`/`image_height`が極端に小さい）**:
+   同様にx1>x2の反転が起こりうる
+5. **`_detect_hands`（`image_rgb=None`）**: `_image_content_hash`が
+   `AttributeError: 'NoneType' object has no attribute 'tobytes'`で
+   クラッシュ
+
+### 修正方針
+
+1・2は`compute_rotation_angle`と同じ「不正な角度は0度に丸める」方針で
+`rotate_image`/`rotate_points`それぞれに独立したガードを追加した。
+3・4は`max_width`/`max_height`を最小1にクランプし、かつ最終防御として
+`x2 = max(x1, x2)`・`y2 = max(y1, y2)`で反転を必ず解消するようにした
+（今後どんな新しい経路で退化した入力が来ても安全側に倒れる設計とした）。
+5は`image_rgb is None`を検出して空の`DetectionResult`を返すガードを
+`_detect_hands`の先頭に追加した。
+
+### 検証
+
+`rotate_image`/`rotate_points`にNaN/Inf/-Infのangleを渡すテストを追加。
+`compute_padded_bbox`には、通常のケースに加えて**ランダムな入力を200件
+投入するファズテスト**（`np.random.default_rng`によるシード固定で
+再現可能）を追加し、どんな組み合わせでも常に`x2 >= x1`かつ`y2 >= y1`
+であることを網羅的に検証した。`_detect_hands(None, ...)`が例外を出さず
+空の結果を返すことも確認した。
+
+新規テスト10件追加（`test_geometry.py`の
+`TestRotateImageAndPointsNonFiniteAngleGuards`5件、
+`TestComputePaddedBboxNeverInvertsBox`4件（うち1件はランダムファズ
+テスト）、`test_nodes_batch_and_mode.py`の
+`TestDetectHandsNoneImageGuard`1件）。計455件
+全てパス（SAM2実モデル関連4件+4エラーは開発環境の既知の制約で今回の
+変更とは無関係）。
+
+---
+
 ## 直近の次アクション（着手順）
 
 1. 実写真での3ノード連携・見た目の確認（`wrist_blur`/`finger_sharpness`/

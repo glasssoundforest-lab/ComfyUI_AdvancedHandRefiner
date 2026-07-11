@@ -810,3 +810,17 @@ class TestRefineMaskWithShading:
             result = nodes._refine_mask_with_shading(image, rough_mask)
 
         assert np.array_equal(result, rough_mask)
+
+
+class TestDetectHandsNoneImageGuard:
+    """
+    ★2026-07-11追加（異常値耐性の体系的点検、第2ラウンドで発見）:
+    `_detect_hands(None, ...)`が`_image_content_hash`内で
+    `AttributeError: 'NoneType' object has no attribute 'tobytes'`で
+    クラッシュしていた。通常のパイプラインでは起こらないはずだが、
+    防御的に空のDetectionResultを返すようにした。
+    """
+
+    def test_none_image_returns_empty_result_instead_of_crashing(self):
+        result = nodes._detect_hands(None, 0.5)
+        assert result.is_empty

@@ -625,6 +625,27 @@ GPU（CUDA実行プロバイダ）環境の実行ログには、SAM2推論時に
   モデル内部でさらに衝突する可能性はモデルアーキテクチャに起因する
   限界として残ります。
 
+#### 異常値耐性の体系的な点検（2026-07-11、2ラウンド実施）
+
+ユーザーから「異常値に対する耐性を確認してください」という依頼を受け、
+NaN・Inf・負の値・空リスト・型不一致・0サイズ等を体系的に投入する
+点検を2回にわたって実施し、計8件のクラッシュ・論理バグを発見・修正
+しました:
+
+- `compute_rotation_angle`: landmarksにNaN/Infが含まれるとIEEE754の
+  比較特性により既存の退化ケースガードをすり抜けクラッシュ
+- `estimate_finger_count`系: landmarksが空/短すぎる場合の未処理IndexError
+- `rotate_image`/`rotate_points`: angle引数自体がNaN/Infだと
+  （`compute_rotation_angle`経由以外の呼び出し元でも）クラッシュ
+- `compute_padded_bbox`: `max_width`/`max_height`に0や負の値、または
+  `image_width`/`image_height`が極端に小さい場合、x1>x2という反転した
+  bboxが生成される論理バグ（クラッシュはしないが後続処理が的外れになる）
+- `_detect_hands`: `image_rgb=None`で`AttributeError`によりクラッシュ
+
+いずれも「安全側に倒す」（角度を0に丸める、画像全体・空の検出結果を
+返す等）方針で修正し、ランダム入力を多数投入するファズテストも含めた
+回帰テストを追加しています。詳細はMILESTONES.mdを参照してください。
+
 ## テスト
 
 ```bash

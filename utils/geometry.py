@@ -127,6 +127,15 @@ def rotate_image(image: np.ndarray, angle: float) -> tuple[np.ndarray, tuple[flo
     h, w = image.shape[:2]
     center = (w / 2.0, h / 2.0)
 
+    # ★異常値耐性: angleがNaN/Infだと、後続のキャンバスサイズ計算
+    # （int(h*sin+w*cos)等）が「cannot convert float NaN to integer」で
+    # 例外を起こしクラッシュする。`compute_rotation_angle`自体には退化
+    # ケース（landmarksが同一点等）へのガードが既にあるが、この関数は
+    # 他の呼び出し元からも使われる汎用ユーティリティのため、ここでも
+    # 独立してサニタイズし、不正な角度は「回転しない(0度)」に丸める。
+    if not math.isfinite(angle):
+        angle = 0.0
+
     rot_mat = cv2.getRotationMatrix2D(center, angle, 1.0)
 
     cos = abs(rot_mat[0, 0])
@@ -188,6 +197,12 @@ def rotate_points(
     Returns:
         回転後画像座標系での点群
     """
+    # ★異常値耐性: angleがNaN/Infだと`math.cos`/`math.sin`が
+    # "math domain error"で例外を起こす。`rotate_image`と同様、
+    # 不正な角度は「回転しない(0度)」に丸める。
+    if not math.isfinite(angle):
+        angle = 0.0
+
     rad = math.radians(angle)
     cos_a, sin_a = math.cos(rad), math.sin(rad)
 
@@ -263,6 +278,18 @@ def compute_padded_bbox(
     x2 = int(max(xs)) + padding
     y2 = int(max(ys)) + padding
 
+    # ★2026-07-11追加（異常値耐性の点検で発見）: max_width/max_heightに
+    # 0や負の値を渡すと、`x1 = round(cx - max_width/2)`が中心より右へ、
+    # `x2 = x1 + max_width`がさらにそこから左へ計算されてしまい、
+    # x1 > x2 という反転したbboxが生成されるクラッシュには至らないが
+    # 深刻な論理バグがあった（呼び出し側のスライス`img[y1:y2, x1:x2]`が
+    # 空配列を返し、後続処理が的外れな結果になりうる）。意味のある最小
+    # サイズとして1にクランプする。
+    if max_width is not None:
+        max_width = max(1, max_width)
+    if max_height is not None:
+        max_height = max(1, max_height)
+
     if max_width is not None and (x2 - x1) > max_width:
         cx = (x1 + x2) / 2.0
         x1 = int(round(cx - max_width / 2.0))
@@ -283,6 +310,14 @@ def compute_padded_bbox(
     y1 = max(0, y1)
     x2 = min(image_width, x2)
     y2 = min(image_height, y2)
+
+    # ★2026-07-11追加（異常値耐性の点検で発見）: image_width/image_height
+    # が極端に小さい（0等、本来起こり得ないはずだが防御的に）場合、
+    # 上記のクリップだけではx2<x1・y2<y1という反転したbboxが残りうる。
+    # 呼び出し側が`img[y1:y2, x1:x2]`のようにそのままスライスに使う
+    # ことを踏まえ、最終防御としてここで反転を解消しておく。
+    x2 = max(x1, x2)
+    y2 = max(y1, y2)
 
     return (x1, y1, x2, y2)
 

@@ -303,3 +303,95 @@ class TestComputeRotationAngleDefensiveGuards:
     def test_landmarks_shorter_than_required_index_returns_zero(self):
         # MIDDLE_FINGER_MCP_IDX(9)に届かない5点のみ
         assert geometry.compute_rotation_angle([(0.0, 0.0)] * 5) == 0.0
+
+
+class TestRotateImageAndPointsNonFiniteAngleGuards:
+    """
+    ★2026-07-11追加（異常値耐性の体系的点検、第2ラウンドで発見）:
+    `compute_rotation_angle`自体はNaN/Inf対策済み（既存の
+    `TestComputeRotationAngleDefensiveGuards`参照）だが、
+    `rotate_image`/`rotate_points`は汎用ユーティリティとして他の
+    呼び出し元からも直接使われるため、これら自身も独立してangle引数の
+    NaN/Infに対して防御的であるべきという方針で、それぞれ単体でも
+    ガードを追加した。修正前は
+    `ValueError: cannot convert float NaN to integer`
+    （rotate_image）・`ValueError: math domain error`（rotate_points）
+    でクラッシュしていた。
+    """
+
+    def test_rotate_image_with_nan_angle_does_not_crash(self):
+        img = np.zeros((50, 50, 3), dtype=np.uint8)
+        rotated, center = geometry.rotate_image(img, float("nan"))
+        assert rotated.shape[:2] == (50, 50)  # angle=0扱いになり回転しない
+
+    def test_rotate_image_with_inf_angle_does_not_crash(self):
+        img = np.zeros((50, 50, 3), dtype=np.uint8)
+        rotated, center = geometry.rotate_image(img, float("inf"))
+        assert rotated.shape[:2] == (50, 50)
+
+    def test_rotate_image_with_negative_inf_angle_does_not_crash(self):
+        img = np.zeros((50, 50, 3), dtype=np.uint8)
+        rotated, center = geometry.rotate_image(img, float("-inf"))
+        assert rotated.shape[:2] == (50, 50)
+
+    def test_rotate_points_with_nan_angle_does_not_crash(self):
+        points = [(10.0, 10.0), (20.0, 20.0)]
+        result = geometry.rotate_points(points, float("nan"), (25.0, 25.0), (25.0, 25.0))
+        assert result == points  # angle=0扱いになり点は動かない(中心が同じため)
+
+    def test_rotate_points_with_inf_angle_does_not_crash(self):
+        points = [(10.0, 10.0)]
+        result = geometry.rotate_points(points, float("inf"), (25.0, 25.0), (25.0, 25.0))
+        assert result == points
+
+
+class TestComputePaddedBboxNeverInvertsBox:
+    """
+    ★2026-07-11追加（異常値耐性の体系的点検、第2ラウンドで発見）:
+    `max_width`/`max_height`に0や負の値を渡す、あるいは
+    `image_width`/`image_height`が極端に小さい（0等）場合に、
+    x1 > x2（またはy1 > y2）という反転したbboxが生成される論理バグが
+    あった。クラッシュはしないが、呼び出し元の`img[y1:y2, x1:x2]`
+    スライスが空配列になり、後続処理が的外れな結果になりうる。
+    どんな入力でも常に x2 >= x1 かつ y2 >= y1 であることを保証する。
+    """
+
+    def test_negative_max_width_does_not_invert_box(self):
+        x1, y1, x2, y2 = geometry.compute_padded_bbox(
+            [(10.0, 10.0), (50.0, 50.0)], 5, 100, 100, max_width=-10, max_height=-10
+        )
+        assert x2 >= x1
+        assert y2 >= y1
+
+    def test_zero_max_width_does_not_invert_box(self):
+        x1, y1, x2, y2 = geometry.compute_padded_bbox(
+            [(10.0, 10.0), (50.0, 50.0)], 5, 100, 100, max_width=0, max_height=0
+        )
+        assert x2 >= x1
+        assert y2 >= y1
+
+    def test_zero_image_size_does_not_invert_box(self):
+        x1, y1, x2, y2 = geometry.compute_padded_bbox([(10.0, 10.0), (50.0, 50.0)], 5, 0, 0)
+        assert x2 >= x1
+        assert y2 >= y1
+
+    def test_result_is_always_non_inverted_across_random_fuzz(self):
+        """ランダムな入力を多数投入し、常に非反転であることを確認する（回帰の網羅性を上げるため）"""
+        rng = np.random.default_rng(42)
+        for _ in range(200):
+            n_points = rng.integers(1, 5)
+            points = [
+                (float(rng.uniform(-1000, 1000)), float(rng.uniform(-1000, 1000)))
+                for _ in range(n_points)
+            ]
+            padding = int(rng.integers(-100, 100))
+            image_width = int(rng.integers(0, 500))
+            image_height = int(rng.integers(0, 500))
+            max_width = int(rng.integers(-50, 500)) if rng.random() < 0.5 else None
+            max_height = int(rng.integers(-50, 500)) if rng.random() < 0.5 else None
+
+            x1, y1, x2, y2 = geometry.compute_padded_bbox(
+                points, padding, image_width, image_height, max_width=max_width, max_height=max_height
+            )
+            assert x2 >= x1, (points, padding, image_width, image_height, max_width, max_height)
+            assert y2 >= y1, (points, padding, image_width, image_height, max_width, max_height)
