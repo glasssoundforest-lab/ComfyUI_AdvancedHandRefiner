@@ -390,6 +390,13 @@ def _refine_mask_with_shading(
     if refined_ratio < 0.01 or refined_ratio > 0.95:
         return rough_mask
 
+    # ★2026-07-11追加: GrabCutの出力も0/255の完全な二値マスクであり、
+    # 境界にアンチエイリアス・ぼかしが無い。`_generous_fallback_mask`と
+    # 同じ理由（境界の硬さがそのまま不自然な形の切れ目として見えて
+    # しまう問題）で、ここでも境界をガウシアンぼかしで滑らかにする。
+    blur_ksize = max(3, (min(h, w) // 12) | 1)
+    refined = cv2.GaussianBlur(refined, (blur_ksize, blur_ksize), 0)
+
     return refined
 
 
@@ -528,6 +535,20 @@ def _generous_fallback_mask(shape: tuple[int, int]) -> np.ndarray:
     # 端に接すると継ぎ目が目立ちやすいため、8割強に留めた余白を持たせる
     axes = (max(1, int(w * 0.42)), max(1, int(h * 0.42)))
     cv2.ellipse(mask, center, axes, 0, 0, 360, 255, -1)
+
+    # ★2026-07-11追加: ユーザーから「手が円形/楕円形の境界ではっきりと
+    # 切り取られたような、不自然な形のまま出力される」という報告と、
+    # 実際にその症状が写った画像を受けた。原因は、この楕円マスクが
+    # `cv2.ellipse(..., -1)`による完全に硬い境界（0か255かの二値、
+    # アンチエイリアス無し）だったこと。特に`denoise`が高い（崩れた
+    # 構造から抜け出すために引き上げられた）場合、マスク内は実質的に
+    # ゼロから作り直されるため、この硬い楕円の境界がそのまま「不自然な
+    # 円形の切れ目」として可視化されてしまっていた。マスクの縁に
+    # ガウシアンぼかしを適用し、滑らかに減衰する境界にすることで、
+    # 実際の手の輪郭と一致しない形状であっても、視覚的に不自然な
+    # ハードエッジにならないようにした。
+    blur_ksize = max(3, (min(h, w) // 10) | 1)  # 奇数に丸める
+    mask = cv2.GaussianBlur(mask, (blur_ksize, blur_ksize), 0)
     return mask
 
 

@@ -862,6 +862,42 @@ class TestRefineMaskWithShading:
         assert np.array_equal(result, rough_mask)
 
 
+class TestFallbackMasksHaveFeatheredEdges:
+    """
+    ★2026-07-11追加: ユーザーから「手が円形/楕円形の境界ではっきりと
+    切り取られたような、不自然な形のまま出力される」という報告と、
+    実際にその症状が写った画像を受けた。原因は`_generous_fallback_mask`
+    （楕円）・`_refine_mask_with_shading`（GrabCut）がどちらも完全な
+    二値マスク（境界にアンチエイリアス・ぼかしが無い）だったこと。
+    特にdenoiseが高い場合、マスク内は実質的にゼロから作り直されるため、
+    この硬い境界がそのまま不自然な形の切れ目として可視化されていた。
+    両方のマスクの境界にガウシアンぼかしを適用したことを検証する。
+    """
+
+    def test_generous_fallback_mask_edge_is_feathered_not_hard_binary(self):
+        mask = nodes._generous_fallback_mask((200, 200))
+        # 完全な二値(0か255のみ)ではなく、境界付近に中間値が存在するはず
+        unique_values = np.unique(mask)
+        assert len(unique_values) > 2, "マスクが依然として完全な二値のまま(ぼかしが効いていない)"
+
+    def test_generous_fallback_mask_center_and_corner_unaffected_by_blur(self):
+        """ぼかしを追加しても、中心は前景・四隅は背景のまま保たれる"""
+        mask = nodes._generous_fallback_mask((200, 200))
+        assert mask[100, 100] == 255  # 中心
+        assert mask[0, 0] == 0  # 四隅
+        assert mask[199, 199] == 0
+
+    def test_refine_mask_with_shading_edge_is_feathered(self):
+        image = np.full((200, 200, 3), 40, dtype=np.uint8)
+        cv2.ellipse(image, (100, 100), (50, 70), 0, 0, 360, (200, 180, 160), -1)
+        rough_mask = nodes._generous_fallback_mask((200, 200))
+
+        refined = nodes._refine_mask_with_shading(image, rough_mask)
+
+        unique_values = np.unique(refined)
+        assert len(unique_values) > 2, "GrabCut精密化後のマスクが依然として完全な二値のまま"
+
+
 class TestDetectHandsNoneImageGuard:
     """
     ★2026-07-11追加（異常値耐性の体系的点検、第2ラウンドで発見）:
