@@ -1,3 +1,4 @@
+import gc
 import hashlib
 import logging
 import os
@@ -1802,6 +1803,26 @@ class AdvancedHandAutoFixer:
 
             current_rgb = new_rgb
             selected = recheck_selected
+
+            # ★2026-07-11追加: ユーザー提供の実行ログで、1つの手/画像あたり
+            # 何度もリトライを重ねる（今回のケースでは6回）ような長時間の
+            # 実行において、試行が進むにつれてKSamplerの1ステップあたりの
+            # 時間が徐々に悪化していく現象（クラッシュには至らないが、
+            # 5it/s台→1〜2.5s/it台まで悪化）を確認した。同じログで
+            # サードパーティ拡張機能によるCPU使用率超過の警告も観測されて
+            # おり、断定はできないものの、多くのモデル再読み込みサイクルに
+            # よるメモリ断片化の蓄積が一因である可能性を考慮し、各試行の
+            # 終わりで（ループを継続する場合・打ち切る場合のいずれでも）
+            # VRAMキャッシュとPythonのガベージコレクションを明示的に行う
+            # ようにした（CUDA非搭載環境でも安全にスキップされるよう
+            # ガード済み）。`break`より前に置くことで、正常判定により
+            # 早期終了するケースでも確実に実行されるようにしている。
+            try:
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+            except Exception:
+                pass
+            gc.collect()
 
             if not is_abnormal:
                 final_status = f"{attempts_used}回目で問題なしと判定"

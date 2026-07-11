@@ -1292,3 +1292,59 @@ class TestShadingRefinementAppliedToFallbackMasks:
             )
 
         assert spy_refine.called, "親マスクのフォールバック時に陰影精密化が呼ばれていない"
+
+
+class TestMemoryCleanupBetweenAttempts:
+    """
+    ★2026-07-11追加: ユーザー提供の実行ログで、1つの手に対するリトライを
+    多数(今回は6回)重ねる長時間の実行において、試行が進むにつれて
+    KSamplerの1ステップあたりの時間が徐々に悪化していく現象
+    （クラッシュには至らないが5it/s台→1〜2.5s/it台まで悪化）が観測され、
+    同じログでサードパーティ拡張機能によるCPU使用率超過の警告も確認
+    された。断定はできないが、多くのモデル再読み込みサイクルによる
+    メモリ断片化の蓄積が一因である可能性を考慮し、各試行の終わりで
+    明示的なガベージコレクションを行うようにした。この回帰テストは、
+    その呼び出しが実際に行われることを確認する。
+    """
+
+    def _common_kwargs(self):
+        return dict(
+            model=None,
+            positive=None,
+            negative=None,
+            vae=None,
+            seed=0,
+            steps=20,
+            cfg=7.0,
+            sampler_name="euler",
+            scheduler="normal",
+            denoise=0.6,
+        )
+
+    def test_gc_collect_called_after_each_attempt(self):
+        fixer = nodes.AdvancedHandAutoFixer()
+        canvas = 200
+
+        hand = HandDetection(
+            bbox=BoundingBox(20, 20, 180, 180),
+            landmarks=_landmarks_for_size(float(canvas), float(canvas)),
+            mask=generate_synthetic_hand_mask(canvas_size=(canvas, canvas), palm_radius=30),
+            source="fake",
+        )
+
+        def fake_inpaint(self_, model, positive, negative, vae, image_crop_rgb, coarse_mask, **kwargs):
+            h, w = image_crop_rgb.shape[:2]
+            return np.full((h, w, 3), 128, dtype=np.uint8)
+
+        with patch.object(
+            nodes, "_detect_hands", return_value=DetectionResult(hands=[hand])
+        ), patch.object(nodes.AdvancedHandAutoFixer, "_run_inpaint_sampling", fake_inpaint), patch.object(
+            nodes, "assess_hand_overall_quality", return_value={"is_abnormal": False}
+        ), patch.object(
+            nodes, "gc"
+        ) as mock_gc:
+            fixer.auto_fix(
+                _image_tensor(h=canvas, w=canvas), max_retries=2, **self._common_kwargs()
+            )
+
+        assert mock_gc.collect.called, "各試行の終わりでgc.collect()が呼ばれていない"
