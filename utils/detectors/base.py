@@ -102,8 +102,28 @@ class DetectorPipeline:
     def __init__(self, detectors: list[HandDetector]):
         self._detectors = detectors
 
-    def run(self, image_rgb: np.ndarray, **kwargs: Any) -> DetectionResult:
-        result: DetectionResult | None = None
+    def run(
+        self, image_rgb: np.ndarray, *, initial_prior: DetectionResult | None = None, **kwargs: Any
+    ) -> DetectionResult:
+        """
+        パイプラインを実行する。
+
+        Args:
+            image_rgb: 検出対象の画像
+            initial_prior: ★2026-07-11追加（ユーザー提案）。パイプライン
+                実行前に既に分かっている検出結果（例:
+                クロップ前の検出結果を、クロップ後の画像と同じ座標系へ
+                変換したもの）を、先頭の検出器より前の「種」として
+                与える。`_merge_results`は「今回の検出器の結果が空なら
+                priorをそのまま維持する」設計のため、たとえ最初の
+                検出器（YOLO等）がクロップ後の画像で何も見つけられなく
+                ても、この`initial_prior`は失われずに後続の検出器
+                （最終的にはSAM2）まで引き継がれる。これにより、
+                クロップ後の画像単体では検出が難しいポーズでも、
+                クロップ前に一度認識できていた情報を使ってSAM2に
+                セグメンテーションを試みさせることができる。
+        """
+        result: DetectionResult | None = initial_prior
 
         for detector in self._detectors:
             if not detector.is_available():

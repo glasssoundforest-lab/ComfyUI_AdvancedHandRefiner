@@ -411,7 +411,7 @@ class TestParentMaskTransformedToCropCoords:
             bbox=BoundingBox(100, 100, 200, 200), landmarks=landmarks, mask=parent_mask, source="fake"
         )
 
-        cropped, remap_info, parent_mask_in_crop = optimizer._crop_for_hand(
+        cropped, remap_info, parent_mask_in_crop, _parent_prior = optimizer._crop_for_hand(
             img, hand, padding=10, image_index=0
         )
 
@@ -425,7 +425,7 @@ class TestParentMaskTransformedToCropCoords:
         landmarks = [(150.0 + i, 150.0 + i) for i in range(21)]
         hand = HandDetection(bbox=BoundingBox(100, 100, 200, 200), landmarks=landmarks, mask=None, source="fake")
 
-        _cropped, _remap_info, parent_mask_in_crop = optimizer._crop_for_hand(
+        _cropped, _remap_info, parent_mask_in_crop, _parent_prior = optimizer._crop_for_hand(
             img, hand, padding=10, image_index=0
         )
 
@@ -438,7 +438,7 @@ class TestParentMaskTransformedToCropCoords:
         parent_mask = generate_synthetic_hand_mask(canvas_size=(300, 300), palm_radius=40)
         hand = HandDetection(bbox=BoundingBox(100, 100, 200, 200), landmarks=None, mask=parent_mask, source="fake")
 
-        cropped, _remap_info, parent_mask_in_crop = optimizer._crop_for_hand(
+        cropped, _remap_info, parent_mask_in_crop, _parent_prior = optimizer._crop_for_hand(
             img, hand, padding=10, image_index=0
         )
 
@@ -618,7 +618,7 @@ class TestCropForHandLandmarksUnavailableFallback:
             bbox=BoundingBox(1000, 1500, 1200, 1750), landmarks=None, mask=None, source="sam2_bbox_only"
         )
 
-        cropped, remap_info, _parent_mask = optimizer._crop_for_hand(
+        cropped, remap_info, _parent_mask, _parent_prior = optimizer._crop_for_hand(
             img, hand, padding=16, image_index=0, max_crop_size=(238, 269)
         )
 
@@ -633,7 +633,7 @@ class TestCropForHandLandmarksUnavailableFallback:
         optimizer = nodes.AdvancedHandOrientationOptimizer()
         img = np.zeros((3456, 2304, 3), dtype=np.uint8)
 
-        cropped, remap_info, _parent_mask = optimizer._crop_for_hand(
+        cropped, remap_info, _parent_mask, _parent_prior = optimizer._crop_for_hand(
             img, None, padding=16, image_index=0, max_crop_size=(238, 269)
         )
 
@@ -646,7 +646,7 @@ class TestCropForHandLandmarksUnavailableFallback:
         optimizer = nodes.AdvancedHandOrientationOptimizer()
         img = np.zeros((3456, 2304, 3), dtype=np.uint8)
 
-        cropped, remap_info, _parent_mask = optimizer._crop_for_hand(
+        cropped, remap_info, _parent_mask, _parent_prior = optimizer._crop_for_hand(
             img, None, padding=16, image_index=0, max_crop_size=None
         )
 
@@ -873,7 +873,7 @@ class TestRetryCropSizeCap:
             bbox=BoundingBox(4, 4, 196, 196), landmarks=landmarks, mask=mask, source="fake"
         )
 
-        cropped, _remap_info, _parent_mask = optimizer._crop_for_hand(img_rgb, selected, padding=5, image_index=0)
+        cropped, _remap_info, _parent_mask, _parent_prior = optimizer._crop_for_hand(img_rgb, selected, padding=5, image_index=0)
         # 上限を指定していないので、landmarksの広い範囲に応じた大きなクロップになる
         assert cropped.shape[0] > 150 or cropped.shape[1] > 150
 
@@ -1071,3 +1071,126 @@ class TestDiagnosticLoggingForCropSize:
             )
 
         assert result.shape == (64, 64, 3)
+
+
+class TestCropDetectionUsesParentPriorAndDeviationCheck:
+    """
+    ★2026-07-11追加（ユーザー提案の2点）: 以下を検証する。
+    1. クロップ後の画像に対する再検出を呼ぶ際、クロップ前の検出結果を
+       変換した`parent_prior_for_crop`が`initial_prior`として渡される
+       （SAM2がYOLO/MediaPipe不在でもこの情報を使えるようにするため）。
+    2. クロップ後の再検出結果とクロップ前の検出結果（の変換）を比較し、
+       大きく逸脱している場合はクロップ後の結果を鵜呑みにせず、
+       クロップ前の結果を優先する。
+    """
+
+    def _common_kwargs(self):
+        return dict(
+            model=None,
+            positive=None,
+            negative=None,
+            vae=None,
+            seed=0,
+            steps=20,
+            cfg=7.0,
+            sampler_name="euler",
+            scheduler="normal",
+            denoise=0.6,
+        )
+
+    def test_crop_level_detect_hands_receives_transformed_parent_prior(self):
+        fixer = nodes.AdvancedHandAutoFixer()
+        canvas = 200
+
+        parent_mask = generate_synthetic_hand_mask(canvas_size=(canvas, canvas), palm_radius=30)
+        initial_hand = HandDetection(
+            bbox=BoundingBox(20, 20, 180, 180),
+            landmarks=_landmarks_for_size(float(canvas), float(canvas)),
+            mask=parent_mask,
+            source="fake",
+        )
+
+        received_priors = []
+        call_state = {"n": 0}
+
+        def detect_side_effect(image_rgb, *_args, initial_prior=None, **_kwargs):
+            call_state["n"] += 1
+            if call_state["n"] == 1:
+                # 1回目: auto_fix内の最初の全体検出
+                return DetectionResult(hands=[initial_hand])
+            if call_state["n"] == 2:
+                # 2回目: _fix_one_hand内のクロップ後の再検出
+                # (ここでinitial_priorが渡されるはず)
+                received_priors.append(initial_prior)
+                return DetectionResult(hands=[])
+            # 3回目以降: 貼り戻し後の全体画像に対する再チェック
+            # (これはクロップ座標系のpriorとは無関係なのでinitial_priorは渡らない)
+            return DetectionResult(hands=[])
+
+        def fake_inpaint(self_, model, positive, negative, vae, image_crop_rgb, coarse_mask, **kwargs):
+            h, w = image_crop_rgb.shape[:2]
+            return np.full((h, w, 3), 128, dtype=np.uint8)
+
+        with patch.object(nodes, "_detect_hands", side_effect=detect_side_effect), patch.object(
+            nodes.AdvancedHandAutoFixer, "_run_inpaint_sampling", fake_inpaint
+        ):
+            fixer.auto_fix(
+                _image_tensor(h=canvas, w=canvas), max_retries=0, **self._common_kwargs()
+            )
+
+        assert len(received_priors) == 1, "クロップ後の再検出呼び出しが期待した回数と異なる"
+        assert received_priors[0] is not None
+        assert not received_priors[0].is_empty
+
+    def test_deviating_crop_result_is_rejected_in_favor_of_parent_mask(self):
+        """
+        クロップ後の再検出結果が、クロップ前の検出結果（の変換）と全く
+        重ならない（IoU=0）場合、そのクロップ後の結果を使わず、
+        クロップ前の結果を優先することを確認する。
+        """
+        fixer = nodes.AdvancedHandAutoFixer()
+        canvas = 200
+
+        parent_mask = generate_synthetic_hand_mask(canvas_size=(canvas, canvas), palm_radius=30)
+        initial_hand = HandDetection(
+            bbox=BoundingBox(20, 20, 180, 180),
+            landmarks=_landmarks_for_size(float(canvas), float(canvas)),
+            mask=parent_mask,
+            source="fake",
+        )
+
+        call_state = {"n": 0}
+
+        def detect_side_effect(image_rgb, *_args, **_kwargs):
+            call_state["n"] += 1
+            h, w = image_rgb.shape[:2]
+            if call_state["n"] == 1:
+                return DetectionResult(hands=[initial_hand])
+            # クロップ後の再検出は「成功」するが、親マスクと全く重ならない
+            # (画像の隅だけの)明らかにおかしいマスクを返す
+            deviating_mask = np.zeros((h, w), dtype=np.uint8)
+            deviating_mask[0:3, 0:3] = 255
+            deviating_hand = HandDetection(
+                bbox=BoundingBox(0, 0, 3, 3), landmarks=None, mask=deviating_mask, source="crop_fake"
+            )
+            return DetectionResult(hands=[deviating_hand])
+
+        captured_masks = []
+
+        def fake_inpaint(self_, model, positive, negative, vae, image_crop_rgb, coarse_mask, **kwargs):
+            captured_masks.append(coarse_mask.copy())
+            h, w = image_crop_rgb.shape[:2]
+            return np.full((h, w, 3), 128, dtype=np.uint8)
+
+        with patch.object(nodes, "_detect_hands", side_effect=detect_side_effect), patch.object(
+            nodes.AdvancedHandAutoFixer, "_run_inpaint_sampling", fake_inpaint
+        ):
+            fixer.auto_fix(
+                _image_tensor(h=canvas, w=canvas), max_retries=0, **self._common_kwargs()
+            )
+
+        assert len(captured_masks) == 1
+        used_mask = captured_masks[0]
+        # 逸脱した3x3の隅マスクではなく、より大きい親マスク由来の
+        # マスクが使われているはず(3x3=9pxよりずっと大きい)
+        assert used_mask.sum() > (9 * 255)

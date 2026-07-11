@@ -162,7 +162,7 @@ class TestOrientationOptimizerBatchSupport:
         # _crop_for_hand を直接呼び出して、パディングロジック自体を検証する。
         batch_image = nodes.torch.from_numpy(np.zeros((2, 80, 60, 3), dtype=np.float32))
         img_rgb = nodes._tensor_to_numpy_rgb(batch_image, 0)
-        cropped1, remap1, _parent_mask1 = optimizer._crop_for_hand(img_rgb, None, 0, 0)
+        cropped1, remap1, _parent_mask1, _parent_prior1 = optimizer._crop_for_hand(img_rgb, None, 0, 0)
         assert cropped1.shape[:2] == (80, 60)
         assert remap1["content_size"] == (60, 80)
 
@@ -534,7 +534,7 @@ class TestDefensiveFallbackPaths:
             bbox=BoundingBox(45, 45, 55, 55), landmarks=landmarks, source="fake"
         )
 
-        cropped, remap_info, _parent_mask = optimizer._crop_for_hand(
+        cropped, remap_info, _parent_mask, _parent_prior = optimizer._crop_for_hand(
             img_rgb, selected, padding=-1000, image_index=0
         )
 
@@ -709,3 +709,43 @@ class TestTransformMaskToCropCoords:
         mask[10:40, 10:40] = 255
         result = nodes._transform_mask_to_crop_coords(mask, 0.0, (30, 30, 20, 20))
         assert result is None
+
+
+class TestMasksIou:
+    """★2026-07-11追加: `_masks_iou`（クロップ前後のマスク比較用IoU）の単体テスト。"""
+
+    def test_identical_masks_have_iou_1(self):
+        mask = np.zeros((50, 50), dtype=np.uint8)
+        mask[10:30, 10:30] = 255
+        assert nodes._masks_iou(mask, mask) == pytest.approx(1.0)
+
+    def test_non_overlapping_masks_have_iou_0(self):
+        m1 = np.zeros((50, 50), dtype=np.uint8)
+        m1[0:10, 0:10] = 255
+        m2 = np.zeros((50, 50), dtype=np.uint8)
+        m2[40:50, 40:50] = 255
+        assert nodes._masks_iou(m1, m2) == 0.0
+
+    def test_partial_overlap_gives_intermediate_iou(self):
+        m1 = np.zeros((50, 50), dtype=np.uint8)
+        m1[10:30, 10:30] = 255
+        m2 = np.zeros((50, 50), dtype=np.uint8)
+        m2[15:35, 15:35] = 255
+        iou = nodes._masks_iou(m1, m2)
+        assert 0.0 < iou < 1.0
+
+    def test_none_inputs_return_none(self):
+        mask = np.zeros((10, 10), dtype=np.uint8)
+        assert nodes._masks_iou(None, mask) is None
+        assert nodes._masks_iou(mask, None) is None
+        assert nodes._masks_iou(None, None) is None
+
+    def test_shape_mismatch_returns_none(self):
+        m1 = np.zeros((10, 10), dtype=np.uint8)
+        m2 = np.zeros((20, 20), dtype=np.uint8)
+        assert nodes._masks_iou(m1, m2) is None
+
+    def test_both_empty_masks_return_none(self):
+        m1 = np.zeros((10, 10), dtype=np.uint8)
+        m2 = np.zeros((10, 10), dtype=np.uint8)
+        assert nodes._masks_iou(m1, m2) is None

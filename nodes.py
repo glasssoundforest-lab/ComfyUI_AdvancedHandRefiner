@@ -16,7 +16,7 @@ import torch
 # おり、相対importの前提となる親パッケージが存在しない場合）は
 # 従来通りの絶対importにフォールバックする。
 try:
-    from .utils.detection_types import DetectionResult
+    from .utils.detection_types import BoundingBox, DetectionResult, HandDetection
     from .utils.detectors.base import DetectorPipeline
     from .utils.detectors.mediapipe_detector import MediaPipeHandDetector
     from .utils.detectors.sam2_detector import Sam2HandDetector
@@ -32,7 +32,7 @@ try:
     from .utils.hand_quality import assess_hand_overall_quality
     from .utils.mask_refine import sharpen_finger_contours, soften_wrist_boundary
 except ImportError:
-    from utils.detection_types import DetectionResult
+    from utils.detection_types import BoundingBox, DetectionResult, HandDetection
     from utils.detectors.base import DetectorPipeline
     from utils.detectors.mediapipe_detector import MediaPipeHandDetector
     from utils.detectors.sam2_detector import Sam2HandDetector
@@ -163,6 +163,7 @@ def _detect_hands(
     detection_mode: str = "full",
     sam2_tile_size: int = 512,
     sam2_tile_overlap: int = 64,
+    initial_prior: DetectionResult | None = None,
 ) -> DetectionResult:
     """
     統一検出パイプラインを実行するヘルパー。
@@ -179,7 +180,25 @@ def _detect_hands(
     再検出を省略する。画像がわずかでも異なれば（別の画像、あるいは
     前段のノードで加工された結果等）ハッシュ値が変わるため、誤って
     古い結果を使い回すことはない。
+
+    Args:
+        initial_prior: ★2026-07-11追加（ユーザー提案）。パイプラインへ
+            渡す初期prior（例: クロップ前の検出結果を、クロップ後の
+            画像と同じ座標系へ変換したもの）。指定した場合、priorの
+            内容はキャッシュキーに含まれていないため、誤って別のprior
+            での結果を使い回さないよう、キャッシュを完全にバイパスする
+            （読み書きどちらも行わない）。
     """
+    if initial_prior is not None:
+        pipeline = _get_detector_pipeline(detection_mode)
+        return pipeline.run(
+            image_rgb,
+            initial_prior=initial_prior,
+            min_hand_detection_confidence=min_detection_confidence,
+            sam2_tile_size=sam2_tile_size,
+            sam2_tile_overlap=sam2_tile_overlap,
+        )
+
     cache_key = (
         _image_content_hash(image_rgb),
         image_rgb.shape,
@@ -238,6 +257,47 @@ def _select_hand(result: DetectionResult, hand_index: int):
     return result.hands[hand_index]
 
 
+def _transform_bbox_to_crop_coords(
+    bbox: BoundingBox | None,
+    angle: float,
+    old_center: tuple[float, float],
+    new_center: tuple[float, float],
+    crop_box: tuple[int, int, int, int],
+) -> BoundingBox | None:
+    """
+    親検出時点のbbox（元画像座標系）を、画像本体に適用したのと同じ
+    回転+クロップ変換に通し、クロップ後の画像と同じ座標系のbboxに
+    変換する（`_transform_mask_to_crop_coords`のbbox版）。
+
+    4隅の点を回転させてから軸並行外接矩形を取り、クロップ原点だけ
+    平行移動する（回転させると矩形が矩形でなくなるため、外接矩形で
+    近似する）。
+    """
+    if bbox is None:
+        return None
+    corners = [(bbox.x1, bbox.y1), (bbox.x2, bbox.y1), (bbox.x2, bbox.y2), (bbox.x1, bbox.y2)]
+    rotated_corners = rotate_points(corners, angle, old_center, new_center) if angle != 0.0 else corners
+    xs = [p[0] for p in rotated_corners]
+    ys = [p[1] for p in rotated_corners]
+    x1, y1, _x2, _y2 = crop_box
+    return BoundingBox(min(xs) - x1, min(ys) - y1, max(xs) - x1, max(ys) - y1)
+
+
+def _transform_landmarks_to_crop_coords(
+    landmarks: list[tuple[float, float]] | None,
+    angle: float,
+    old_center: tuple[float, float],
+    new_center: tuple[float, float],
+    crop_box: tuple[int, int, int, int],
+) -> list[tuple[float, float]] | None:
+    """親検出時点のlandmarksを、画像本体と同じ回転+クロップ変換に通してクロップ座標系へ変換する。"""
+    if landmarks is None:
+        return None
+    rotated = rotate_points(landmarks, angle, old_center, new_center) if angle != 0.0 else landmarks
+    x1, y1, _x2, _y2 = crop_box
+    return [(px - x1, py - y1) for px, py in rotated]
+
+
 def _transform_mask_to_crop_coords(
     mask: np.ndarray | None,
     angle: float,
@@ -273,6 +333,63 @@ def _transform_mask_to_crop_coords(
     if cx2 <= cx1 or cy2 <= cy1:
         return None
     return rotated_mask[cy1:cy2, cx1:cx2]
+
+
+#: クロップ前後のマスクを比較し「逸脱している」とみなす際の下限IoU。
+#: `utils/detectors/base.py`のbbox版`IOU_MATCH_THRESHOLD`と同じ値を採用し、
+#: プロジェクト全体で「同一の手とみなせる一致度」の基準を統一する。
+MASK_DEVIATION_IOU_THRESHOLD = 0.3
+
+
+def _masks_iou(mask_a: np.ndarray | None, mask_b: np.ndarray | None) -> float | None:
+    """
+    2つの0-255マスクのIoU（Intersection over Union）を計算する。
+
+    ★2026-07-11追加（ユーザー提案）: クロップ後の画像に対する再検出で
+    得られたマスクと、クロップ前の検出結果を変換したマスクを比較し、
+    「逸脱していないか」を判定するために使う。両者のサイズが異なる
+    場合（本来は同じクロップ画像に対する結果なので一致するはずだが、
+    念のため）はNoneを返し、判定不能として扱う。
+    """
+    if mask_a is None or mask_b is None:
+        return None
+    if mask_a.shape != mask_b.shape:
+        return None
+    a = mask_a > 127
+    b = mask_b > 127
+    union = np.logical_or(a, b).sum()
+    if union == 0:
+        return None
+    intersection = np.logical_and(a, b).sum()
+    return float(intersection) / float(union)
+
+
+def _build_crop_prior(
+    bbox: BoundingBox | None,
+    landmarks: list[tuple[float, float]] | None,
+    mask: np.ndarray | None,
+    confidence: float,
+) -> DetectionResult | None:
+    """
+    クロップ座標系へ変換済みのbbox・landmarks・maskを1つの
+    `HandDetection`にまとめ、`DetectionResult`として返す。
+
+    ★2026-07-11追加（ユーザー提案）: `_detect_hands`の`initial_prior`に
+    渡すことで、クロップ後の画像単体ではYOLO/MediaPipeが何も検出できない
+    場合でも、SAM2にこの情報を使ってセグメンテーションを試みさせる
+    ことができる。bbox・landmarks・maskが全てNoneの場合は、有効な情報が
+    何も無いためNoneを返す。
+    """
+    if bbox is None and landmarks is None and mask is None:
+        return None
+    hand = HandDetection(
+        bbox=bbox,
+        landmarks=landmarks,
+        mask=mask,
+        confidence=confidence,
+        source="parent_transformed",
+    )
+    return DetectionResult(hands=[hand])
 
 
 def _generous_fallback_mask(shape: tuple[int, int]) -> np.ndarray:
@@ -396,7 +513,9 @@ class AdvancedHandOrientationOptimizer:
                 selected_list = [_select_hand(result, hand_index)]
 
             for selected in selected_list:
-                cropped, remap_info, _parent_mask = self._crop_for_hand(img_rgb, selected, padding, i)
+                cropped, remap_info, _parent_mask, _parent_prior = self._crop_for_hand(
+                    img_rgb, selected, padding, i
+                )
                 crops.append(cropped)
                 remap_infos.append(remap_info)
 
@@ -428,7 +547,7 @@ class AdvancedHandOrientationOptimizer:
         padding: int,
         image_index: int,
         max_crop_size: tuple[int, int] | None = None,
-    ) -> tuple[np.ndarray, RemapInfo, np.ndarray | None]:
+    ) -> tuple[np.ndarray, RemapInfo, np.ndarray | None, DetectionResult | None]:
         """
         既に選択済みの1つの手（`selected`、Noneの場合は「手なし」を表す）に
         ついて、向き最適化・クロップを行う（検出処理自体はこの関数の外で
@@ -439,24 +558,26 @@ class AdvancedHandOrientationOptimizer:
         のリトライループで、再検出結果の悪化によりクロップが際限なく
         肥大化する（＝サンプリングコストが跳ね上がる）のを防ぐために使う。
 
-        ★2026-07-11追加（ユーザー提案）: `selected.mask`（クロップ前、
-        親の検出時点で既に得られている粗いセグメンテーション）を、
-        画像に適用したのと全く同じ回転+クロップ変換に通し、クロップ後の
-        画像と同じ座標系のマスクとして3番目の戻り値
-        （`parent_mask_in_crop_coords`）で返すようにした。
+        ★2026-07-11追加（ユーザー提案）: `selected`（クロップ前、親の
+        検出時点で既に得られているbbox/landmarks/mask）を、画像に適用
+        したのと全く同じ回転+クロップ変換に通し、クロップ後の画像と
+        同じ座標系の情報として返すようにした:
 
-        従来、クロップ後の画像に対する検出（YOLO/MediaPipe/SAM2の
-        再実行）が失敗すると、精密なマスクを諦めて汎用的な楕円マスクに
-        フォールバックしていた。しかし、クロップの時点で既に手を認識
-        できている（`selected`が存在する）以上、その時点の粗い
-        セグメンテーションを変換して使う方が、汎用的な楕円よりずっと
-        実際の手の形状に沿ったフォールバックになる。呼び出し側
-        （`_fix_one_hand`）は、クロップ後の再検出が失敗した場合に、
-        汎用楕円マスクより先にこの変換済みマスクを優先して使う。
+        - 3番目の戻り値（`parent_mask_in_crop_coords`）: マスクのみを
+          変換したもの。フォールバック用マスクとして直接使える
+        - 4番目の戻り値（`parent_prior_for_crop`）: bbox・landmarks・
+          maskをまとめて変換した`DetectionResult`。クロップ後の画像に
+          対して再度検出パイプラインを実行する際、この`initial_prior`
+          として渡すことで、クロップ後の画像単体ではYOLO/MediaPipeが
+          何も見つけられなくても、SAM2がこの情報を使ってセグメンテー
+          ションを試みられるようになる（`_detect_hands`の
+          `initial_prior`引数を参照）。
 
         Returns:
-            (クロップ画像, remap_info, 親マスクをクロップ座標系に変換したもの。
-            `selected`が無い/`selected.mask`が無い場合は None)
+            (クロップ画像, remap_info,
+             親マスクをクロップ座標系に変換したもの（無ければNone）,
+             親のbbox/landmarks/maskをクロップ座標系に変換した
+             DetectionResult（無ければNone）)
         """
         orig_h, orig_w = img_rgb.shape[:2]
 
@@ -511,7 +632,15 @@ class AdvancedHandOrientationOptimizer:
                         "content_size": (cx2 - cx1, cy2 - cy1),
                     }
                     parent_mask = _transform_mask_to_crop_coords(selected.mask, 0.0, crop_box)
-                    return cropped, remap_info, parent_mask
+                    parent_prior = _build_crop_prior(
+                        _transform_bbox_to_crop_coords(
+                            bbox, 0.0, (0.0, 0.0), (0.0, 0.0), crop_box
+                        ),
+                        None,  # このフォールバック経路は元々landmarksを持たない
+                        parent_mask,
+                        selected.confidence,
+                    )
+                    return cropped, remap_info, parent_mask, parent_prior
 
             # bboxも無い（本当に手がかりが一切無い）場合の最終フォールバック。
             # max_crop_sizeが指定されていれば、画像中央基準でその上限まで
@@ -538,7 +667,7 @@ class AdvancedHandOrientationOptimizer:
                         if selected is not None
                         else None
                     )
-                    return cropped, remap_info, parent_mask
+                    return cropped, remap_info, parent_mask, None
 
             remap_info = {
                 "angle": 0.0,
@@ -548,7 +677,7 @@ class AdvancedHandOrientationOptimizer:
                 "rotated_size": (orig_w, orig_h),
                 "content_size": (orig_w, orig_h),
             }
-            return img_rgb, remap_info, None
+            return img_rgb, remap_info, None, None
 
         # 選択された手（デフォルトでは信頼度が最も高い手、hand_indexで
         # 指定された手、あるいはprocess_all_hands時はそのうちの1つ）
@@ -589,7 +718,14 @@ class AdvancedHandOrientationOptimizer:
         }
 
         parent_mask = _transform_mask_to_crop_coords(selected.mask, angle, crop_box)
-        return cropped, remap_info, parent_mask
+        parent_landmarks = _transform_landmarks_to_crop_coords(
+            selected.landmarks, angle, old_center, new_center, crop_box
+        )
+        parent_bbox = _transform_bbox_to_crop_coords(
+            selected.bbox, angle, old_center, new_center, crop_box
+        )
+        parent_prior = _build_crop_prior(parent_bbox, parent_landmarks, parent_mask, selected.confidence)
+        return cropped, remap_info, parent_mask, parent_prior
 
 def _mask_tensor_to_numpy(mask: torch.Tensor, index: int = 0) -> np.ndarray:
     """ComfyUIの MASK テンソル（B, H, W, 0-1 float）のうち、
@@ -1379,8 +1515,10 @@ class AdvancedHandAutoFixer:
                 effective_cap[1],
             )
 
-            cropped_rgb, remap_info, parent_mask_in_crop_coords = optimizer._crop_for_hand(
-                current_rgb, selected, padding, image_index, max_crop_size=effective_cap
+            cropped_rgb, remap_info, parent_mask_in_crop_coords, parent_prior_for_crop = (
+                optimizer._crop_for_hand(
+                    current_rgb, selected, padding, image_index, max_crop_size=effective_cap
+                )
             )
 
             if first_attempt_crop_size is None:
@@ -1400,27 +1538,67 @@ class AdvancedHandAutoFixer:
             # クロップ後の画像はズームインされている分、元画像より
             # 精密な検出結果が期待できるため、これが得られる場合は
             # 最優先で使う。
+            #
+            # ★2026-07-11追加（ユーザー提案1）: クロップ前の検出結果を
+            # クロップ座標系に変換したもの（`parent_prior_for_crop`）を
+            # `initial_prior`として渡す。`DetectorPipeline`は「今回の
+            # 検出器の結果が空ならpriorをそのまま維持する」設計のため、
+            # クロップ後の画像単体ではYOLO/MediaPipeが何も見つけられ
+            # なくても、このpriorがSAM2まで引き継がれ、SAM2がこの情報を
+            # 使ってセグメンテーションを試みられるようになる
+            # （従来は「prior（前段のbbox/landmarks）が無いため
+            # セグメンテーションのプロンプトを構築できません」という
+            # ログと共にSAM2がスキップしていた）。
             crop_detect_result = _detect_hands(
-                cropped_rgb, min_detection_confidence, detection_mode
+                cropped_rgb,
+                min_detection_confidence,
+                detection_mode,
+                initial_prior=parent_prior_for_crop,
             )
             crop_selected = (
                 _select_hand(crop_detect_result, 0) if not crop_detect_result.is_empty else None
             )
 
-            if crop_selected is not None and crop_selected.mask is not None:
-                # 最善: クロップ後の画像に対する再検出（より精密）が成功した
-                coarse_mask = crop_selected.mask
+            # ★2026-07-11追加（ユーザー提案2）: クロップ後の再検出結果と、
+            # クロップ前の検出結果（を変換したもの）が大きく食い違って
+            # いないかをIoUで比較する。両者が同じ手を指しているなら
+            # 本来近い形状になるはずで、大きく逸脱している場合は
+            # クロップ後の再検出（何らかの理由で誤爆した可能性がある）を
+            # 鵜呑みにせず、より安定した親マスク側を優先する
+            # （="再チェック"に相当する判断）。
+            crop_mask_candidate = crop_selected.mask if crop_selected is not None else None
+            deviation_iou = _masks_iou(crop_mask_candidate, parent_mask_in_crop_coords)
+            crop_result_deviates = (
+                deviation_iou is not None and deviation_iou < MASK_DEVIATION_IOU_THRESHOLD
+            )
+
+            if crop_result_deviates:
+                logger.warning(
+                    "HandAutoFixer: [image_index=%d, hand=%d, attempt=%d/%d] "
+                    "クロップ後の再検出結果がクロップ前の検出結果と大きく"
+                    "逸脱しています(IoU=%.3f)。クロップ前の検出結果を優先します。",
+                    image_index,
+                    hand_index,
+                    attempt + 1,
+                    max_retries + 1,
+                    deviation_iou,
+                )
+
+            if crop_mask_candidate is not None and not crop_result_deviates:
+                # 最善: クロップ後の画像に対する再検出（より精密）が成功し、
+                # かつクロップ前の検出結果と矛盾していない
+                coarse_mask = crop_mask_candidate
             elif parent_mask_in_crop_coords is not None:
                 # ★2026-07-11追加（ユーザー提案）: クロップ後の再検出が
-                # 失敗しても、クロップの時点で既に手を認識できていた
-                # （親の検出結果にマスクがあった）なら、それを画像と同じ
-                # 回転+クロップ変換に通してクロップ座標系に変換した
-                # `parent_mask_in_crop_coords`を使う。精密さは劣るが、
-                # 実際の手の形状に沿っている分、汎用的な楕円マスクより
-                # 良いフォールバックになる。
+                # 失敗した、あるいは逸脱していた場合、クロップの時点で
+                # 既に手を認識できていた（親の検出結果にマスクがあった）
+                # なら、それを画像と同じ回転+クロップ変換に通してクロップ
+                # 座標系に変換した`parent_mask_in_crop_coords`を使う。
+                # 精密さは劣るが、実際の手の形状に沿っている分、汎用的な
+                # 楕円マスクより良いフォールバックになる。
                 logger.info(
                     "HandAutoFixer: [image_index=%d, hand=%d, attempt=%d/%d] "
-                    "クロップ後の画像で手を再検出できませんでしたが、"
+                    "クロップ後の画像で信頼できる再検出結果が得られませんでしたが、"
                     "クロップ前の検出結果（マスク）を変換して使用します。",
                     image_index,
                     hand_index,

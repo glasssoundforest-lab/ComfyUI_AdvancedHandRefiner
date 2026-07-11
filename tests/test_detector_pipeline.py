@@ -274,3 +274,58 @@ class TestDetectorPipeline:
         pipeline = DetectorPipeline([d1, d2])
         result = pipeline.run(_dummy_image())
         assert result.is_empty
+
+
+class TestInitialPrior:
+    """
+    ★2026-07-11追加（ユーザー提案）: `DetectorPipeline.run()`の
+    `initial_prior`引数のテスト。クロップ前の検出結果を変換したものを
+    「種」として与えることで、先頭の検出器（YOLO等）がクロップ後の
+    画像で何も見つけられなくても、その情報が後続の検出器（SAM2）まで
+    引き継がれることを確認する。
+    """
+
+    def test_initial_prior_is_passed_to_first_detector(self):
+        seed = DetectionResult(hands=[HandDetection(bbox=BoundingBox(1, 1, 9, 9), source="parent_transformed")])
+        d1 = _StubDetector("yolo", DetectionResult(hands=[]))
+        pipeline = DetectorPipeline([d1])
+
+        pipeline.run(_dummy_image(), initial_prior=seed)
+
+        assert d1.received_priors[0] is seed
+
+    def test_initial_prior_survives_when_first_detector_finds_nothing(self):
+        """
+        ★最も重要なケース: 先頭の検出器(YOLO相当)が何も検出できなくても
+        (_merge_resultsの「new.is_emptyならpriorをそのまま維持」設計により)、
+        initial_priorは失われず後続の検出器まで引き継がれる。
+        """
+        seed = DetectionResult(hands=[HandDetection(bbox=BoundingBox(1, 1, 9, 9), source="parent_transformed")])
+        yolo = _StubDetector("yolo", DetectionResult(hands=[]))  # 何も検出できない
+        mediapipe = _StubDetector("mediapipe", DetectionResult(hands=[]))  # こちらも何も検出できない
+        sam2 = _StubDetector("sam2", DetectionResult(hands=[]))
+        pipeline = DetectorPipeline([yolo, mediapipe, sam2])
+
+        pipeline.run(_dummy_image(), initial_prior=seed)
+
+        # 3つとも何も見つけられなくても、seedがpriorとして最後まで引き継がれる
+        assert mediapipe.received_priors[0] is seed
+        assert sam2.received_priors[0] is seed
+
+    def test_no_initial_prior_preserves_legacy_behavior(self):
+        """initial_priorを渡さない場合、従来通り先頭の検出器はprior=Noneで呼ばれる"""
+        d1 = _StubDetector("yolo", DetectionResult(hands=[]))
+        pipeline = DetectorPipeline([d1])
+
+        pipeline.run(_dummy_image())
+
+        assert d1.received_priors[0] is None
+
+    def test_result_reflects_initial_prior_when_all_detectors_empty(self):
+        seed = DetectionResult(hands=[HandDetection(bbox=BoundingBox(1, 1, 9, 9), source="parent_transformed")])
+        pipeline = DetectorPipeline([_StubDetector("yolo", DetectionResult(hands=[]))])
+
+        result = pipeline.run(_dummy_image(), initial_prior=seed)
+
+        assert not result.is_empty
+        assert result.hands[0].source == "parent_transformed"

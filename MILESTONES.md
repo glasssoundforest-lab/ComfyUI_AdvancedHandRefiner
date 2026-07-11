@@ -2094,6 +2094,84 @@ optimize_orientation`・`AdvancedHandAutoFixer._fix_one_hand`）を
 
 ---
 
+## 🔬 クロップ前の情報をSAM2への事前情報として注入＋逸脱検知（ユーザー提案、2026-07-11）
+
+前回の「クロップ前のマスク変換によるフォールバック」実装後、ユーザー
+から更に2つの提案を受けた:
+
+1. 「クロップ後の画像検出に、クロップ前のデータから、推論しセグメン
+   テーションを組むことはできないか」
+2. 「クロップ後にセグメンテーションしたデータと、クロップ前のセグメン
+   テーションしたデータを比較し、逸脱していないか、逸脱しているなら
+   再チェック可能かを判断できないか」
+
+どちらも既存の`DetectorPipeline`の設計（`_merge_results`が「今回の
+検出器の結果が空ならpriorをそのまま維持する」という性質を持つこと）を
+活用することで、綺麗に実装できることが分かった。
+
+### 実装1: `initial_prior`によるパイプラインへの事前情報注入
+
+`DetectorPipeline.run()`に`initial_prior: DetectionResult | None = None`
+引数を追加した。従来`result: DetectionResult | None = None`から
+始まっていたループの初期値を`initial_prior`に置き換えるだけで、
+`_merge_results`の既存の性質（`new.is_empty`なら`prior`をそのまま
+返す）により、先頭の検出器（YOLO）がクロップ後の画像で何も見つけ
+られなくても、この初期priorはMediaPipe→SAM2まで失われずに引き継がれる。
+
+`_detect_hands()`にも同名の`initial_prior`引数を追加し、指定時は
+プロセス内キャッシュを完全にバイパスするようにした（priorの内容が
+キャッシュキーに含まれていないため、誤って別のpriorでの結果を使い
+回さないための安全策）。
+
+`_crop_for_hand`の戻り値をさらに拡張し（3-tuple→4-tuple）、
+`selected`のbbox・landmarks・maskを全て画像本体と同じ回転+クロップ
+変換に通してクロップ座標系へ変換し、1つの`DetectionResult`（新規
+ヘルパー`_build_crop_prior`）としてまとめたものを4番目の戻り値
+（`parent_prior_for_crop`）として返すようにした（新規ヘルパー
+`_transform_bbox_to_crop_coords`・`_transform_landmarks_to_crop_coords`
+を追加、既存の`_transform_mask_to_crop_coords`と合わせて3種の情報を
+それぞれ変換する）。`_fix_one_hand`は、クロップ後の再検出
+（`_detect_hands(cropped_rgb, ...)`）を呼ぶ際、この`parent_prior_for_crop`
+を`initial_prior`として渡すようになった。
+
+### 実装2: クロップ前後のマスクの逸脱検知
+
+新規ヘルパー`_masks_iou()`を追加。クロップ後の再検出で得られたマスクと、
+クロップ前の検出結果を変換したマスク（`parent_mask_in_crop_coords`）
+との間でIoU（Intersection over Union）を計算する。両者は本来同じ手を
+指しているはずなので、閾値
+（`MASK_DEVIATION_IOU_THRESHOLD = 0.3`、`utils/detectors/base.py`の
+bbox版`IOU_MATCH_THRESHOLD`と統一）を下回るほど乖離している場合は
+「逸脱している」と判定し、クロップ後の結果（何らかの理由で誤爆した
+可能性がある）を鵜呑みにせず、より安定しているクロップ前の結果を
+優先する（＝ユーザーの言う「再チェック」に相当する判断）。
+
+これにより、`_fix_one_hand`のマスク選択優先順位は以下のようになった:
+
+1. クロップ後の再検出結果（**かつ**クロップ前の結果と矛盾していない）
+2. クロップ前の検出結果を変換したもの（クロップ後の再検出が失敗、
+   または逸脱していた場合）
+3. 汎用楕円マスク（1・2のどちらも得られない最終手段）
+
+### 検証
+
+`DetectorPipeline`単体で、先頭の検出器が何も見つけられなくても
+`initial_prior`が最後の検出器まで引き継がれることを確認。`_masks_iou`
+の単体テスト（完全一致・不一致・部分一致・形状不一致等）を追加。
+`AdvancedHandAutoFixer`経由のエンドツーエンドで、(a)
+クロップ後の検出呼び出しに実際に変換済みpriorが渡されていること、
+(b) クロップ後の結果が明らかに逸脱している場合、クロップ前の結果が
+優先して使われること、をそれぞれ対照実験（該当コードを一時的に無効化
+して回帰することを確認）込みで検証した。
+
+新規テスト12件追加（`test_detector_pipeline.py`の`TestInitialPrior`
+4件、`test_nodes_batch_and_mode.py`の`TestMasksIou`6件、
+`test_nodes_auto_fixer.py`の`TestCropDetectionUsesParentPriorAndDeviationCheck`
+2件）。計415件全てパス（SAM2実モデル関連4件+4エラーは開発環境の
+既知の制約で今回の変更とは無関係）。
+
+---
+
 ## 直近の次アクション（着手順）
 
 1. 実写真での3ノード連携・見た目の確認（`wrist_blur`/`finger_sharpness`/
