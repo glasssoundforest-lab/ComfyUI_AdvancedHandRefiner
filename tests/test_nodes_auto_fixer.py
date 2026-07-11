@@ -541,6 +541,34 @@ class TestGenerousFallbackMaskWhenCropDetectionFails:
         mask = nodes._generous_fallback_mask((0, 0))
         assert mask.shape == (0, 0)
 
+    def test_generous_fallback_mask_covers_corners_much_better_than_old_ellipse(self):
+        """
+        ★2026-07-11追加: ユーザーから「手の一部は生成されたが、まだ
+        全体を生成できていない」という報告と、実際にその症状が写った
+        画像を受けた。原因は、従来の楕円マスク（クロップの84%程度、
+        中央に配置）が、指が対角線状に伸びる等の不規則な手の形状に
+        対して、四隅（コーナー）を原理的にカバーできていなかったこと。
+        マスク範囲外の部分は、リトライ回数やdenoiseをどれだけ強めても
+        絶対に再生成されないため、この見落としは深刻だった。
+
+        角を丸めた矩形へ変更したことで、旧楕円では確実に0だった
+        四隅付近の座標が、新マスクでは有意にカバーされていることを
+        確認する。
+        """
+        h, w = 237, 276  # 実行ログで実際に観測されたクロップサイズに近い値
+        mask = nodes._generous_fallback_mask((h, w))
+
+        # 旧楕円(中心、幅・高さの84%)であれば確実に0だったはずの、
+        # 四隅寄りの座標を検証する
+        corner_like_points = [(20, 20), (20, w - 20), (h - 20, 20), (h - 20, w - 20)]
+        for y, x in corner_like_points:
+            assert mask[y, x] > 100, f"座標(y={y}, x={x})が旧楕円と同様にカバーされていない"
+
+        # カバー率自体も、旧楕円(円周率/4 ≈ 78.5%が理論上限、実際は84%径相当で約55%)
+        # よりも大幅に高いはず
+        coverage_ratio = float(np.count_nonzero(mask > 127)) / mask.size
+        assert coverage_ratio > 0.75, f"カバー率が不十分({coverage_ratio:.1%})"
+
     def test_auto_fix_still_inpaints_when_crop_level_detection_completely_fails(self):
         """
         クロップ後の検出が完全に失敗しても(YOLO/MediaPipe/SAM2いずれも

@@ -818,8 +818,16 @@ class TestRefineMaskWithShading:
         return image
 
     def test_refines_rough_ellipse_mask_using_image_content(self):
+        """
+        ★2026-07-11更新: `_generous_fallback_mask`のカバー率を
+        大幅に引き上げた（手の一部がマスク範囲外になり再生成されない
+        問題への対応）ことに伴い、ここでは`_generous_fallback_mask`
+        由来の（広すぎる）マスクではなく、GrabCut自体の精密化効果を
+        独立して検証するための、意図的に小さめの粗いマスクを使う。
+        """
         image = self._synthetic_shaded_image()
-        rough_mask = nodes._generous_fallback_mask((200, 200))
+        rough_mask = np.zeros((200, 200), dtype=np.uint8)
+        cv2.circle(rough_mask, (100, 100), 60, 255, -1)
 
         refined = nodes._refine_mask_with_shading(image, rough_mask)
 

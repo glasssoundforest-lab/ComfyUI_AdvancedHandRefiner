@@ -509,7 +509,7 @@ def _generous_fallback_mask(shape: tuple[int, int]) -> np.ndarray:
 
     クロップ自体は既に（親の検出結果のbboxに基づき）手の領域周辺に
     絞られていることを踏まえ、「精密なマスクが得られないなら諦める」
-    のではなく、「クロップの大部分を覆う楕円形の大まかなマスクで、
+    のではなく、「クロップのほぼ全域を覆う大まかなマスクで、
     ともかく再生成を試みる」方針に変更した。多少不正確でも、
     全く手を加えないよりは改善の見込みがある。
 
@@ -517,7 +517,8 @@ def _generous_fallback_mask(shape: tuple[int, int]) -> np.ndarray:
         shape: (H, W) クロップ画像のサイズ
 
     Returns:
-        0-255 uint8 マスク（H, W）。クロップ中央を覆う楕円形。
+        0-255 uint8 マスク（H, W）。クロップのほぼ全域を覆う、角を
+        丸めた矩形（境界はガウシアンぼかしで滑らかに減衰する）。
     """
     h, w = shape
     # ★2026-07-11追加（異常値耐性の点検で発見）: hまたはwが負の場合、
@@ -531,10 +532,43 @@ def _generous_fallback_mask(shape: tuple[int, int]) -> np.ndarray:
     mask = np.zeros((h, w), dtype=np.uint8)
     if h <= 0 or w <= 0:
         return mask
-    center = (w // 2, h // 2)
-    # 端に接すると継ぎ目が目立ちやすいため、8割強に留めた余白を持たせる
-    axes = (max(1, int(w * 0.42)), max(1, int(h * 0.42)))
-    cv2.ellipse(mask, center, axes, 0, 0, 360, 255, -1)
+
+    # ★2026-07-11追加（ユーザー報告により発見）: 従来は
+    # `axes = (w*0.42, h*0.42)`という、クロップの84%程度を覆う楕円
+    # だった。しかし手は指が対角線状に伸びる等、細長く不規則な形を
+    # 取りうるため、**楕円の四隅（コーナー）部分は原理的にマスク範囲外
+    # になってしまう**。ユーザーから「手の一部は生成されたが、まだ
+    # 全体を生成できていない」という報告を受け、実際にこの見落としを
+    # 発見した。指先がクロップの隅の方まで伸びているポーズでは、
+    # 楕円の外側にはみ出した部分が一切マスクされず、何度リトライ・
+    # denoiseを引き上げても、マスク範囲外である以上その部分は絶対に
+    # 再生成されない（リトライ回数やdenoiseの強さでは解決できない
+    # 種類の問題）。
+    #
+    # 修正: 中央に留めた楕円ではなく、クロップのほぼ全域を覆う
+    # 「角を丸めた矩形」に変更した。クロップ自体が既に親の検出結果の
+    # bbox+paddingに基づき手の領域周辺に絞られていることを踏まえ、
+    # 「クロップに含まれるどこにあっても手を取りこぼさない」ことを
+    # 優先する。境界のガウシアンぼかし（後述）と組み合わせることで、
+    # 矩形であることによる不自然さも軽減される。
+    margin = max(2, int(min(h, w) * 0.04))  # 継ぎ目対策の最小限の余白のみ
+    corner_radius = max(1, int(min(h, w) * 0.15))
+    x1, y1 = margin, margin
+    x2, y2 = max(x1 + 1, w - margin), max(y1 + 1, h - margin)
+    rect_w, rect_h = x2 - x1, y2 - y1
+    corner_radius = min(corner_radius, rect_w // 2, rect_h // 2)
+    if corner_radius >= 1:
+        cv2.rectangle(mask, (x1 + corner_radius, y1), (x2 - corner_radius, y2), 255, -1)
+        cv2.rectangle(mask, (x1, y1 + corner_radius), (x2, y2 - corner_radius), 255, -1)
+        for cx, cy in [
+            (x1 + corner_radius, y1 + corner_radius),
+            (x2 - corner_radius, y1 + corner_radius),
+            (x1 + corner_radius, y2 - corner_radius),
+            (x2 - corner_radius, y2 - corner_radius),
+        ]:
+            cv2.circle(mask, (cx, cy), corner_radius, 255, -1)
+    else:
+        cv2.rectangle(mask, (x1, y1), (x2, y2), 255, -1)
 
     # ★2026-07-11追加: ユーザーから「手が円形/楕円形の境界ではっきりと
     # 切り取られたような、不自然な形のまま出力される」という報告と、
