@@ -1797,6 +1797,38 @@ class AdvancedHandAutoFixer:
                     cropped_rgb, _generous_fallback_mask(cropped_rgb.shape[:2])
                 )
 
+            # ★2026-07-11追加: ユーザーから「手が真珠色の塊のような、
+            # はっきりしない形のまま何度再生成しても変わらない」という
+            # 報告を受け、リトライループを精査した結果、重大な設計上の
+            # 欠落を発見した。従来、`denoise`は全ての試行で常に同じ固定値
+            # （既定0.6）が使われており、リトライのたびに変わるのは
+            # seedとマスクだけだった。しかし、denoise=0.6は「元の画素
+            # 構造を60%残す」ことを意味するため、**元の手が極端に崩れて
+            # いる（真珠色の塊状になっている等）場合、その崩れた構造
+            # 自体が毎回のリトライに強く影響し続けてしまい、何度
+            # リトライしても似たような不明瞭な結果に収束しやすい**という
+            # 問題があった。
+            #
+            # 修正: リトライを重ねるたびに、denoiseを段階的に引き上げる
+            # ようにした。1回目の試行はユーザー指定のdenoise（既定0.6、
+            # 周囲との一貫性を保ちつつ穏当に直す）をそのまま使うが、
+            # それでも異常と判定され再試行に至った場合は、元の（崩れた）
+            # 画素構造への依存度を毎回下げ、プロンプト・マスク形状に
+            # より従った、より思い切った作り直しを試みさせる。
+            escalated_denoise = min(1.0, denoise + attempt * 0.15)
+            if attempt > 0:
+                logger.info(
+                    "HandAutoFixer: [image_index=%d, hand=%d, attempt=%d/%d] "
+                    "前回までの試行で崩れた構造から抜け出せていない可能性を考慮し、"
+                    "denoiseを%.2f→%.2fへ引き上げます。",
+                    image_index,
+                    hand_index,
+                    attempt + 1,
+                    max_retries + 1,
+                    denoise,
+                    escalated_denoise,
+                )
+
             try:
                 inpainted_rgb = self._run_inpaint_sampling(
                     model,
@@ -1810,7 +1842,7 @@ class AdvancedHandAutoFixer:
                     cfg=cfg,
                     sampler_name=sampler_name,
                     scheduler=scheduler,
-                    denoise=denoise,
+                    denoise=escalated_denoise,
                     grow_mask_by=mask_grow_pixels,
                 )
             except Exception as e:

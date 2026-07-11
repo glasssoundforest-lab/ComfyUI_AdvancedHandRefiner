@@ -1452,3 +1452,131 @@ class TestTaskCompletesDespitePerHandOrPerImageExceptions:
         assert image.shape == (2, canvas, canvas, 3)
         assert "検出処理の模擬的な想定外エラー" in report
         assert "正常に処理されました" in report
+
+
+class TestEscalatingDenoiseAcrossRetries:
+    """
+    ★2026-07-11追加: ユーザーから「手が真珠色の塊のような、はっきり
+    しない形のまま何度再生成しても変わらない」という報告を受けた。
+    調査の結果、denoiseが全ての試行で常に同じ固定値のまま使われており、
+    元の手が極端に崩れている場合、その崩れた構造自体が毎回のリトライに
+    強く影響し続け、何度リトライしても似たような不明瞭な結果に収束
+    しやすいという設計上の欠落を発見した。リトライを重ねるたびに
+    denoiseを段階的に引き上げるよう修正したことを検証する。
+    """
+
+    def _common_kwargs(self):
+        return dict(
+            model=None,
+            positive=None,
+            negative=None,
+            vae=None,
+            seed=0,
+            steps=20,
+            cfg=7.0,
+            sampler_name="euler",
+            scheduler="normal",
+        )
+
+    def test_denoise_escalates_across_retry_attempts(self):
+        fixer = nodes.AdvancedHandAutoFixer()
+        canvas = 200
+
+        hand = HandDetection(
+            bbox=BoundingBox(20, 20, 180, 180),
+            landmarks=_landmarks_for_size(float(canvas), float(canvas)),
+            mask=generate_synthetic_hand_mask(canvas_size=(canvas, canvas), palm_radius=30),
+            source="fake",
+        )
+
+        captured_denoise_values = []
+
+        def fake_inpaint(self_, model, positive, negative, vae, image_crop_rgb, coarse_mask, **kwargs):
+            captured_denoise_values.append(kwargs["denoise"])
+            h, w = image_crop_rgb.shape[:2]
+            return np.full((h, w, 3), 128, dtype=np.uint8)
+
+        with patch.object(
+            nodes, "_detect_hands", return_value=DetectionResult(hands=[hand])
+        ), patch.object(nodes.AdvancedHandAutoFixer, "_run_inpaint_sampling", fake_inpaint), patch.object(
+            nodes, "assess_hand_overall_quality", return_value={"is_abnormal": True}
+        ):
+            fixer.auto_fix(
+                _image_tensor(h=canvas, w=canvas),
+                max_retries=3,
+                denoise=0.6,
+                **self._common_kwargs(),
+            )
+
+        assert captured_denoise_values == [
+            pytest.approx(0.6),
+            pytest.approx(0.75),
+            pytest.approx(0.90),
+            pytest.approx(1.0),
+        ]
+
+    def test_denoise_never_exceeds_1_0(self):
+        fixer = nodes.AdvancedHandAutoFixer()
+        canvas = 200
+
+        hand = HandDetection(
+            bbox=BoundingBox(20, 20, 180, 180),
+            landmarks=_landmarks_for_size(float(canvas), float(canvas)),
+            mask=generate_synthetic_hand_mask(canvas_size=(canvas, canvas), palm_radius=30),
+            source="fake",
+        )
+
+        captured_denoise_values = []
+
+        def fake_inpaint(self_, model, positive, negative, vae, image_crop_rgb, coarse_mask, **kwargs):
+            captured_denoise_values.append(kwargs["denoise"])
+            h, w = image_crop_rgb.shape[:2]
+            return np.full((h, w, 3), 128, dtype=np.uint8)
+
+        with patch.object(
+            nodes, "_detect_hands", return_value=DetectionResult(hands=[hand])
+        ), patch.object(nodes.AdvancedHandAutoFixer, "_run_inpaint_sampling", fake_inpaint), patch.object(
+            nodes, "assess_hand_overall_quality", return_value={"is_abnormal": True}
+        ):
+            fixer.auto_fix(
+                _image_tensor(h=canvas, w=canvas),
+                max_retries=5,
+                denoise=0.9,
+                **self._common_kwargs(),
+            )
+
+        assert all(v <= 1.0 for v in captured_denoise_values)
+        assert captured_denoise_values[-1] == pytest.approx(1.0)
+
+    def test_first_attempt_uses_exact_user_specified_denoise(self):
+        """1回目の試行は、ユーザー指定のdenoiseをそのまま使う(勝手に強めない)"""
+        fixer = nodes.AdvancedHandAutoFixer()
+        canvas = 200
+
+        hand = HandDetection(
+            bbox=BoundingBox(20, 20, 180, 180),
+            landmarks=_landmarks_for_size(float(canvas), float(canvas)),
+            mask=generate_synthetic_hand_mask(canvas_size=(canvas, canvas), palm_radius=30),
+            source="fake",
+        )
+
+        captured_denoise_values = []
+
+        def fake_inpaint(self_, model, positive, negative, vae, image_crop_rgb, coarse_mask, **kwargs):
+            captured_denoise_values.append(kwargs["denoise"])
+            h, w = image_crop_rgb.shape[:2]
+            return np.full((h, w, 3), 128, dtype=np.uint8)
+
+        with patch.object(
+            nodes, "_detect_hands", return_value=DetectionResult(hands=[hand])
+        ), patch.object(nodes.AdvancedHandAutoFixer, "_run_inpaint_sampling", fake_inpaint), patch.object(
+            nodes, "assess_hand_overall_quality", return_value={"is_abnormal": False}
+        ):
+            fixer.auto_fix(
+                _image_tensor(h=canvas, w=canvas),
+                max_retries=3,
+                denoise=0.45,
+                **self._common_kwargs(),
+            )
+
+        assert captured_denoise_values == [pytest.approx(0.45)]
