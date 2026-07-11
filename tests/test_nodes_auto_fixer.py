@@ -1348,3 +1348,107 @@ class TestMemoryCleanupBetweenAttempts:
             )
 
         assert mock_gc.collect.called, "各試行の終わりでgc.collect()が呼ばれていない"
+
+
+class TestTaskCompletesDespitePerHandOrPerImageExceptions:
+    """
+    ★2026-07-11追加: ユーザーから「手の生成がしっかりと終わらずタスクが
+    終了する」という報告を受け調査した結果、重大な頑健性の欠落を発見
+    した。従来、auto_fix()のメインループは`_fix_one_hand()`の呼び出しや
+    初回の`_detect_hands()`呼び出しを一切例外から保護しておらず、1つの
+    手/1枚の画像の処理中に発生した想定外の例外が、そのままauto_fix
+    全体（＝ComfyUIのタスク実行そのもの）をクラッシュさせ、既に修復
+    できていた他の手・他の画像の結果まで全て失われていた。
+
+    このテストは、想定外の例外が発生しても、auto_fix()がクラッシュせず
+    最後まで完走し、影響を受けなかった他の手/画像の結果は正しく保持
+    されることを検証する。
+    """
+
+    def _common_kwargs(self):
+        return dict(
+            model=None,
+            positive=None,
+            negative=None,
+            vae=None,
+            seed=0,
+            steps=20,
+            cfg=7.0,
+            sampler_name="euler",
+            scheduler="normal",
+            denoise=0.6,
+        )
+
+    def test_exception_in_one_hand_does_not_crash_task_and_other_hand_still_processed(self):
+        """
+        2つの手のうち1つ目の処理で想定外の例外が発生しても、auto_fix()
+        全体はクラッシュせず完走し、2つ目の手は正常に処理されることを
+        確認する。
+        """
+        fixer = nodes.AdvancedHandAutoFixer()
+        canvas = 200
+
+        hand_a = HandDetection(
+            bbox=BoundingBox(10, 10, 90, 90),
+            landmarks=_landmarks_for_size(90.0, 90.0),
+            mask=generate_synthetic_hand_mask(canvas_size=(canvas, canvas), palm_radius=20),
+            source="fake",
+        )
+        hand_b = HandDetection(
+            bbox=BoundingBox(110, 110, 190, 190),
+            landmarks=_landmarks_for_size(90.0, 90.0),
+            mask=generate_synthetic_hand_mask(canvas_size=(canvas, canvas), palm_radius=20),
+            source="fake",
+        )
+
+        with patch.object(
+            nodes, "_detect_hands", return_value=DetectionResult(hands=[hand_a, hand_b])
+        ), patch.object(
+            nodes.AdvancedHandAutoFixer,
+            "_fix_one_hand",
+            side_effect=[RuntimeError("模擬的な想定外のエラー"), (np.zeros((canvas, canvas, 3), dtype=np.uint8), "[hand=1] 正常に処理されました")],
+        ):
+            image, report = fixer.auto_fix(
+                _image_tensor(h=canvas, w=canvas), max_retries=0, **self._common_kwargs()
+            )
+
+        # クラッシュせず戻り値が得られること
+        assert image.shape == (1, canvas, canvas, 3)
+        # 失敗した手についての説明がレポートに含まれること
+        assert "想定外のエラー" in report
+        # 影響を受けなかった2つ目の手は正常に処理されたことがレポートに反映されること
+        assert "正常に処理されました" in report
+
+    def test_exception_in_detection_for_one_image_does_not_crash_batch(self):
+        """
+        バッチ内の1枚目の画像で検出処理が想定外の例外を送出しても、
+        auto_fix()全体はクラッシュせず完走し、2枚目の画像は正常に
+        処理されることを確認する。
+        """
+        fixer = nodes.AdvancedHandAutoFixer()
+        canvas = 100
+
+        hand = HandDetection(
+            bbox=BoundingBox(10, 10, 90, 90),
+            landmarks=_landmarks_for_size(90.0, 90.0),
+            mask=generate_synthetic_hand_mask(canvas_size=(canvas, canvas), palm_radius=20),
+            source="fake",
+        )
+
+        batch_image = nodes.torch.from_numpy(np.zeros((2, canvas, canvas, 3), dtype=np.float32))
+
+        with patch.object(
+            nodes,
+            "_detect_hands",
+            side_effect=[RuntimeError("検出処理の模擬的な想定外エラー"), DetectionResult(hands=[hand])],
+        ), patch.object(
+            nodes.AdvancedHandAutoFixer,
+            "_fix_one_hand",
+            return_value=(np.full((canvas, canvas, 3), 200, dtype=np.uint8), "[image_index=1] 正常に処理されました"),
+        ):
+            image, report = fixer.auto_fix(batch_image, max_retries=0, **self._common_kwargs())
+
+        # 2枚とも出力に含まれる(バッチ全体が失われていない)
+        assert image.shape == (2, canvas, canvas, 3)
+        assert "検出処理の模擬的な想定外エラー" in report
+        assert "正常に処理されました" in report

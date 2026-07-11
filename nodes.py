@@ -1476,7 +1476,28 @@ class AdvancedHandAutoFixer:
         for i in range(batch_size):
             current_rgb = _tensor_to_numpy_rgb(image, i)
             img_rgb_for_detection = _tensor_to_numpy_rgb(image, i)  # 検出は常に元画像に対して行う
-            result = _detect_hands(img_rgb_for_detection, min_detection_confidence, detection_mode)
+
+            # ★2026-07-11追加: 手単位の保護（下記）に加え、その手前の
+            # 初回検出自体が想定外の例外を送出した場合も、バッチ内の
+            # この1枚をスキップして次の画像の処理を継続できるようにする
+            # （バッチ処理全体が1枚の異常データに巻き込まれてタスクが
+            # 完走しなくなることを防ぐため）。
+            try:
+                result = _detect_hands(img_rgb_for_detection, min_detection_confidence, detection_mode)
+            except Exception as e:
+                logger.error(
+                    "HandAutoFixer: [image_index=%d] 検出処理中に想定外のエラーが"
+                    "発生したため、この画像はスキップして次の処理を継続します (%s: %s)",
+                    i,
+                    type(e).__name__,
+                    e,
+                )
+                report_lines.append(
+                    f"[image_index={i}] 検出処理で想定外のエラーが発生したため"
+                    f"スキップされました ({type(e).__name__}: {e})"
+                )
+                output_images.append(current_rgb)
+                continue
 
             if result.is_empty:
                 report_lines.append(f"[image_index={i}] 手が検出できませんでした。処理をスキップしました。")
@@ -1489,32 +1510,68 @@ class AdvancedHandAutoFixer:
                 if selected is None:
                     continue
 
-                current_rgb, hand_report = self._fix_one_hand(
-                    optimizer,
-                    stitcher,
-                    current_rgb,
-                    selected,
-                    image_index=i,
-                    hand_index=hand_idx,
-                    model=model,
-                    positive=positive,
-                    negative=negative,
-                    vae=vae,
-                    base_seed=seed,
-                    steps=steps,
-                    cfg=cfg,
-                    sampler_name=sampler_name,
-                    scheduler=scheduler,
-                    denoise=denoise,
-                    max_retries=max_retries,
-                    padding=padding,
-                    min_detection_confidence=min_detection_confidence,
-                    detection_mode=detection_mode,
-                    expected_fingers=expected_fingers,
-                    mask_grow_pixels=mask_grow_pixels,
-                    color_match_strength=color_match_strength,
-                    max_crop_dimension=max_crop_dimension,
-                )
+                # ★2026-07-11追加: 重大な頑健性の欠落を発見・修正した。
+                # 従来はここで`_fix_one_hand`の呼び出しが一切保護されて
+                # おらず、1つの手の処理中に発生した想定外の例外
+                # （検出・貼り戻し・品質判定・GrabCut等、`_run_inpaint_
+                # sampling`個別のtry/exceptではカバーされない箇所）が、
+                # そのままauto_fix全体、ひいてはComfyUIのタスク実行
+                # そのものをクラッシュさせてしまっていた。これにより、
+                # 既に正常に修復できていた他の手や、バッチ内の他の画像の
+                # 結果まで全て失われ、「生成が最後まで終わらずタスクが
+                # 終了する」という報告につながっていた。
+                #
+                # 修正: 1つの手の処理を例外から保護し、失敗しても
+                # その手を「未修復のまま」でスキップして次の手・次の
+                # 画像の処理を継続できるようにした。これにより、タスク
+                # 全体が最後まで完走し、修復できた手は修復された状態で、
+                # 修復に失敗した手はレポートにその旨が明記された状態で
+                # 返せるようになる。
+                try:
+                    current_rgb, hand_report = self._fix_one_hand(
+                        optimizer,
+                        stitcher,
+                        current_rgb,
+                        selected,
+                        image_index=i,
+                        hand_index=hand_idx,
+                        model=model,
+                        positive=positive,
+                        negative=negative,
+                        vae=vae,
+                        base_seed=seed,
+                        steps=steps,
+                        cfg=cfg,
+                        sampler_name=sampler_name,
+                        scheduler=scheduler,
+                        denoise=denoise,
+                        max_retries=max_retries,
+                        padding=padding,
+                        min_detection_confidence=min_detection_confidence,
+                        detection_mode=detection_mode,
+                        expected_fingers=expected_fingers,
+                        mask_grow_pixels=mask_grow_pixels,
+                        color_match_strength=color_match_strength,
+                        max_crop_dimension=max_crop_dimension,
+                    )
+                except Exception as e:
+                    logger.error(
+                        "HandAutoFixer: [image_index=%d, hand=%d] "
+                        "処理中に想定外のエラーが発生したため、この手はスキップして"
+                        "次の処理を継続します (%s: %s)",
+                        i,
+                        hand_idx,
+                        type(e).__name__,
+                        e,
+                    )
+                    hand_report = (
+                        f"[image_index={i}, hand={hand_idx}] "
+                        f"想定外のエラーによりスキップされました "
+                        f"({type(e).__name__}: {e})"
+                    )
+                    # current_rgb はこの手の処理開始前の状態（直前の手までの
+                    # 修復結果）のまま維持し、タスク全体は継続する
+
                 report_lines.append(hand_report)
 
             output_images.append(current_rgb)
