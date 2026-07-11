@@ -6,6 +6,7 @@ from __future__ import annotations
 
 from unittest.mock import patch
 
+import cv2
 import numpy as np
 import pytest
 
@@ -749,3 +750,63 @@ class TestMasksIou:
         m1 = np.zeros((10, 10), dtype=np.uint8)
         m2 = np.zeros((10, 10), dtype=np.uint8)
         assert nodes._masks_iou(m1, m2) is None
+
+
+class TestRefineMaskWithShading:
+    """
+    ★2026-07-11追加（ユーザー提案「陰影も参照してセグメンテーションの
+    構築はできますか」）: `_refine_mask_with_shading`（GrabCutを使い、
+    実際のクロップ画像の色・陰影を手がかりに粗いマスクの輪郭を精密化
+    するヘルパー）の単体テスト。
+    """
+
+    def _synthetic_shaded_image(self, h=200, w=200):
+        """暗い背景の中に、明るい楕円+矩形の「手」領域を持つ合成画像を作る"""
+        image = np.full((h, w, 3), 40, dtype=np.uint8)
+        cv2.ellipse(image, (w // 2, h // 2), (50, 70), 0, 0, 360, (200, 180, 160), -1)
+        cv2.rectangle(image, (w // 2 - 10, 20), (w // 2 + 10, 60), (200, 180, 160), -1)
+        return image
+
+    def test_refines_rough_ellipse_mask_using_image_content(self):
+        image = self._synthetic_shaded_image()
+        rough_mask = nodes._generous_fallback_mask((200, 200))
+
+        refined = nodes._refine_mask_with_shading(image, rough_mask)
+
+        assert refined is not None
+        assert refined.shape == rough_mask.shape
+        assert not np.array_equal(refined, rough_mask), "陰影を反映して形状が変化していない"
+
+    def test_none_mask_returns_none(self):
+        image = self._synthetic_shaded_image()
+        assert nodes._refine_mask_with_shading(image, None) is None
+
+    def test_all_zero_mask_returns_unchanged(self):
+        image = self._synthetic_shaded_image()
+        empty_mask = np.zeros((200, 200), dtype=np.uint8)
+        result = nodes._refine_mask_with_shading(image, empty_mask)
+        assert np.array_equal(result, empty_mask)
+
+    def test_shape_mismatch_returns_rough_mask_unchanged(self):
+        image = np.zeros((100, 100, 3), dtype=np.uint8)
+        rough_mask = np.full((50, 50), 255, dtype=np.uint8)
+        result = nodes._refine_mask_with_shading(image, rough_mask)
+        assert np.array_equal(result, rough_mask)
+
+    def test_tiny_mask_falls_back_safely_without_crashing(self):
+        """浸食で完全に消えてしまうほど小さいマスクでもクラッシュせず、安全にフォールバックする"""
+        image = self._synthetic_shaded_image()
+        tiny_mask = np.zeros((200, 200), dtype=np.uint8)
+        tiny_mask[100:102, 100:102] = 255
+        result = nodes._refine_mask_with_shading(image, tiny_mask)
+        assert result is not None
+        assert result.shape == tiny_mask.shape
+
+    def test_grabcut_exception_falls_back_to_rough_mask(self):
+        image = self._synthetic_shaded_image()
+        rough_mask = nodes._generous_fallback_mask((200, 200))
+
+        with patch.object(nodes.cv2, "grabCut", side_effect=cv2.error("stub failure")):
+            result = nodes._refine_mask_with_shading(image, rough_mask)
+
+        assert np.array_equal(result, rough_mask)

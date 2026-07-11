@@ -1194,3 +1194,101 @@ class TestCropDetectionUsesParentPriorAndDeviationCheck:
         # 逸脱した3x3の隅マスクではなく、より大きい親マスク由来の
         # マスクが使われているはず(3x3=9pxよりずっと大きい)
         assert used_mask.sum() > (9 * 255)
+
+
+class TestShadingRefinementAppliedToFallbackMasks:
+    """
+    ★2026-07-11追加（ユーザー提案「陰影も参照してセグメンテーションの
+    構築はできますか」）: `_fix_one_hand`が、幾何学的近似に過ぎない
+    フォールバックマスク（楕円・クロップ前検出結果の変換）に対して、
+    実際に`_refine_mask_with_shading`を呼び出していることを確認する。
+    """
+
+    def _common_kwargs(self):
+        return dict(
+            model=None,
+            positive=None,
+            negative=None,
+            vae=None,
+            seed=0,
+            steps=20,
+            cfg=7.0,
+            sampler_name="euler",
+            scheduler="normal",
+            denoise=0.6,
+        )
+
+    def test_ellipse_fallback_is_refined_with_shading(self):
+        fixer = nodes.AdvancedHandAutoFixer()
+        canvas = 200
+
+        call_state = {"n": 0}
+
+        def detect_side_effect(image_rgb, *_args, **_kwargs):
+            call_state["n"] += 1
+            if call_state["n"] == 1:
+                # 親検出自体もマスク無し(bboxのみ)にして、
+                # parent_mask_in_crop_coordsもNoneになるようにする
+                return DetectionResult(
+                    hands=[
+                        HandDetection(
+                            bbox=BoundingBox(20, 20, 180, 180),
+                            landmarks=_landmarks_for_size(float(canvas), float(canvas)),
+                            mask=None,
+                            source="fake",
+                        )
+                    ]
+                )
+            return DetectionResult(hands=[])  # クロップ後は常に検出失敗
+
+        def fake_inpaint(self_, model, positive, negative, vae, image_crop_rgb, coarse_mask, **kwargs):
+            h, w = image_crop_rgb.shape[:2]
+            return np.full((h, w, 3), 128, dtype=np.uint8)
+
+        with patch.object(nodes, "_detect_hands", side_effect=detect_side_effect), patch.object(
+            nodes.AdvancedHandAutoFixer, "_run_inpaint_sampling", fake_inpaint
+        ), patch.object(
+            nodes, "_refine_mask_with_shading", wraps=nodes._refine_mask_with_shading
+        ) as spy_refine:
+            fixer.auto_fix(
+                _image_tensor(h=canvas, w=canvas), max_retries=0, **self._common_kwargs()
+            )
+
+        assert spy_refine.called, "楕円フォールバック時に陰影精密化が呼ばれていない"
+
+    def test_parent_mask_fallback_is_refined_with_shading(self):
+        fixer = nodes.AdvancedHandAutoFixer()
+        canvas = 200
+        parent_mask = generate_synthetic_hand_mask(canvas_size=(canvas, canvas), palm_radius=30)
+
+        call_state = {"n": 0}
+
+        def detect_side_effect(image_rgb, *_args, **_kwargs):
+            call_state["n"] += 1
+            if call_state["n"] == 1:
+                return DetectionResult(
+                    hands=[
+                        HandDetection(
+                            bbox=BoundingBox(20, 20, 180, 180),
+                            landmarks=_landmarks_for_size(float(canvas), float(canvas)),
+                            mask=parent_mask,
+                            source="fake",
+                        )
+                    ]
+                )
+            return DetectionResult(hands=[])  # クロップ後は常に検出失敗
+
+        def fake_inpaint(self_, model, positive, negative, vae, image_crop_rgb, coarse_mask, **kwargs):
+            h, w = image_crop_rgb.shape[:2]
+            return np.full((h, w, 3), 128, dtype=np.uint8)
+
+        with patch.object(nodes, "_detect_hands", side_effect=detect_side_effect), patch.object(
+            nodes.AdvancedHandAutoFixer, "_run_inpaint_sampling", fake_inpaint
+        ), patch.object(
+            nodes, "_refine_mask_with_shading", wraps=nodes._refine_mask_with_shading
+        ) as spy_refine:
+            fixer.auto_fix(
+                _image_tensor(h=canvas, w=canvas), max_retries=0, **self._common_kwargs()
+            )
+
+        assert spy_refine.called, "親マスクのフォールバック時に陰影精密化が呼ばれていない"

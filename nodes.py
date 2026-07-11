@@ -298,6 +298,90 @@ def _transform_landmarks_to_crop_coords(
     return [(px - x1, py - y1) for px, py in rotated]
 
 
+def _refine_mask_with_shading(
+    image_rgb: np.ndarray,
+    rough_mask: np.ndarray | None,
+    iterations: int = 3,
+) -> np.ndarray | None:
+    """
+    粗いマスク（楕円フォールバック等の幾何学的近似、あるいはクロップ前の
+    検出結果を回転+クロップ変換しただけのマスク）を、実際のクロップ画像の
+    陰影（輝度勾配・色の変化）を手がかりに、GrabCutアルゴリズムで輪郭に
+    沿うよう精密化する。
+
+    ★2026-07-11追加（ユーザー提案: 「陰影も参照してセグメンテーションの
+    構築はできますか」）。OpenCVの`cv2.grabCut`は各ピクセルを前景/背景に
+    分類するグラフカット最適化を行い、そのエネルギー関数には「隣接
+    ピクセル間の色・輝度差が小さいほど同じラベル（前景/背景）に
+    なりやすい」というコントラスト項が含まれる。指の間の影・関節の
+    陰影・爪の明暗といった陰影変化は、このコントラスト項を通じて
+    自然に輪郭のヒントとして活用される。
+
+    与えられた`rough_mask`をそのまま信じるのではなく、内側に十分縮小
+    した領域を「確実な前景」、外側に十分広げた領域の外を「確実な背景」
+    とし、その間の境界帯だけをGrabCutに判断させる設計にすることで、
+    元のマスクが多少ずれていても、実際の手の輪郭（陰影の切り替わり）に
+    引き寄せられるようにしている。
+
+    Args:
+        image_rgb: 精密化の手がかりとなるクロップ画像（H, W, 3）
+        rough_mask: 精密化前の粗いマスク（0-255 uint8、(H, W)）
+        iterations: GrabCutの反復回数
+
+    Returns:
+        精密化されたマスク（0-255 uint8）。入力が不正、GrabCutが崩壊
+        （ほぼ空・ほぼ画像全体になる等）、例外発生等の場合は、安全側に
+        倒して`rough_mask`をそのまま返す。
+    """
+    if rough_mask is None or not np.any(rough_mask):
+        return rough_mask
+    if image_rgb.shape[:2] != rough_mask.shape[:2]:
+        return rough_mask
+
+    h, w = rough_mask.shape[:2]
+    kernel = np.ones((7, 7), np.uint8)
+    fg_core = cv2.erode(rough_mask, kernel, iterations=2)
+    bg_outer = cv2.dilate(rough_mask, kernel, iterations=3)
+
+    gc_mask = np.full((h, w), cv2.GC_BGD, dtype=np.uint8)
+    gc_mask[bg_outer > 0] = cv2.GC_PR_BGD
+    gc_mask[rough_mask > 0] = cv2.GC_PR_FGD
+    gc_mask[fg_core > 0] = cv2.GC_FGD
+
+    if not np.any(gc_mask == cv2.GC_FGD):
+        # 確実な前景領域が無い（マスクが小さすぎて浸食で消えた等）場合、
+        # GrabCutの結果は信頼できないため元のマスクのまま返す
+        return rough_mask
+
+    bgd_model = np.zeros((1, 65), np.float64)
+    fgd_model = np.zeros((1, 65), np.float64)
+
+    try:
+        image_bgr = cv2.cvtColor(image_rgb, cv2.COLOR_RGB2BGR)
+        cv2.grabCut(
+            image_bgr, gc_mask, None, bgd_model, fgd_model, iterations, cv2.GC_INIT_WITH_MASK
+        )
+    except cv2.error as e:
+        logger.warning(
+            "HandAutoFixer: GrabCutによるマスク精密化に失敗しました (%s)。"
+            "元の粗いマスクをそのまま使用します。",
+            e,
+        )
+        return rough_mask
+
+    refined = np.where(
+        (gc_mask == cv2.GC_FGD) | (gc_mask == cv2.GC_PR_FGD), 255, 0
+    ).astype(np.uint8)
+
+    # GrabCutが崩壊（ほぼ空、あるいは画像のほとんどを前景と判定）した
+    # 場合は信頼せず、元の粗いマスクにフォールバックする
+    refined_ratio = float(np.count_nonzero(refined)) / float(refined.size)
+    if refined_ratio < 0.01 or refined_ratio > 0.95:
+        return rough_mask
+
+    return refined
+
+
 def _transform_mask_to_crop_coords(
     mask: np.ndarray | None,
     angle: float,
@@ -1596,16 +1680,22 @@ class AdvancedHandAutoFixer:
                 # 座標系に変換した`parent_mask_in_crop_coords`を使う。
                 # 精密さは劣るが、実際の手の形状に沿っている分、汎用的な
                 # 楕円マスクより良いフォールバックになる。
+                #
+                # ★2026-07-11追加（ユーザー提案「陰影も参照して
+                # セグメンテーションの構築はできますか」）: 回転+クロップ
+                # 変換だけでは境界にわずかなずれが生じうるため、
+                # `_refine_mask_with_shading`でクロップ画像の実際の陰影
+                # （輝度勾配）を手がかりにGrabCutで輪郭を微調整する。
                 logger.info(
                     "HandAutoFixer: [image_index=%d, hand=%d, attempt=%d/%d] "
                     "クロップ後の画像で信頼できる再検出結果が得られませんでしたが、"
-                    "クロップ前の検出結果（マスク）を変換して使用します。",
+                    "クロップ前の検出結果（マスク）を陰影を参照して精密化し使用します。",
                     image_index,
                     hand_index,
                     attempt + 1,
                     max_retries + 1,
                 )
-                coarse_mask = parent_mask_in_crop_coords
+                coarse_mask = _refine_mask_with_shading(cropped_rgb, parent_mask_in_crop_coords)
             else:
                 # ★2026-07-11修正: 以前はここで即座に諦めて（このハンドの
                 # インペイントを完全に中断して）元の状態のまま残していた。
@@ -1614,17 +1704,22 @@ class AdvancedHandAutoFixer:
                 # ため、精密な検出にも親マスクの変換にも失敗した場合のみ、
                 # クロップ中央を覆う大まかな楕円マスクでともかく再生成を
                 # 試みるよう変更した（`_generous_fallback_mask`参照）。
+                # ★2026-07-11追加: 楕円は完全に幾何学的な近似なので、
+                # `_refine_mask_with_shading`でクロップ画像の陰影を手がかりに
+                # 実際の手の輪郭に近づける。
                 logger.warning(
                     "HandAutoFixer: [image_index=%d, hand=%d, attempt=%d/%d] "
                     "クロップ後の画像で手を検出できず、親マスクの変換も"
-                    "利用できませんでした。大まかな楕円マスクでインペイント"
-                    "を試みます。",
+                    "利用できませんでした。大まかな楕円マスクを陰影を参照して"
+                    "精密化し、インペイントを試みます。",
                     image_index,
                     hand_index,
                     attempt + 1,
                     max_retries + 1,
                 )
-                coarse_mask = _generous_fallback_mask(cropped_rgb.shape[:2])
+                coarse_mask = _refine_mask_with_shading(
+                    cropped_rgb, _generous_fallback_mask(cropped_rgb.shape[:2])
+                )
 
             try:
                 inpainted_rgb = self._run_inpaint_sampling(
