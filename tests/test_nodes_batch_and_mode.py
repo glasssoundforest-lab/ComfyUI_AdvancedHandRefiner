@@ -168,6 +168,56 @@ class TestOrientationOptimizerBatchSupport:
         assert remap1["content_size"] == (60, 80)
 
 
+class TestStitchSingleNearEmptyMaskDiagnostics:
+    """
+    ★2026-07-11追加: ユーザーから「手の生成が全くされていない状態で
+    出力されている（ペイントノードは機能しているか）」という報告を
+    受けた。ログ上ではKSamplerが正常に完走しているにも関わらず、
+    `_stitch_single`の「合成対象マスクがほぼ空」判定によって生成結果が
+    丸ごと破棄され、元画像がそのまま返されている可能性を疑っている。
+    原因を確定するため、「マスク自体が空なのか」「回転による有効領域
+    (valid_region)の方が空なのか」を切り分けられる診断ログを追加した。
+    このテストは、その診断ログが実際に出力されることを確認する。
+    """
+
+    def test_near_empty_mask_logs_breakdown_of_restored_mask_and_valid_region(self, caplog):
+        h, w = 50, 50
+        stitcher = nodes.AdvancedHandSeamlessStitcher()
+
+        original_image = nodes.torch.from_numpy(np.zeros((1, h, w, 3), dtype=np.float32))
+        inpainted_image = nodes.torch.from_numpy(np.zeros((1, h, w, 3), dtype=np.float32))
+        # ほぼ空のマスク(合成対象がほぼ無い状態を意図的に再現)
+        mask_tensor = nodes.torch.from_numpy(np.zeros((1, h, w), dtype=np.float32))
+
+        remap_info = {
+            "angle": 15.0,
+            "center": (w / 2.0, h / 2.0),
+            "crop_box": (0, 0, w, h),
+            "original_size": (w, h),
+            "rotated_size": (w, h),
+            "content_size": (w, h),
+        }
+
+        with caplog.at_level("WARNING", logger="HandRefiner"):
+            result = stitcher._stitch_single(
+                original_image,
+                inpainted_image,
+                mask_tensor,
+                remap_info,
+                color_match_strength=0.5,
+                orig_index=0,
+                inpaint_index=0,
+                mask_index=0,
+            )
+
+        assert result.shape == (h, w, 3)
+        messages = [r.message for r in caplog.records]
+        assert any(
+            "合成対象マスクがほぼ空です" in m and "restored_mask=" in m and "valid_region=" in m
+            for m in messages
+        ), "内訳を示す診断ログが出力されていない"
+
+
 class TestSeamlessStitcherFullBatchWithRemapInfoList:
     """OrientationOptimizerが返すremap_infoのリストを、実際にSeamlessStitcherに
     渡して最後まで通す、Orientation→Stitcherの結合バッチテスト"""

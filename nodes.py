@@ -1181,9 +1181,25 @@ class AdvancedHandSeamlessStitcher:
 
         mask_pixel_count = int(np.count_nonzero(effective_mask > 10))
         if mask_pixel_count < 10:
+            # ★2026-07-11追加: ユーザーから「手の生成が全くされていない
+            # 状態で出力されている（ペイントノードは機能しているか）」
+            # という報告を受けた。ログ上ではKSamplerが正常に何度も
+            # 完走しているにも関わらず、この「合成対象マスクがほぼ空」
+            # 判定によって生成結果が丸ごと破棄され、元画像がそのまま
+            # 返されている可能性を疑っている。原因を確定するため、
+            # 「マスク自体が空なのか」「回転による有効領域(valid_region)
+            # の方が空なのか」を切り分けられる診断ログを追加した。
+            restored_mask_count = int(np.count_nonzero(restored_mask > 10))
+            valid_region_count = int(np.count_nonzero(valid_region > 10))
             logger.warning(
-                "HandSeamlessStitcher: 合成対象マスクがほぼ空です。"
-                "元画像をそのまま返します。"
+                "HandSeamlessStitcher: 合成対象マスクがほぼ空です"
+                "(effective=%dpx, restored_mask=%dpx, valid_region=%dpx, "
+                "angle=%.2f, crop_box=%s)。元画像をそのまま返します。",
+                mask_pixel_count,
+                restored_mask_count,
+                valid_region_count,
+                remap_info.get("angle", 0.0),
+                remap_info.get("crop_box"),
             )
             return orig_rgb
 
@@ -2032,4 +2048,18 @@ class AdvancedHandAutoFixer:
         decoded_rgb = _tensor_to_numpy_rgb(decoded_image, 0)
         if pad_h > 0 or pad_w > 0:
             decoded_rgb = decoded_rgb[:orig_h, :orig_w]
+
+        # ★2026-07-11追加: ユーザーから「手の生成が全くされていない状態で
+        # 出力されている」という報告を受けた。KSamplerはログ上正常に完走
+        # しているが、(a) デコード結果自体が乏しい/破綻している可能性と、
+        # (b) 生成自体は問題ないが後段の貼り戻し処理（`_stitch_single`の
+        # 「マスクがほぼ空」判定）で結果が丸ごと破棄されている可能性、
+        # の2つを切り分けるための診断ログ。
+        logger.info(
+            "HandAutoFixer: デコード結果の統計 mean=%.1f std=%.1f "
+            "(極端に均一な値の場合、生成が実質的に機能していない可能性がある)",
+            float(decoded_rgb.mean()),
+            float(decoded_rgb.std()),
+        )
+
         return decoded_rgb
